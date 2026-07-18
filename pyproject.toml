@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "community-organizer"
+version = "0.1.0"
+description = "Community Organizer — volunteer scheduling for communities"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = [
+  "boto3>=1.34",
+  "click>=8.1",
+  "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "moto[dynamodb,ses,cognitoidp]>=5.0",
+  # Match the Lambda runtime: just python-jose, no [cryptography]
+  # extra. Our tests don't sign or verify real JWTs, so the
+  # pure-Python crypto fallback (ecdsa / pyasn1 / rsa) is enough,
+  # and the dev install surface shrinks (cryptography + cffi +
+  # pycparser are heavy and have lots of CVE history).
+  "python-jose>=3.3",
+]
+
+[project.scripts]
+community-organizer = "community_organizer.cli:main"
+co = "community_organizer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Default run skips the `live` suite — those drive the deployed site
+# (real auth, real SES, real Graph) and aren't appropriate for the
+# fast in-process moto suite. Run `pytest -m live` or
+# `pytest tests/live/` explicitly to invoke them.
+addopts = "-ra -q -m \"not live\""
+pythonpath = ["src"]
+markers = [
+  "live: hits deployed AWS resources; requires external credentials",
+  "destructive: writes/mutates deployed test state; needs --run-destructive",
+]

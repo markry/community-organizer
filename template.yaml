@@ -1,0 +1,695 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Community Organizer — volunteer scheduling for communities
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: community.example.org
+    Description: Public domain for the web app (also the SES sending domain).
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Route 53 hosted zone ID for your domain.
+  CommunityId:
+    Type: String
+    Default: example-community
+    Description: Community identifier for this deployment (single-tenant per stack).
+  CookieDomain:
+    Type: String
+    Default: community.example.org
+    Description: |
+      Domain attribute set on auth + active-app cookies. Allows
+      sessions to flow across any subdomain under this scope.
+      Set to the parent of all deployed hostnames — e.g.
+      `community.example.org` so cookies can be shared across related subdomains.
+      Leave blank to fall back to host-only cookies.
+  CommunityTimezone:
+    Type: String
+    Default: America/New_York
+    Description: Default IANA timezone for the community.
+  EmailProvider:
+    Type: String
+    Default: ses
+    AllowedValues: [ses, m365]
+  SmsProvider:
+    Type: String
+    Default: none
+    AllowedValues: [twilio, none]
+  SmsAllowlist:
+    Type: String
+    Default: ""
+    Description: >-
+      Comma-separated user_ids permitted to receive SMS reminders during
+      rollout. When non-empty, NO other user gets a text even if their channel
+      is sms/both — the hard safety gate. Empty = rely on per-user channel only.
+  SsmParamPrefix:
+    Type: String
+    Default: /community-organizer
+    AllowedPattern: ^/[A-Za-z0-9_.\-/]+$
+    Description: Prefix for SSM parameters used by this deployment.
+  InboundProvider:
+    Type: String
+    Default: ses
+    AllowedValues: [ses, none]
+  AcmCertArn:
+    Type: String
+    Default: arn:aws:acm:us-east-1:000000000000:certificate/00000000-0000-0000-0000-000000000000
+    Description: us-east-1 ACM certificate ARN for the CloudFront alias on DomainName. Replace the placeholder for deploys.
+  TableName:
+    Type: String
+    Default: community-organizer
+    Description: DynamoDB table physical name. Existing deployments should override this rather than renaming tables.
+  ResourcePrefix:
+    Type: String
+    Default: community-organizer
+    AllowedPattern: ^[A-Za-z][A-Za-z0-9-]*$
+    Description: >-
+      Prefix for named physical resources (Lambda function names, SNS topic,
+      Cognito pool/client). Existing deployments must override this to their
+      current prefix (e.g. your existing prefix) — changing a Lambda FunctionName or SNS
+      TopicName forces resource REPLACEMENT, so keep it stable for a live stack.
+
+Globals:
+  Function:
+    Runtime: python3.13
+    MemorySize: 256
+    Timeout: 30
+    Architectures:
+      - arm64
+    LoggingConfig:
+      LogFormat: JSON
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref Table
+        COMMUNITY_ID: !Ref CommunityId
+        COMMUNITY_TIMEZONE: !Ref CommunityTimezone
+        EMAIL_PROVIDER: !Ref EmailProvider
+        SMS_PROVIDER: !Ref SmsProvider
+        INBOUND_PROVIDER: !Ref InboundProvider
+        DOMAIN_NAME: !Ref DomainName
+        COOKIE_DOMAIN: !Ref CookieDomain
+
+Resources:
+
+  # ---- Data ----------------------------------------------------------------
+
+  Table:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      # Continuous backups: restore the table to any second in the last
+      # 35 days (accidental delete, bad write, bug, rogue credential).
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ---- Auth ----------------------------------------------------------------
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Ref ResourcePrefix
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: "You're invited to join the volunteer scheduling system"
+          EmailMessage: !Sub >-
+            Welcome! You've been added to the scheduling system for your community.
+
+            You can sign in two ways:
+
+            1. Sign in with Google (recommended) -- just click the Google button.
+               Works with any Google account, no new password needed.
+
+            2. Sign in with email and password -- use these credentials:
+               Username: {username}
+               Temporary password: {####}
+               You'll be asked to set a new password on first sign-in.
+
+            Get started at: https://${DomainName}/login
+      EmailConfiguration:
+        EmailSendingAccount: DEVELOPER
+        SourceArn: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${DomainName}"
+        From: !Sub "organizer@${DomainName}"
+
+  # UserPoolDomain is managed out-of-band when using a custom Cognito domain.
+  # Example: create auth.community.example.org and point its DNS record at
+  # the CloudFront distribution returned by the Cognito domain command.
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ResourcePrefix}-web"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO, Google, SignInWithApple]
+      CallbackURLs:
+        - !Sub "https://${DomainName}/auth/callback"
+        # Shared with the beta stack. One UserPoolClient + one
+        # COOKIE_DOMAIN can share a session across a production
+        # domain and a related beta domain without the cross-host JWT-audience
+        # mismatch you'd get with per-stack clients.
+        - https://beta.community.example.org/auth/callback
+      LogoutURLs:
+        - !Sub "https://${DomainName}/auth/logout"
+        - !Sub "https://${DomainName}/"
+        - https://beta.community.example.org/auth/logout
+        - https://beta.community.example.org/
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+      RefreshTokenValidity: 30
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # ---- Lambdas -------------------------------------------------------------
+
+  WebFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-web"
+      CodeUri: src/
+      Handler: community_organizer.lambdas.web.lambda_handler
+      Timeout: 30
+      # Lambda CPU scales with memory (1 full vCPU at 1769 MB). Profiling
+      # (2026-07-01) showed the web handler is CPU-bound on botocore's
+      # per-item deserialization; at the 256 MB Global default it ran on
+      # ~0.15 vCPU, ~7x slower than a core. Overriding to 1769 MB (1 vCPU)
+      # for this function only — speeds up warm pages AND the CPU-bound cold
+      # start ~7x; roughly cost-neutral (GB-ms) at this traffic. Single-
+      # threaded/GIL-bound work sees no gain past one vCPU, so 1769 is the knee.
+      MemorySize: 1769
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          USER_POOL_CLIENT_ID: !Ref UserPoolClient
+          COGNITO_DOMAIN: !Sub "auth.${DomainName}"
+          OG_ART_BUCKET: !Ref OgArtBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref Table
+        - S3CrudPolicy:
+            BucketName: !Ref OgArtBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource:
+                - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${DomainName}"
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminGetUser
+                - cognito-idp:AdminDeleteUser
+                - cognito-idp:AdminInitiateAuth
+                - cognito-idp:AdminRespondToAuthChallenge
+                - cognito-idp:AdminSetUserPassword
+                - cognito-idp:AdminUserGlobalSignOut
+                - cognito-idp:ForgotPassword
+                - cognito-idp:ConfirmForgotPassword
+              Resource:
+                - !GetAtt UserPool.Arn
+      Events:
+        # Keep one container FULLY warm to kill the ~3s cold-start lag on the
+        # first click of a session. Every 4 min sits comfortably inside
+        # Lambda's idle keep-alive window (typically 5-15+ min) with margin
+        # against early reclaim. Hits /warmer, which does a cheap DDB read +
+        # JWKS prefetch so the boto3 client, DynamoDB connection, AND token-
+        # verify cache are all warm (not just the Python init) — so the first
+        # REAL request is fast, not just the second. Near-free, and touches
+        # none of the delicate FunctionURL/CloudFront/OAC wiring. Reversible:
+        # delete this Events block. (True Provisioned Concurrency would need
+        # an alias + re-pointing the FURL/OAC — not worth the risk here.)
+        Warmer:
+          Type: Schedule
+          Properties:
+            Schedule: rate(4 minutes)
+            Description: Keep the web Lambda fully warm.
+            Input: '{"rawPath": "/warmer"}'
+      FunctionUrlConfig:
+        # NOTE: AuthType=AWS_IAM (the D4 fix) breaks POST requests
+        # with "The request signature we calculated does not match"
+        # — OAC's body-hash signature doesn't match what Lambda FURL
+        # recomputes after CloudFront's request forwarding. GET
+        # works, POST doesn't. Confirmed by the sandbox: same
+        # error pattern there too.
+        #
+        # Reverted to NONE pending a workaround. The OAC + the two
+        # Lambda Permissions are kept in place so the next attempt
+        # is a one-line re-flip. See SECURITY-AUDIT.md "D4 status".
+        AuthType: NONE
+        InvokeMode: BUFFERED
+
+  # Allow CloudFront to invoke the FURL via its OAC. SourceArn pins
+  # the permission to OUR distribution — no other CloudFront
+  # distribution in the account can invoke this Lambda.
+  WebFunctionUrlInvokeByCloudFront:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+      FunctionUrlAuthType: AWS_IAM
+
+  # See the comment on SandboxInvokeByCloudFront — since October
+  # 2025 AWS requires BOTH lambda:InvokeFunctionUrl and
+  # lambda:InvokeFunction. Without this second permission,
+  # CloudFront → FURL requests return 403 AccessDeniedException
+  # with Message=null at the FURL boundary.
+  WebInvokeByCloudFront:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebFunction
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  NotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-notifier"
+      CodeUri: src/
+      Handler: community_organizer.lambdas.notifier.lambda_handler
+      Timeout: 300
+      Environment:
+        Variables:
+          COMMUNITY_ID: !Ref CommunityId
+          # SMS_PROVIDER comes from Globals. The allowlist is the rollout
+          # safety gate (only these user_ids can be texted).
+          SMS_ALLOWLIST: !Ref SmsAllowlist
+          TWILIO_SID_PARAM: !Sub "${SsmParamPrefix}/twilio_account_sid"
+          TWILIO_TOKEN_PARAM: !Sub "${SsmParamPrefix}/twilio_auth_token"
+          TWILIO_SENDER_PARAM: !Sub "${SsmParamPrefix}/twilio_sender_phone"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref Table
+        - DynamoDBStreamReadPolicy:
+            TableName: !Ref Table
+            StreamName: !Select [3, !Split ["/", !GetAtt Table.StreamArn]]
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource:
+                - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${DomainName}"
+            # Twilio credentials for SMS reminders. Read-only on the
+            # the app's own params; KMS decrypt scoped to SSM so the role
+            # can't decrypt anything else.
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmParamPrefix}/twilio_*"
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub "ssm.${AWS::Region}.amazonaws.com"
+      Events:
+        EveryMinute:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Enabled: true
+        TableStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt Table.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"dynamodb":{"Keys":{"SK":{"S":[{"prefix":"ASGN#"}]}}}}'
+
+  # Per-app social-card art (one object per app_id). Private — never served
+  # directly; the web Lambda reads it and returns the bytes at /og/<id>.png.
+  OgArtBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-og-art"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  InboundEmailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-inbound-email"
+      # Defense in depth (security fix D6). The account-level Block
+      # Public Access setting is on, but bucket-level explicit BPA
+      # protects against an admin disabling the account default by
+      # mistake. Same logic for OwnershipControls.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-after-7-days
+            Status: Enabled
+            ExpirationInDays: 7
+
+  InboundEmailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InboundEmailBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${InboundEmailBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceAccount": !Ref "AWS::AccountId"
+
+  InboundReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties:
+      RuleSetName: !Sub "${AWS::StackName}-inbound"
+
+  InboundReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn:
+      - InboundEmailBucketPolicy
+      - InboundLambdaPermission
+    Properties:
+      RuleSetName: !Ref InboundReceiptRuleSet
+      Rule:
+        Name: calendar-replies
+        Enabled: true
+        ScanEnabled: true
+        Recipients:
+          - !Sub "organizer@${DomainName}"
+        Actions:
+          - S3Action:
+              BucketName: !Ref InboundEmailBucket
+              ObjectKeyPrefix: incoming/
+          - LambdaAction:
+              FunctionArn: !GetAtt InboundFunction.Arn
+              InvocationType: Event
+
+  InboundLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InboundFunction
+      Action: lambda:InvokeFunction
+      Principal: ses.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+
+  InboundMxRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: MX
+      TTL: 300
+      ResourceRecords:
+        - !Sub "10 inbound-smtp.${AWS::Region}.amazonaws.com"
+
+  InboundFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-inbound"
+      CodeUri: src/
+      Handler: community_organizer.lambdas.inbound.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          COMMUNITY_ID: !Ref CommunityId
+          INBOUND_BUCKET: !Ref InboundEmailBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref Table
+        - S3ReadPolicy:
+            BucketName: !Ref InboundEmailBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource:
+                - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${DomainName}"
+
+  BounceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-bounce"
+      CodeUri: src/
+      Handler: community_organizer.lambdas.bounce.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          COMMUNITY_ID: !Ref CommunityId
+          # Defense-in-depth SNS topic check (security fix D16).
+          EXPECTED_SNS_TOPIC_ARN: !Ref BounceTopic
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref Table
+      Events:
+        SesNotifications:
+          Type: SNS
+          Properties:
+            Topic: !Ref BounceTopic
+
+  # ---- D4 sandbox ----------------------------------------------------------
+  # Hello-world Lambda used to iterate the OAC + ORP combinations
+  # without touching the live / path. Mounted on CloudFront at
+  # /sandbox/* via a dedicated cache behavior below.
+  SandboxFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-sandbox"
+      CodeUri: src/
+      Handler: community_organizer.lambdas.sandbox.lambda_handler
+      Timeout: 10
+      FunctionUrlConfig:
+        AuthType: AWS_IAM
+        InvokeMode: BUFFERED
+
+  SandboxFunctionUrlInvokeByCloudFront:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SandboxFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+      FunctionUrlAuthType: AWS_IAM
+
+  # AWS broke the OAC path in October 2025: CloudFront now also
+  # needs lambda:InvokeFunction (not only lambda:InvokeFunctionUrl)
+  # to call a Lambda FURL with AuthType=AWS_IAM. Without this
+  # second permission you get 403 AccessDeniedException with
+  # Message=null at the FURL — the signature validates fine, but
+  # the principal is missing the second action. Source:
+  # https://github.com/aws-samples/remote-swe-agents/issues/361
+  SandboxInvokeByCloudFront:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SandboxFunction
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  SandboxOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-sandbox-oac"
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---- Bounce / complaint --------------------------------------------------
+
+  BounceTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-ses-feedback"
+      DisplayName: SES bounce + complaint feedback for Community Organizer
+
+  # ---- CDN + DNS -----------------------------------------------------------
+
+  # Origin Access Control: CloudFront signs every origin request to
+  # the Lambda Function URL with SigV4. Combined with the FURL's
+  # AuthType=AWS_IAM, this means only CloudFront can invoke the URL.
+  # Security fix D4. See:
+  # Keep the CloudFront/Lambda Function URL permission pattern documented here
+  # because it is easy to break while changing the web distribution.
+  WebOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-web-oac"
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        IPV6Enabled: true
+        HttpVersion: http2and3
+        Comment: !Sub "Community Organizer — ${DomainName}"
+        Aliases:
+          - !Ref DomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref AcmCertArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: lambda-web
+            DomainName: !Select [2, !Split ["/", !GetAtt WebFunctionUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt WebOAC.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              HTTPSPort: 443
+          - Id: lambda-sandbox
+            DomainName: !Select [2, !Split ["/", !GetAtt SandboxFunctionUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt SandboxOAC.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              HTTPSPort: 443
+        DefaultCacheBehavior:
+          TargetOriginId: lambda-web
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed AllViewerExceptHostHeader (b689b0a8). Forwards
+          # everything except Host (CloudFront sets its own Host to
+          # the FURL hostname for OAC signing). Same managed policy
+          # the sandbox uses — proved equivalent during the D4
+          # investigation.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          Compress: true
+        CacheBehaviors:
+          # D4 sandbox path. Uses managed AllViewerExceptHostHeader
+          # (b689b0a8) — forwards everything except the Host header
+          # (CloudFront sets its own Host = FURL hostname for OAC
+          # signing). The actual unlock was the lambda:InvokeFunction
+          # permission (see SandboxInvokeByCloudFront above), not
+          # the ORP choice.
+          - PathPattern: /sandbox/*
+            TargetOriginId: lambda-sandbox
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            Compress: true
+
+  DomainAliasRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+Outputs:
+  TableName:
+    Value: !Ref Table
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  # WebFunctionUrl removed from outputs — direct URL is no longer
+  # publicly invokable (AuthType=AWS_IAM) and publishing it just
+  # makes scanning easier.
+  CloudFrontDomain:
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  AppUrl:
+    Value: !Sub "https://${DomainName}/"
+  BounceTopicArn:
+    Value: !Ref BounceTopic
+    Description: Subscribe SES bounce + complaint notifications to this SNS topic.
+  CognitoAuthDomain:
+    Value: !Sub "auth.${DomainName}"
+    Description: Custom Cognito domain for OAuth flows.

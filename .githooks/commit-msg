@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Refuse commit messages that name real people or carry real production data.
+#
+# WHY THIS IS A HOOK AND NOT A README PARAGRAPH:
+# On 2026-07-15 the maintainers spent hours scrubbing PII out of this project,
+# and then, the same day, put a real member's first name into two commit
+# messages of the then-PUBLIC repo -- describing her behaviour, unflatteringly,
+# in permanent history. The project had documentation saying not to. Guidance
+# you can read past at the moment it matters is not a control. This is a
+# control: it fails the commit.
+#
+# The people in this system are volunteers at a parish. They did not consent to
+# being case studies. Write about ROLES ("the AA", "an organizer", "a member"),
+# never about PEOPLE.
+#
+# Enable (once per clone):   git config core.hooksPath .githooks
+# Bypass, if you truly must: git commit --no-verify   <-- think hard first
+#
+# The denylist lives in the PRIVATE ops repo, because a list of real members'
+# names -- and of live account/zone/domain identifiers -- is exactly the thing
+# that must not be in this one. (First draft of this hook hardcoded the AWS
+# account id as a detection pattern. The guard leaked what it guards. Only
+# generic patterns live here now.)
+set -uo pipefail
+
+MSG_FILE="$1"
+MSG="$(grep -v '^#' "$MSG_FILE" 2>/dev/null || true)"
+FAIL=0
+
+reject() {
+    [ "$FAIL" = 0 ] && printf '\n\033[31m=== commit blocked: possible PII ===\033[0m\n' >&2
+    FAIL=1
+    printf '  \033[31m%s\033[0m\n    %s\n' "$1" "$2" >&2
+}
+
+# --- 1. names + live identifiers, from the private denylist ---------------
+DENYLIST="${CO_PII_DENYLIST:-$(git rev-parse --show-toplevel)/../community-organizer-ops/pii-denylist.txt}"
+if [ -f "$DENYLIST" ]; then
+    while IFS= read -r term; do
+        case "$term" in ''|'#'*) continue ;; esac
+        if printf '%s' "$MSG" | grep -qiw -- "$term"; then
+            reject "matches the private denylist: '$term'" \
+                   "describe the role or the behaviour, not the person/deployment"
+        fi
+    done < "$DENYLIST"
+else
+    printf '\033[33mwarning: PII denylist not found at %s — name check SKIPPED\033[0m\n' "$DENYLIST" >&2
+    printf '\033[33m         (clone the ops repo alongside this one)\033[0m\n' >&2
+fi
+
+# --- 2. real production data, regardless of the denylist ------------------
+# A 32-hex string is a user_id / event_id / app_id out of the live table.
+if printf '%s' "$MSG" | grep -qiE '\b[0-9a-f]{32}\b'; then
+    reject "contains a 32-hex id (a real user_id/event_id?)" "reference the behaviour, not the row"
+fi
+# Real email addresses. example.com/example.org are fixtures; co@amdg.io is the
+# project's own published contact.
+if printf '%s' "$MSG" | grep -qiE '[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}' \
+   && ! printf '%s' "$MSG" | grep -qiE '^[^@]*@(example\.(com|org)|amdg\.io)'; then
+    if printf '%s' "$MSG" | grep -viE '@(example\.(com|org)|amdg\.io)' | grep -qiE '[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}'; then
+        reject "contains an email address" "use user@example.com, or omit it"
+    fi
+fi
+# A bare 12-digit run is an AWS account id. (The specific one is in the private
+# denylist; this catches any of them without naming ours.)
+if printf '%s' "$MSG" | grep -qE '\b[0-9]{12}\b'; then
+    reject "contains a 12-digit number (an AWS account id?)" "deployment ids live in the ops repo"
+fi
+# US phone numbers.
+if printf '%s' "$MSG" | grep -qE '\+?1?[ .-]?\(?[2-9][0-9]{2}\)?[ .-]?[0-9]{3}[ .-]?[0-9]{4}\b'; then
+    reject "looks like a phone number" "omit it"
+fi
+
+if [ "$FAIL" != 0 ]; then
+    printf '\n  Rewrite the message. If this is a false positive, --no-verify exists,\n' >&2
+    printf '  but read the top of .githooks/commit-msg before you reach for it.\n\n' >&2
+    exit 1
+fi
+exit 0

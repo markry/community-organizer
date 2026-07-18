@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.aws-sam/
+.bootstrap/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+samconfig.toml
+*-prod.json
+*-prod.toml
+prod-*.json
+prod-*.toml
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local operational one-off scripts — many contain real member data
+# (emails/phones) or provisioning secrets. Never commit; keep local.
+scripts/
+tests/live/
+# Local design/source assets — not needed by the Lambda build.
+assets/
+# Playwright MCP browser-testing artifacts.
+.playwright-mcp/

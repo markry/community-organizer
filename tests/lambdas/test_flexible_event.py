@@ -62,6 +62,16 @@ def _mk_event(cid, *, state="poll", date="2026-08-15"):
     return evt, opt
 
 
+def _add_option(cid, evt, date, *, sort_key=1, start_time="18:30"):
+    """Add another candidate date to an event (turns a fixed-date event into a
+    multi-date poll)."""
+    opt = FlexiblePollOption(community_id=cid, app_id="a1",
+                             event_id=evt.event_id, iso_date=date,
+                             start_time=start_time, sort_key=sort_key)
+    db.put_flexible_poll_option(opt)
+    return opt
+
+
 def _mk_token(cid, evt, user_id, token="tok-1"):
     db.put_event_token(EventToken(
         community_id=cid, app_id="a1", event_id=evt.event_id, user_id=user_id,
@@ -233,6 +243,38 @@ def test_close_includes_confirm_message(ddb_table, monkeypatch) -> None:
     confirms = [kw for kw in sent if kw["kind"] == "event_confirmed"]
     assert confirms and any("Bring your copy of Dune!" in kw["body_text"]
                             for kw in confirms)
+
+
+def test_close_screen_single_date_confirms_not_picks(ddb_table) -> None:
+    """The decision gate stays for a single-date event, but with no pointless
+    one-option 'pick the winning date' radio — the date is shown as a fact and
+    confirmed directly. The winning_option is still submitted so the close
+    pipeline is unchanged."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid, date="2026-08-15")          # single date
+    ev = {"requestContext": {"http": {"method": "GET"}},
+          "queryStringParameters": {"event": evt.event_id}}
+    body = web._flex_event_results_page(
+        ev, aa, db.get_community(cid), app, aa_mem)["body"]
+    assert "Pick the winning date" not in body            # no 1-of-1 radio
+    assert "Confirm this event" in body
+    assert "Confirm &amp; send invites for" in body
+    assert "type='radio' name='winning_option'" not in body
+    # The date is still submitted, so close-review/close work unchanged.
+    assert f"name='winning_option' value='{opt.option_id}'" in body
+
+
+def test_close_screen_multi_date_still_picks(ddb_table) -> None:
+    """Two+ dates keep the 'pick the winning date' radio."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _add_option(cid, evt, "2026-08-22")
+    ev = {"requestContext": {"http": {"method": "GET"}},
+          "queryStringParameters": {"event": evt.event_id}}
+    body = web._flex_event_results_page(
+        ev, aa, db.get_community(cid), app, aa_mem)["body"]
+    assert "Pick the winning date" in body
+    assert "type='radio' name='winning_option'" in body
 
 
 def test_declined_user_can_rejoin_after_close(ddb_table, monkeypatch) -> None:
@@ -407,10 +449,13 @@ def test_send_poll_response_aware(ddb_table, monkeypatch) -> None:
     from community_organizer.core.models import FlexibleRSVP
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
     evt, opt = _mk_event(cid)
-    # Bob answers for the whole 2-person household (bob + sue share h1).
+    opt2 = _add_option(cid, evt, "2026-08-22")           # >1 date == poll copy
+    # Bob answers for the whole 2-person household (bob + sue share h1), voting
+    # on every date so he counts as a complete personal response (not "a new
+    # date was added since you answered").
     db.put_flexible_rsvp(FlexibleRSVP(
         community_id=cid, app_id="a1", event_id=evt.event_id,
-        user_id=bob.user_id, votes={opt.option_id: "yes"},
+        user_id=bob.user_id, votes={opt.option_id: "yes", opt2.option_id: "no"},
         party_size=2, bringing="salad"))
     sent = _capture(monkeypatch)
     web._api_flex_event_send_poll(
@@ -429,6 +474,23 @@ def test_send_poll_response_aware(ddb_table, monkeypatch) -> None:
     # Joe (uncovered) — the normal invitation.
     assert "vote on dates" in by_to["joe@example.com"]["subject"].lower()
     assert "you're invited" in by_to["joe@example.com"]["body_text"].lower()
+
+
+def test_send_poll_single_date_is_rsvp_invite(ddb_table, monkeypatch) -> None:
+    """A single-date event emails a fixed-date RSVP invite ('you're invited on
+    <date>, can you come?'), not a 'vote on dates' poll."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid, date="2026-08-15")         # single date
+    sent = _capture(monkeypatch)
+    web._api_flex_event_send_poll(
+        _post("/api/flex/event/send-poll", {"event": evt.event_id}),
+        aa, db.get_community(cid), app, aa_mem)
+    inv = {kw["to_addr"]: kw for kw in sent}["joe@example.com"]
+    assert "vote on dates" not in inv["subject"].lower()
+    assert "you're invited" in inv["subject"].lower()
+    assert "can you make it" in inv["body_text"].lower()
+    assert "August 15" in inv["body_text"]               # the fixed date, in body
+    assert "Proposed dates" not in inv["body_text"]      # no poll date list
 
 
 def test_send_poll_declined_member_not_reinvited(ddb_table, monkeypatch) -> None:
@@ -590,8 +652,10 @@ def test_resend_nudges_household_about_added_date(ddb_table, monkeypatch) -> Non
 # ---- public token flow ----------------------------------------------------
 
 def test_token_page_renders_poll_form(ddb_table) -> None:
+    # Two dates == a real poll: "which dates work? answer each."
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
     evt, opt = _mk_event(cid)
+    _add_option(cid, evt, "2026-08-22")
     tok = _mk_token(cid, evt, bob.user_id)
     page = web._flex_token_page(_get(f"/e/{tok}"))
     assert page["statusCode"] == 200
@@ -600,6 +664,22 @@ def test_token_page_renders_poll_form(ddb_table) -> None:
     assert "Answer for your family or for yourself" in page["body"]
     assert "Responding as <b>Bob</b>" in page["body"]   # whose link this is
     assert "for <b>each</b> date" in page["body"]        # answer-all instruction
+
+
+def test_token_page_single_date_is_fixed_invite(ddb_table) -> None:
+    # One date == a fixed-date invitation: "can you come?", no "dates" plural.
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)                            # single date
+    tok = _mk_token(cid, evt, bob.user_id)
+    page = web._flex_token_page(_get(f"/e/{tok}"))
+    assert page["statusCode"] == 200
+    assert "Can you come?" in page["body"]
+    assert "Which dates work?" not in page["body"]
+    assert "for <b>each</b> date" not in page["body"]
+    assert "Let us know whether you can make it" in page["body"]
+    # The RSVP controls and bring/headcount fields are still there.
+    assert "What will you bring?" in page["body"]
+    assert f"vote_{opt.option_id}" in page["body"]
 
 
 def test_token_vote_records_rsvp(ddb_table) -> None:

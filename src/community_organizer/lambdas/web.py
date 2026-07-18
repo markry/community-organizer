@@ -2316,8 +2316,9 @@ def _flex_event_new_page(event: dict, user: User, community: Community | None,
           "<legend style='font-weight:600;color:#444;padding:0 8px'>"
           "Proposed dates</legend>"
           "<p style='color:#888;font-size:0.85em;margin:0 0 8px'>"
-          "Members will vote Yes / No / Maybe on each. Leave the time blank "
-          "to decide it later.</p>"
+          "Add <b>one</b> date for a fixed-date invitation (members just RSVP), "
+          "or <b>several</b> to let the group pick. Members answer Yes / No / "
+          "Maybe on each. Leave the time blank to decide it later.</p>"
         + date_rows
         + "</fieldset>"
           "<p><button type='submit' style='padding:8px 24px;cursor:pointer;"
@@ -2564,25 +2565,47 @@ def _flex_event_results_page(event: dict, user: User,
     total_headcount = sum(hh_best.values())
     declined = [r.user_id for r in rsvps if r.confirmed_response == "no"]
 
-    # Close form (only while still a poll)
+    # Close form (only while still a poll). The AA's deliberate click here is
+    # the go/no-go decision gate — she reviews turnout first and may instead
+    # cancel or change the date. With a single candidate date there's nothing
+    # to "pick", so we present the date as a fact and confirm it directly rather
+    # than rendering a pointless one-option radio; the gate itself stays.
     close_html = ""
     if evt.state == "poll" and options:
-        opt_radios = "".join(
-            "<label style='display:block;margin:4px 0'>"
-            f"<input type='radio' name='winning_option' value='{o.option_id}'> "
-            f"{html.escape(_fmt_iso_date(o.iso_date))}"
-            + (f" {_fmt_time(o.start_time)}" if o.start_time else "")
-            + "</label>"
-            for o in options)
+        if len(options) == 1:
+            o = options[0]
+            when = (_fmt_iso_date(o.iso_date)
+                    + (f" {_fmt_time(o.start_time)}" if o.start_time else ""))
+            close_body = (
+                f"<input type='hidden' name='winning_option' value='{o.option_id}'>"
+                "<b>Confirm this event</b>"
+                f"<p style='margin:6px 0'>Date: <b>{html.escape(when)}</b></p>"
+                "<p style='color:#888;font-size:0.85em;margin:0 0 8px'>Sends the "
+                "calendar invite to everyone who's in, and a short note to anyone "
+                "who can't make it. Not enough interest? You can still change the "
+                "date or cancel below.</p>"
+                "<p><button type='submit' style='padding:7px 18px;cursor:pointer'>"
+                f"Confirm &amp; send invites for {html.escape(when)} &rarr;"
+                "</button></p>")
+        else:
+            opt_radios = "".join(
+                "<label style='display:block;margin:4px 0'>"
+                f"<input type='radio' name='winning_option' value='{o.option_id}'> "
+                f"{html.escape(_fmt_iso_date(o.iso_date))}"
+                + (f" {_fmt_time(o.start_time)}" if o.start_time else "")
+                + "</label>"
+                for o in options)
+            close_body = (
+                "<b>Pick the winning date</b>"
+                f"{opt_radios}"
+                "<p><button type='submit' style='padding:7px 18px;cursor:pointer'>"
+                "Review &amp; send invites &rarr;</button></p>")
         close_html = (
             "<form method='post' action='/api/flex/event/close-review' "
             "style='margin:14px 0;padding:12px;border:1px solid #cfe5cf;"
             "border-radius:8px;background:#fbfdfb'>"
             f"<input type='hidden' name='event' value='{event_id}'>"
-            "<b>Pick the winning date</b>"
-            f"{opt_radios}"
-            "<p><button type='submit' style='padding:7px 18px;cursor:pointer'>"
-            "Review &amp; send invites &rarr;</button></p></form>")
+            f"{close_body}</form>")
 
     tokens = list(db.list_event_tokens(app.app_id, event_id))
     sent = len(tokens)
@@ -2964,6 +2987,16 @@ def _api_flex_event_send_poll(event: dict, user: User,
         + (f" {_fmt_time(o.start_time)}" if o.start_time else "")
         + (f" ({o.label})" if o.label else "")
         for o in options)
+    # A single-date event is a fixed-date invitation, not a date poll — the
+    # invite says "you're invited on <date>, can you come?" rather than asking
+    # people to pick among dates.
+    single = len(options) == 1
+    when_line = ""
+    if single:
+        _o0 = options[0]
+        when_line = (_fmt_iso_date(_o0.iso_date)
+                     + (f" {_fmt_time(_o0.start_time)}" if _o0.start_time else "")
+                     + (f" ({_o0.label})" if _o0.label else ""))
 
     now = dt.datetime.now(dt.timezone.utc)
     sent = 0
@@ -3083,6 +3116,21 @@ def _api_flex_event_send_poll(event: dict, user: User,
                     f"  {link}\n\n"
                     "(This link is just for you — no login needed.)\n\n"
                     f"-- {org_name}\n")
+        elif single:
+            # Fixed-date invitation — one date, RSVP not a poll.
+            subject = f"{org_name}: you're invited to {evt.title}"
+            body = (
+                f"Hi {u.name},\n\n"
+                f"You're invited to {evt.title} on {when_line}.\n\n"
+                + (f"{evt.description}\n\n" if evt.description else "")
+                + "Can you make it? Answer for your family or for yourself — "
+                "click your personal link to RSVP and say what you'll bring:\n\n"
+                f"  {link}\n\n"
+                "Please respond by clicking your personal link above. Replies to "
+                "this email are not recorded — your answer only counts through "
+                "the link.\n\n"
+                "(This link is just for you — no login needed.)\n\n"
+                f"-- {org_name}\n")
         else:
             # Not yet covered — the normal invitation.
             subject = f"{org_name}: vote on dates for {evt.title}"
@@ -3593,15 +3641,39 @@ def _flex_token_page(event: dict) -> dict:
                  f"{radios}</div>")
     cur_party = str(rsvp.party_size) if rsvp and rsvp.party_size else ""
     cur_bring = (rsvp.bringing if rsvp else "") or ""
+    # A single-date event is a fixed-date invitation, not a poll: Yes/Maybe/No
+    # on the one date reads as an RSVP. Adapt the framing (heading, sub-line,
+    # and the client-side confirms) so it doesn't talk about "dates" plural.
+    single = len(options) == 1
+    poll_heading = "Can you come?" if single else "Which dates work?"
+    poll_subline = (
+        "Let us know whether you can make it."
+        if single else
+        "Please mark <b>Yes</b>, <b>Maybe</b>, or <b>No</b> for <b>each</b> "
+        "date below — not just one.")
+    # \\u2019 = a JS-string-escaped apostrophe (this text is emitted inside a
+    # single-quoted confirm('...') literal).
+    js_incomplete = (
+        "You haven\\u2019t chosen an answer. Please mark Yes, Maybe, or No. "
+        "Submit anyway?"
+        if single else
+        "You haven\\u2019t answered every date. Please mark Yes, Maybe, or No "
+        "for each one. Submit anyway?")
+    js_allno = (
+        "You\\u2019ve marked No, so you can\\u2019t make it \\u2014 and you "
+        "won\\u2019t get further emails about this event. If that\\u2019s not "
+        "right, choose Yes or Maybe. Continue?"
+        if single else
+        "You said no to all dates. You won\\u2019t get future emails about this "
+        "event. To stay informed, mark Maybe on at least one. Continue?")
     body = (
         f"<h1>{html.escape(evt.title)}</h1>" + who_line + _hh_poll_detail(options)
         + (f"<p>{html.escape(evt.description)}</p>" if evt.description else "")
         + "<p style='color:#555'>Answer for your family or for yourself.</p>"
         "<form method='post' action='/api/e/vote' id='pollform'>"
         f"<input type='hidden' name='token' value='{html.escape(token)}'>"
-        "<h2 style='font-size:1.05em;margin-bottom:2px'>Which dates work?</h2>"
-        "<p style='color:#555;margin:0 0 10px'>Please mark <b>Yes</b>, "
-        "<b>Maybe</b>, or <b>No</b> for <b>each</b> date below — not just one.</p>"
+        f"<h2 style='font-size:1.05em;margin-bottom:2px'>{poll_heading}</h2>"
+        f"<p style='color:#555;margin:0 0 10px'>{poll_subline}</p>"
         f"{rows}"
         "<label style='display:block;margin:12px 0 4px'>How many from your "
         "household plan to attend?</label>"
@@ -3620,13 +3692,11 @@ def _flex_token_page(event: dict) -> dict:
         "function(r){groups[r.name]=1;});"
         "var total=Object.keys(groups).length;"
         "var rs=f.querySelectorAll('input[type=radio]:checked');"
-        "if(rs.length<total){if(!confirm('You haven\\u2019t answered every date. "
-        "Please mark Yes, Maybe, or No for each one. Submit anyway?')){"
-        "e.preventDefault();return;}}"
+        f"if(rs.length<total){{if(!confirm('{js_incomplete}')){{"
+        "e.preventDefault();return;}}}"
         "var ok=false;rs.forEach(function(r){if(r.value!=='no')ok=true;});"
-        "if(rs.length>0&&!ok){if(!confirm('You said no to all dates. You won\\u2019t "
-        "get future emails about this event. To stay informed, mark Maybe on at "
-        "least one. Continue?')){e.preventDefault();}}});</script>")
+        f"if(rs.length>0&&!ok){{if(!confirm('{js_allno}')){{"
+        "e.preventDefault();}}}});</script>")
     return _html(200, _page(body, title=evt.title))
 
 

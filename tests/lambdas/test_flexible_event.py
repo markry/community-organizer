@@ -1006,3 +1006,23 @@ def test_results_page_offers_the_picker_with_nobody_ticked(ddb_table) -> None:
     assert f"name='user_id' value='{bob.user_id}'" in body
     # Nobody pre-armed.
     assert "checked>" not in body.split("pick-panel")[1]
+
+
+def test_close_review_with_responses_renders(ddb_table) -> None:
+    """Regression: close-review 500'd with 'str has no attribute user_id' on any
+    poll that had >=1 RSVP — the handler iterated the rsvps DICT (yielding
+    user_id keys) instead of its .values(). Empty polls dodged it; a real
+    poll with a dozen responses hit it every time."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    # A real response with a household headcount — the trigger.
+    web._api_flex_token_vote(_post("/api/e/vote", {
+        "token": _mk_token(cid, evt, bob.user_id, token="tb"),
+        f"vote_{opt.option_id}": "yes", "party_size": "2"}))
+    resp = web._api_flex_event_close_review(
+        _post("/api/flex/event/close-review",
+              {"event": evt.event_id, "winning_option": opt.option_id}),
+        aa, db.get_community(cid), app, aa_mem)
+    assert resp["statusCode"] == 200                       # not a 500
+    assert "Send invites" in resp["body"]
+    assert "attending" in resp["body"]                     # headcount computed

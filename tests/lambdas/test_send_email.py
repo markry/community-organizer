@@ -367,3 +367,53 @@ def test_opted_out_member_is_never_a_recipient(ddb_table, monkeypatch):
                 aa, cid, app)
     assert _emails_to(fake, "dave@example.com") == []
     assert _emails_to(fake, "alice@example.com")
+
+
+# ---- calendar invites (the per-slot half of #178, lost in #215) -----------
+
+def _invites(fake):
+    return [k for k in fake.sent if k.get("ics_content")]
+
+
+def test_full_schedule_sends_one_invite_per_assignment(ddb_table, monkeypatch):
+    cid, app, aa, alice, bob, dave, ca, cb = _seed(ddb_table)
+    fake = _run(monkeypatch, _post({
+        "mode": "all", "subject": "June", "body": "b",
+        "all_include_schedule": "1", "all_copy_month": "2030-06",
+        "send_invites": "1"}), aa, cid, app)
+    inv = _invites(fake)
+    assert sorted(k["to_addr"] for k in inv) == ["alice@example.com",
+                                                 "bob@example.com"]
+    assert all("BEGIN:VEVENT" in k["ics_content"] for k in inv)
+    assert all(k["related_slot_id"] for k in inv)
+    # Dave and the AA have no assignments, so no invite -- but still the email.
+    assert _to(fake, "dave@example.com") is not None
+    assert not [k for k in inv if k["to_addr"] == "dave@example.com"]
+
+
+def test_no_invites_when_box_unticked(ddb_table, monkeypatch):
+    cid, app, aa, alice, bob, dave, ca, cb = _seed(ddb_table)
+    fake = _run(monkeypatch, _post({
+        "mode": "all", "subject": "June", "body": "b",
+        "all_include_schedule": "1", "all_copy_month": "2030-06"}),
+        aa, cid, app)
+    assert fake.sent and not _invites(fake)
+
+
+def test_cohort_slice_invites_only_that_cohort(ddb_table, monkeypatch):
+    cid, app, aa, alice, bob, dave, ca, cb = _seed(ddb_table)
+    fake = _run(monkeypatch, _post({
+        "mode": "select", "subject": "Hi", "body": "b",
+        "cohort": ca.cohort_id,
+        f"cohort_sched_{ca.cohort_id}": "1",
+        f"cohort_month_{ca.cohort_id}": "2030-06",
+        "send_invites": "1"}), aa, cid, app)
+    assert [k["to_addr"] for k in _invites(fake)] == ["alice@example.com"]
+
+
+def test_send_email_page_offers_invites_ticked(ddb_table):
+    cid, app, aa, alice, bob, dave, ca, cb = _seed(ddb_table)
+    ev = {"requestContext": {"http": {"method": "GET"}}}
+    body = web._send_email_page(ev, aa, db.get_community(cid), app,
+                                db.get_membership("ush", aa.user_id))["body"]
+    assert "name='send_invites' value='1' checked" in body

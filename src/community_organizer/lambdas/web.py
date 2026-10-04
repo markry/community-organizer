@@ -10794,8 +10794,12 @@ def _send_email_page(event: dict, user: User, community: Community | None,
         return _html(403, _page("<p>Admins only.</p><p><a href='/'>Back</a></p>"))
     org_name = app.name if app else (community.name if community else user.community_id)
     sent = _get_param(event, "sent")
+    invites = _get_param(event, "invites")
+    invites_note = (f" Calendar invites sent: {html.escape(invites)}."
+                    if invites else "")
     sent_msg = (f"<p style='color:#2a7;margin-bottom:16px'>"
-                f"Email sent to {html.escape(sent)} recipients.</p>" if sent else "")
+                f"Email sent to {html.escape(sent)} recipients.{invites_note}</p>"
+                if sent else "")
     templates_by_id = {t.template_id: t for t in db.list_templates(app.app_id)}
     def _cohort_sort_key(c):
         tpl = templates_by_id.get(c.linked_template_id or "")
@@ -11003,7 +11007,16 @@ def _send_email_page(event: dict, user: User, community: Community | None,
         "style='width:100%;padding:8px;font-size:1em;border:1px solid #ccc;"
         "border-radius:4px;box-sizing:border-box;font-family:inherit'></textarea>"
         "</div>"
-        "<button type='button' id='send-btn' style='padding:12px 28px;"
+        + ("" if not have_sched else (
+            "<div style='margin-bottom:16px'>"
+            "<label style='font-size:0.9em;color:#444'>"
+            "<input type='checkbox' name='send_invites' value='1' checked> "
+            "Send calendar invites for assignments</label>"
+            "<p style='color:#888;font-size:0.85em;margin:4px 0 0 24px'>"
+            "When a schedule is included, each recipient also gets one calendar "
+            "invite per slot they're assigned that month. Re-sending updates "
+            "the same calendar entry; it doesn't duplicate it.</p></div>"))
+        + "<button type='button' id='send-btn' style='padding:12px 28px;"
         "cursor:pointer;font-size:1.05em;color:white;background:#2a7;"
         "border:none;border-radius:4px;min-width:220px;"
         "font-weight:600'>Send email</button>"
@@ -11358,9 +11371,53 @@ def _api_send_email(event: dict, user: User, community: Community | None,
                 body_html=_html_body(msg, set()),
                 kind="other", related_app_id=app.app_id)
             sent += len(to)
-    log.info("admin %s sent schedule email (mode=%s, cohort_group=%s) to %d, subj=%s",
-             user.user_id, mode, bool(slice_cell) and not full_months, sent, subject)
-    return _redirect(f"/admin/send-email?sent={sent}")
+
+    # ---- calendar invites -----------------------------------------------
+    # One single-event invite per (recipient, assigned slot) in the months
+    # this email carries -- the per-slot half of the publish design (#178),
+    # which went missing when publish became state-only (#215).
+    invites = 0
+    if _p("send_invites"):
+        if full_months:
+            invite_months, invite_uids = full_months, recipient_uids
+        else:
+            invite_months = sorted({cell[0] for cell in slice_cell.values()})
+            invite_uids = individual_uids.union(
+                *(cohort_members.get(cid, set()) for cid in slice_cell))
+        invites = _send_schedule_invites(
+            community, app, invite_months, invite_uids,
+            provider=provider, from_addr=from_addr)
+    log.info("admin %s sent schedule email (mode=%s, cohort_group=%s) to %d, "
+             "invites=%d, subj=%s", user.user_id, mode,
+             bool(slice_cell) and not full_months, sent, invites, subject)
+    return _redirect(f"/admin/send-email?sent={sent}&invites={invites}")
+
+
+def _send_schedule_invites(community: Community, app: Application,
+                           months: list[str], user_ids: set[str], *,
+                           provider, from_addr: str) -> int:
+    """Send each of ``user_ids`` one calendar invite per slot they're assigned
+    in ``months``. Returns the number sent. A failed send is logged and
+    skipped so one bad address can't stop everyone else's invites."""
+    sent = 0
+    for yyyy_mm in months:
+        for ip in publishing.plan_invites(community, app, yyyy_mm):
+            if ip.user.user_id not in user_ids:
+                continue
+            try:
+                provider.send(
+                    community_id=community.community_id, from_addr=from_addr,
+                    to_addr=ip.user.email, subject=ip.subject,
+                    body_text=ip.body_text, body_html=ip.body_html,
+                    kind="publish_broadcast", related_user_id=ip.user.user_id,
+                    related_app_id=app.app_id, related_yyyy_mm=yyyy_mm,
+                    related_slot_id=ip.slot.slot_id,
+                    ics_content=ip.ics_content)
+                sent += 1
+            except Exception:
+                log.exception("schedule invite send failed for user %s slot %s",
+                              ip.user.user_id, ip.slot.slot_id)
+    return sent
 
 
 def _cohorts_page(event: dict, user: User, community: Community | None,

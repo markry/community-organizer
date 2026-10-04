@@ -206,6 +206,17 @@ def _send_reminder(ntf: Notification) -> bool:
         ntf.state = "cancelled"
         db.put_notification(ntf)
         return False
+    # The user must still HOLD this slot. Release/trade/admin-removal all
+    # delete the Assignment row but don't proactively cancel this pending
+    # reminder, so re-validate at send time — otherwise someone who traded
+    # out of their slot still gets the day-before reminder for it.
+    if not any(a.user_id == ntf.user_id for a in
+               db.list_assignments_for_slot(ntf.app_id, ntf.yyyy_mm, slot.slot_id)):
+        ntf.state = "cancelled"
+        db.put_notification(ntf)
+        log.info("reminder %s cancelled: user %s no longer assigned to slot %s",
+                 ntf.notification_id, ntf.user_id, slot.slot_id)
+        return False
     community = db.get_community(community_id)
     app = next((a for a in db.list_applications(community_id) if a.app_id == ntf.app_id), None)
     org_name = app.name if app else (community.name if community else community_id)

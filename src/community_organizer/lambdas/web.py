@@ -3271,7 +3271,7 @@ def _api_flex_event_close_review(event: dict, user: User,
     _cusers = {u.user_id: u for u in confirmed + couldnt}
     _conf_ids = {u.user_id for u in confirmed}
     attending_headcount = _flex_headcount(
-        [r for r in _rsvps if r.user_id in _conf_ids], _cusers)
+        [r for r in _rsvps.values() if r.user_id in _conf_ids], _cusers)
     date_label = (_fmt_iso_date(opt.iso_date)
                   + (f" {_fmt_time(opt.start_time)}" if opt.start_time else ""))
     draft = (f"Hi,\n\n{date_label} was chosen for {evt.title}. So sorry you "

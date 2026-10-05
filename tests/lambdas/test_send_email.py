@@ -417,3 +417,52 @@ def test_send_email_page_offers_invites_ticked(ddb_table):
     body = web._send_email_page(ev, aa, db.get_community(cid), app,
                                 db.get_membership("ush", aa.user_id))["body"]
     assert "name='send_invites' value='1' checked" in body
+
+
+# ---- safeguards: warn before (unticked) and after (short) -----------------
+
+def test_short_invites_redirect_carries_planned_count(ddb_table, monkeypatch):
+    cid, app, aa, alice, bob, dave, ca, cb = _seed(ddb_table)
+
+    class FlakyProvider(FakeProvider):
+        def send(self, **kwargs):
+            if kwargs.get("ics_content") and kwargs["to_addr"] == "bob@example.com":
+                raise RuntimeError("SES throttled")
+            return super().send(**kwargs)
+
+    fake = FlakyProvider()
+    monkeypatch.setattr("community_organizer.providers.email.get_email_provider",
+                        lambda: fake)
+    resp = web._api_send_email(_post({
+        "mode": "all", "subject": "June", "body": "b",
+        "all_include_schedule": "1", "all_copy_month": "2030-06",
+        "send_invites": "1"}), aa, db.get_community(cid), app,
+        db.get_membership("ush", aa.user_id))
+    loc = resp["headers"]["Location"]
+    assert "invites=1" in loc and "invites_planned=2" in loc
+
+
+def _page_with(ddb_table, query):
+    cid, app, aa, *_ = _seed(ddb_table)
+    ev = {"requestContext": {"http": {"method": "GET"}},
+          "queryStringParameters": query}
+    return web._send_email_page(ev, aa, db.get_community(cid), app,
+                                db.get_membership("ush", aa.user_id))["body"]
+
+
+def test_page_warns_when_invites_fell_short(ddb_table):
+    body = _page_with(ddb_table, {"sent": "4", "invites": "1",
+                                  "invites_planned": "2"})
+    assert "only 1 of 2 calendar invites were sent" in body
+
+
+def test_page_quiet_when_all_invites_sent(ddb_table):
+    body = _page_with(ddb_table, {"sent": "4", "invites": "2",
+                                  "invites_planned": "2"})
+    assert "calendar invites were sent" not in body
+    assert "Calendar invites sent: 2." in body
+
+
+def test_confirm_dialog_mentions_unticked_invites(ddb_table):
+    body = _page_with(ddb_table, {})
+    assert "No calendar invites will be sent." in body

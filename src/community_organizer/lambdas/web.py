@@ -10795,11 +10795,23 @@ def _send_email_page(event: dict, user: User, community: Community | None,
     org_name = app.name if app else (community.name if community else user.community_id)
     sent = _get_param(event, "sent")
     invites = _get_param(event, "invites")
+    planned = _get_param(event, "invites_planned")
     invites_note = (f" Calendar invites sent: {html.escape(invites)}."
                     if invites else "")
     sent_msg = (f"<p style='color:#2a7;margin-bottom:16px'>"
                 f"Email sent to {html.escape(sent)} recipients.{invites_note}</p>"
                 if sent else "")
+    # After-check: invites were asked for but fewer went out than were planned.
+    # This is how the Jul 2026 regression (no invites at all, for three months)
+    # would have shown up on the very first send.
+    if (sent and planned and invites is not None and invites.isdigit()
+            and planned.isdigit() and int(invites) < int(planned)):
+        sent_msg += (
+            "<p style='color:#b00;font-weight:600;margin-bottom:16px'>"
+            f"Warning: only {html.escape(invites)} of {html.escape(planned)} "
+            "calendar invites were sent. Some members won't get their "
+            "assignments on their calendars. Please tell the site "
+            "administrator.</p>")
     templates_by_id = {t.template_id: t for t in db.list_templates(app.app_id)}
     def _cohort_sort_key(c):
         tpl = templates_by_id.get(c.linked_template_id or "")
@@ -11103,6 +11115,12 @@ def _send_email_page(event: dict, user: User, community: Community | None,
         "var confirmPrompt=sched?"
         "'Send this email with the schedule to the selected recipients?':"
         "'Send this email to the selected recipients?';"
+        # Unticking invites is a legitimate choice, so say so BEFORE sending
+        # rather than complaining after (the after-check only flags failures).
+        "var inv=document.querySelector('input[name=send_invites]');"
+        "if(sched&&inv&&!inv.checked){confirmPrompt+="
+        "'<br><br><b>No calendar invites will be sent.</b> Members with "
+        "assignments won\\u2019t get them on their calendars.';}"
         "var confirmBtnLabel=sched?'Send email + schedule':'Send';"
         "var d=document.createElement('div');"
         "d.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;"
@@ -11376,7 +11394,7 @@ def _api_send_email(event: dict, user: User, community: Community | None,
     # One single-event invite per (recipient, assigned slot) in the months
     # this email carries -- the per-slot half of the publish design (#178),
     # which went missing when publish became state-only (#215).
-    invites = 0
+    invites = planned = 0
     if _p("send_invites"):
         if full_months:
             invite_months, invite_uids = full_months, recipient_uids
@@ -11384,26 +11402,34 @@ def _api_send_email(event: dict, user: User, community: Community | None,
             invite_months = sorted({cell[0] for cell in slice_cell.values()})
             invite_uids = individual_uids.union(
                 *(cohort_members.get(cid, set()) for cid in slice_cell))
-        invites = _send_schedule_invites(
+        invites, planned = _send_schedule_invites(
             community, app, invite_months, invite_uids,
             provider=provider, from_addr=from_addr)
+        if invites < planned:
+            log.error("schedule invites short: sent %d of %d planned "
+                      "(app %s, months %s)", invites, planned, app.app_id,
+                      ",".join(invite_months))
     log.info("admin %s sent schedule email (mode=%s, cohort_group=%s) to %d, "
-             "invites=%d, subj=%s", user.user_id, mode,
-             bool(slice_cell) and not full_months, sent, invites, subject)
-    return _redirect(f"/admin/send-email?sent={sent}&invites={invites}")
+             "invites=%d/%d, subj=%s", user.user_id, mode,
+             bool(slice_cell) and not full_months, sent, invites, planned,
+             subject)
+    return _redirect(f"/admin/send-email?sent={sent}&invites={invites}"
+                     f"&invites_planned={planned}")
 
 
 def _send_schedule_invites(community: Community, app: Application,
                            months: list[str], user_ids: set[str], *,
-                           provider, from_addr: str) -> int:
+                           provider, from_addr: str) -> tuple[int, int]:
     """Send each of ``user_ids`` one calendar invite per slot they're assigned
-    in ``months``. Returns the number sent. A failed send is logged and
-    skipped so one bad address can't stop everyone else's invites."""
-    sent = 0
+    in ``months``. Returns (sent, planned). A failed send is logged and
+    skipped so one bad address can't stop everyone else's invites; the caller
+    compares the two counts and warns when they differ."""
+    sent = planned = 0
     for yyyy_mm in months:
         for ip in publishing.plan_invites(community, app, yyyy_mm):
             if ip.user.user_id not in user_ids:
                 continue
+            planned += 1
             try:
                 provider.send(
                     community_id=community.community_id, from_addr=from_addr,
@@ -11417,7 +11443,7 @@ def _send_schedule_invites(community: Community, app: Application,
             except Exception:
                 log.exception("schedule invite send failed for user %s slot %s",
                               ip.user.user_id, ip.slot.slot_id)
-    return sent
+    return sent, planned
 
 
 def _cohorts_page(event: dict, user: User, community: Community | None,

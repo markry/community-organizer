@@ -605,6 +605,15 @@ class FlexibleEvent:
     winning_start_time: str | None = None        # "HH:MM" 24h
     winning_duration_minutes: int = 120          # for the calendar invite
     notify_on_response: bool = False             # email AA(s) on each response
+    # Hosting: when on, members who are coming are asked whether they'd be
+    # willing to host — but only once the date is known (a one-date event, or
+    # after the poll closes): nobody can offer a home for an unknown date.
+    # Answers are visible to the app's AAs only. The AA picks a host from the
+    # volunteers; the host is told privately, and the AA announces it (or not)
+    # however they like — nothing is broadcast automatically.
+    ask_for_host: bool = False
+    host_prompt: str | None = None               # None = default wording
+    host_user_id: str | None = None              # the volunteer the AA chose
     poll_closes_at: str | None = None            # optional ISO datetime
     # Event id this one was folded into, when an AA ran two polls for the
     # same gathering. The row stays as a tombstone rather than being deleted
@@ -650,6 +659,10 @@ class FlexibleRSVP:
     votes: dict[str, str] = field(default_factory=dict)
     confirmed_response: AttendanceResponse | None = None
     bringing: str | None = None
+    # Hosting offer (see FlexibleEvent.ask_for_host). AA-only: never shown
+    # to other members, household-mates included.
+    willing_to_host: bool = False
+    host_note: str | None = None                 # address, room, parking…
     # Best-guess household headcount (including the responder) — the
     # member answers for their whole family. Summed (household-grouped)
     # for the AA's total expected attendance.

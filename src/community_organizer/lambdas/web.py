@@ -1053,6 +1053,10 @@ def _dispatch(event: dict, context) -> dict:  # noqa: ARG001
         return _route(event, _api_flex_event_save_message)
     if path == "/api/flex/event/notify":
         return _route(event, _api_flex_event_save_notify)
+    if path == "/api/flex/event/ask-host":
+        return _route(event, _api_flex_event_save_ask_host)
+    if path == "/api/flex/event/host":
+        return _route(event, _api_flex_event_choose_host)
     if path.startswith("/ics/"):
         return _route(event, _serve_ics_for_assignment)
     if path == "/launcher":
@@ -2166,6 +2170,48 @@ def _fmt_iso_date(iso: str) -> str:
         return iso
 
 
+# ---- hosting volunteers ------------------------------------------------------
+# An AA can ask the people who are coming whether they'd host. The question is
+# only put once the date is known — a one-date event, or a poll that has been
+# closed — because nobody can offer their home for an unknown date. Offers are
+# AA-only; the AA picks a host, who is told privately, and announces it (or
+# not) themselves.
+
+_DEFAULT_HOST_PROMPT = "Would you be willing to host?"
+
+
+def _flex_date_known(evt: FlexibleEvent, n_options: int) -> bool:
+    return evt.state == "scheduled" or (evt.state == "poll" and n_options == 1)
+
+
+def _flex_host_question_open(evt: FlexibleEvent, n_options: int) -> bool:
+    """True while members should be asked whether they'd host."""
+    return (evt.ask_for_host and not evt.host_user_id
+            and _flex_date_known(evt, n_options))
+
+
+def _flex_host_fields_html(evt: FlexibleEvent, rsvp: FlexibleRSVP | None) -> str:
+    """The member-facing hosting checkbox + note, for the RSVP forms."""
+    checked = " checked" if rsvp and rsvp.willing_to_host else ""
+    note = (rsvp.host_note if rsvp else "") or ""
+    prompt = evt.host_prompt or _DEFAULT_HOST_PROMPT
+    return (
+        "<fieldset style='border:1px solid #ddd;border-radius:8px;"
+        "padding:10px 12px;margin:14px 0;max-width:420px;text-align:left'>"
+        f"<legend style='font-weight:600;padding:0 6px'>{html.escape(prompt)}"
+        "</legend>"
+        "<label style='cursor:pointer'><input type='checkbox' "
+        f"name='willing_to_host' value='1'{checked}> Yes, I'd be willing to host"
+        "</label>"
+        "<label style='display:block;margin:8px 0 4px;font-size:0.92em'>"
+        "Anything the organizers should know? (address, how many fit, "
+        "parking&hellip;)</label>"
+        "<textarea name='host_note' rows='2' style='padding:6px;width:100%'>"
+        f"{html.escape(note)}</textarea>"
+        "<p style='color:#888;font-size:0.85em;margin:6px 0 0'>Only the "
+        "organizers see this.</p></fieldset>")
+
+
 # ---- AA/member home: state dashboard (not a calendar) ----------------------
 
 def _flexible_home(*, event: dict, user: User, community: Community | None,
@@ -2240,6 +2286,9 @@ def _flexible_home(*, event: dict, user: User, community: Community | None,
             if e.location:
                 line += f" &middot; {html.escape(e.location)}"
             line += f" &middot; {n_attending(e.event_id)} attending"
+            if is_admin and e.host_user_id and e.host_user_id in users:
+                h = users[e.host_user_id]
+                line += f" &middot; host: {html.escape(h.name or h.email)}"
             rows += f"<li style='padding:6px 0'>{line}{results_link(e)}</li>"
         parts.append("<h2 style='font-size:1.1em;color:#2a7'>Scheduled</h2>"
                      "<ul style='margin:0 0 18px;padding-left:0;"
@@ -2311,6 +2360,13 @@ def _flex_event_new_page(event: dict, user: User, community: Community | None,
           "(minutes)</label>"
           "<input type='number' name='duration' min='15' step='15' value='120' "
           "style='padding:6px;width:100px'>"
+          "<label style='display:block;margin:14px 0 2px;cursor:pointer'>"
+          "<input type='checkbox' name='ask_for_host' value='1'> "
+          "Ask who'd be willing to host</label>"
+          "<p style='color:#888;font-size:0.85em;margin:0 0 4px 22px'>People "
+          "who are coming get a &ldquo;would you host?&rdquo; question &mdash; "
+          "with one date, right away; with several, once you've picked the "
+          "date. Only admins see the answers. You choose the host.</p>"
           "<fieldset style='border:1px solid #ddd;border-radius:8px;"
           "padding:12px;margin:16px 0'>"
           "<legend style='font-weight:600;color:#444;padding:0 8px'>"
@@ -2353,7 +2409,8 @@ def _api_flex_event_create(event: dict, user: User, community: Community | None,
     evt = FlexibleEvent(
         community_id=app.community_id, app_id=app.app_id, title=title,
         state="poll", description=description, location=location,
-        winning_duration_minutes=duration, created_by=user.user_id)
+        winning_duration_minutes=duration, created_by=user.user_id,
+        ask_for_host=bool((parsed.get("ask_for_host", [""])[0] or "").strip()))
     db.put_flexible_event(evt)
     n = 0
     for i in range(20):
@@ -2792,6 +2849,78 @@ def _flex_event_results_page(event: dict, user: User,
             f"{checked} onchange='this.form.submit()'> "
             "Email me each time someone responds</label></form>")
 
+    # Hosting: the per-event setting (with its wording), then — when on — who
+    # has offered and who was chosen. AA-only, like the rest of this page.
+    host_html = ""
+    if evt.state in ("poll", "scheduled"):
+        host_checked = " checked" if evt.ask_for_host else ""
+        host_html = (
+            "<form method='post' action='/api/flex/event/ask-host' "
+            "style='margin:10px 0;text-align:left;max-width:560px'>"
+            f"<input type='hidden' name='event' value='{event_id}'>"
+            "<label style='font-size:0.92em;color:#555;cursor:pointer'>"
+            "<input type='checkbox' name='ask_for_host' value='1'"
+            f"{host_checked}> Ask who'd be willing to host</label> "
+            "<input type='text' name='host_prompt' "
+            f"placeholder='{html.escape(_DEFAULT_HOST_PROMPT)}' "
+            f"value='{html.escape(evt.host_prompt or '')}' "
+            "style='padding:4px;width:260px;font-size:0.9em' "
+            "title='Wording of the question (optional)'> "
+            "<button type='submit' style='padding:4px 12px;cursor:pointer;"
+            "font-size:0.9em'>Save</button></form>")
+    if evt.ask_for_host and evt.state in ("poll", "scheduled"):
+        volunteers = sorted((r for r in rsvps if r.willing_to_host
+                             and r.confirmed_response != "no"),
+                            key=lambda r: name_of(r.user_id).lower())
+        host_rows = ""
+        for r in volunteers:
+            is_host = r.user_id == evt.host_user_id
+            note = (f" &mdash; <span style='color:#555'>"
+                    f"{html.escape(r.host_note)}</span>" if r.host_note else "")
+            action = (
+                "<form method='post' action='/api/flex/event/host' "
+                "style='display:inline;margin-left:8px'>"
+                f"<input type='hidden' name='event' value='{event_id}'>"
+                f"<input type='hidden' name='user_id' value='{r.user_id}'>"
+                "<button type='submit' style='padding:2px 10px;cursor:pointer;"
+                "font-size:0.85em' onclick=\"return confirm('Choose this "
+                "person as host? They will get a private thank-you email "
+                "letting them know.');\">Choose as host</button></form>"
+                if not is_host else
+                " <b style='color:#2a7'>&check; host</b>")
+            host_rows += (f"<li style='margin:4px 0'><b>"
+                          f"{html.escape(name_of(r.user_id))}</b>{note}"
+                          f"{action}</li>")
+        if evt.host_user_id:
+            chosen = (
+                f"<p>Host: <b>{html.escape(name_of(evt.host_user_id))}</b>. "
+                "They've been told privately; letting the group know is up to "
+                "you (e.g. via Send Email). The question is now closed.</p>"
+                "<form method='post' action='/api/flex/event/host' "
+                "style='margin:0 0 6px'>"
+                f"<input type='hidden' name='event' value='{event_id}'>"
+                "<input type='hidden' name='user_id' value=''>"
+                "<button type='submit' style='font-size:0.85em;background:none;"
+                "border:none;color:#c33;text-decoration:underline;"
+                "cursor:pointer;padding:0' onclick=\"return confirm('Clear the "
+                "host and reopen the question? The current host is NOT "
+                "emailed; let them know yourself.');\">Clear host and reopen "
+                "the question</button></form>")
+        elif not _flex_date_known(evt, len(options)):
+            chosen = ("<p style='color:#888'>Members will be asked once you've "
+                      "picked the date &mdash; the confirmation email carries "
+                      "the question.</p>")
+        else:
+            chosen = ("<p style='color:#888'>No host chosen yet.</p>"
+                      if volunteers else
+                      "<p style='color:#888'>No one has offered yet.</p>")
+        host_html += (
+            "<h2 style='font-size:1.05em;margin-top:14px'>Hosting "
+            "<span style='color:#888;font-weight:normal;font-size:0.8em'>"
+            "(visible to admins only)</span></h2>" + chosen
+            + (f"<ul style='padding-left:18px'>{host_rows}</ul>"
+               if host_rows else ""))
+
     body = (
         f"<h1>{html.escape(evt.title)}</h1>"
         f"<p style='color:#666;margin-top:-6px'>{html.escape(app.name)}</p>"
@@ -2833,6 +2962,7 @@ def _flex_event_results_page(event: dict, user: User,
         + "</p>"
         + ("<h2 style='font-size:1.05em;margin-top:14px'>Bringing</h2>"
            f"<ul>{bringing_rows}</ul>" if bringing_rows else "")
+        + host_html
         + close_html
         + cancel_html
         # The results page isn't a nav tab — pass no current so "App home"
@@ -3217,6 +3347,112 @@ def _api_flex_event_save_notify(event: dict, user: User,
                      + urllib.parse.quote(msg))
 
 
+def _api_flex_event_save_ask_host(event: dict, user: User,
+                                  community: Community | None,
+                                  app: Application,
+                                  membership: Membership | None) -> dict:
+    """AA turns 'ask who'd be willing to host' on/off and sets its wording."""
+    if _http_method(event) != "POST":
+        return _text(405, "POST required")
+    guard = _flex_guard(user, membership, app)
+    if guard:
+        return guard
+    event_id = (_get_param(event, "event") or "").strip()
+    evt = db.get_flexible_event(app.app_id, event_id)
+    if evt is None or evt.state not in ("poll", "scheduled"):
+        return _error_redirect("/", "Event not found.")
+    evt.ask_for_host = bool(_get_param(event, "ask_for_host"))
+    evt.host_prompt = (_get_param(event, "host_prompt") or "").strip() or None
+    try:
+        db.put_flexible_event(evt, expected_version=evt.version)
+    except db.ConcurrencyConflict:
+        return _error_redirect(f"/flex/event/results?event={event_id}",
+                               "Someone else just changed this — refresh.")
+    if not evt.ask_for_host:
+        msg = "Members won't be asked about hosting."
+    elif _flex_date_known(evt, sum(1 for _ in db.list_flexible_poll_options(
+            app.app_id, event_id))):
+        msg = ("Members who are coming will see the hosting question when they "
+               "open their link.")
+    else:
+        msg = ("Members will be asked about hosting once you've picked the date.")
+    return _redirect(f"/flex/event/results?event={event_id}&notice="
+                     + urllib.parse.quote(msg))
+
+
+def _api_flex_event_choose_host(event: dict, user: User,
+                                community: Community | None, app: Application,
+                                membership: Membership | None) -> dict:
+    """AA picks a host from the volunteers (or clears the choice with an empty
+    user_id). The chosen host gets a private thank-you; nobody else is told —
+    announcing it is the AA's call. Clearing does NOT email the former host."""
+    if _http_method(event) != "POST":
+        return _text(405, "POST required")
+    guard = _flex_guard(user, membership, app)
+    if guard:
+        return guard
+    event_id = (_get_param(event, "event") or "").strip()
+    host_id = (_get_param(event, "user_id") or "").strip()
+    evt = db.get_flexible_event(app.app_id, event_id)
+    if evt is None or evt.state not in ("poll", "scheduled"):
+        return _error_redirect("/", "That event is not open.")
+    back = f"/flex/event/results?event={event_id}"
+    options = list(db.list_flexible_poll_options(app.app_id, event_id))
+    if not host_id:
+        evt.host_user_id = None
+        try:
+            db.put_flexible_event(evt, expected_version=evt.version)
+        except db.ConcurrencyConflict:
+            return _error_redirect(back, "Someone else just changed this — refresh.")
+        return _redirect(back + "&notice=" + urllib.parse.quote(
+            "Host cleared — the question is open again."))
+    if not _flex_date_known(evt, len(options)):
+        return _error_redirect(back, "Pick the date before choosing a host.")
+    rsvp = db.get_flexible_rsvp(app.app_id, event_id, host_id)
+    if rsvp is None or not rsvp.willing_to_host or rsvp.confirmed_response == "no":
+        return _error_redirect(back, "That person hasn't offered to host.")
+    host = db.get_user(app.community_id, host_id)
+    if host is None:
+        return _error_redirect(back, "That member no longer exists.")
+    evt.host_user_id = host_id
+    try:
+        db.put_flexible_event(evt, expected_version=evt.version)
+    except db.ConcurrencyConflict:
+        return _error_redirect(back, "Someone else just changed this — refresh.")
+    if evt.state == "scheduled":
+        iso, start = evt.winning_date or "", evt.winning_start_time
+    else:
+        iso, start = options[0].iso_date, options[0].start_time
+    date_label = _fmt_iso_date(iso) + (f" {_fmt_time(start)}" if start else "")
+    org_name = app.name or (community.name if community else "")
+    told = False
+    if host.email and not host.email_undeliverable:
+        try:
+            from community_organizer.providers.email import get_email_provider
+            get_email_provider().send(
+                community_id=app.community_id,
+                from_addr=_from_addr(user.name, org_name), to_addr=host.email,
+                subject=f"{org_name}: you're hosting {evt.title}",
+                body_text=(f"Hi {host.name},\n\nThank you for offering to host "
+                           f"{evt.title} on {date_label}. We'd love to take you "
+                           "up on it — you're our host!\n\nWe'll be in touch "
+                           "about the details. We haven't told the rest of the "
+                           f"group yet.\n\n-- {user.name or org_name}\n"),
+                kind="event_host_chosen", related_user_id=host_id,
+                related_app_id=app.app_id)
+            told = True
+        except Exception:
+            log.exception("host-chosen email failed app=%s event=%s user=%s",
+                          app.app_id, event_id, host_id)
+    log.info("flex host chosen app=%s event=%s host=%s by=%s emailed=%s",
+             app.app_id, event_id, host_id, user.user_id, told)
+    who = host.name or host.email
+    return _redirect(back + "&notice=" + urllib.parse.quote(
+        f"{who} is the host"
+        + (" and has been sent a private thank-you." if told
+           else " — but couldn't be emailed; please let them know yourself.")))
+
+
 # ---- AA: close (two-step — review the cohorts, then send) ------------------
 
 def _flex_cohorts(app: Application, community: Community | None,
@@ -3298,6 +3534,14 @@ def _api_flex_event_close_review(event: dict, user: User,
         "<textarea name='confirm_message' rows='3' "
         f"style='width:100%;max-width:520px;padding:6px'>{html.escape(confirm_draft)}"
         "</textarea>"
+        + ("<p style='color:#555;font-size:0.9em;margin:6px 0 0'>Each "
+           "confirmation also asks &ldquo;"
+           + html.escape(evt.host_prompt or _DEFAULT_HOST_PROMPT)
+           + "&rdquo; with the person's own link. Only admins see the "
+           "answers.</p>"
+           if (evt.ask_for_host and not evt.host_user_id
+               and sum(1 for _ in db.list_flexible_poll_options(
+                   app.app_id, event_id)) > 1) else "") +
         f"<h2 style='font-size:1.05em;color:#c33'>Courtesy note &rarr; "
         f"{len(couldnt)} can't make it</h2>"
         f"<p style='color:#555'>{names(couldnt)}</p>"
@@ -3364,9 +3608,21 @@ def _api_flex_event_close(event: dict, user: User,
     date_label = (_fmt_iso_date(opt.iso_date)
                   + (f" {_fmt_time(evt.winning_start_time)}"
                      if evt.winning_start_time else ""))
+    # With several candidate dates nobody has been asked about hosting yet
+    # (see _flex_host_question_open): this confirmation is where it's asked.
+    ask_host_now = (evt.ask_for_host and not evt.host_user_id
+                    and len(options) > 1)
+    host_prompt = evt.host_prompt or _DEFAULT_HOST_PROMPT
     for u in confirmed:
         r = rsvps.get(u.user_id)
         bringing = r.bringing if r else None
+        host_ask = ""
+        if ask_host_now and not (r and r.willing_to_host):
+            tk = db.get_event_token(app.app_id, event_id, u.user_id)
+            if tk:
+                host_ask = (f"{host_prompt} If so, let us know through your "
+                            f"personal link (only the organizers see your "
+                            f"answer):\n  https://{domain}/e/{tk.token}\n\n")
         ics = ical.make_flexible_event_ics(
             event_id=event_id, iso_date=opt.iso_date,
             start_time=evt.winning_start_time,
@@ -3378,6 +3634,7 @@ def _api_flex_event_close(event: dict, user: User,
                 + (f" at {loc}" if loc else "") + ".\n\n"
                 + (f"{confirm_message}\n\n" if confirm_message else "")
                 + (f"You're bringing: {bringing}\n\n" if bringing else "")
+                + host_ask
                 + "A calendar invite is attached.\n\n"
                 f"-- {org_name}\n")
         provider.send(
@@ -3613,12 +3870,20 @@ def _flex_token_page(event: dict) -> dict:
                 "background:#2a7;color:#fff;border:none;border-radius:5px'>"
                 "Yes, I can come</button></form>" + optout)
         else:
+            hosting = ""
+            if evt.host_user_id and evt.host_user_id == tok.user_id:
+                hosting = ("<p style='background:#f0fff5;border:1px solid #2a7;"
+                           "border-radius:6px;padding:8px 12px'>You're hosting "
+                           "&mdash; thank you!</p>")
+            elif _flex_host_question_open(evt, 0):
+                hosting = _flex_host_fields_html(evt, rsvp)
             body = (head
                 + "<form method='post' action='/api/e/vote'>"
                 f"<input type='hidden' name='token' value='{html.escape(token)}'>"
                 f"<label>{html.escape(bring_prompt)}</label><br>"
                 f"<input type='text' name='bringing' value='{html.escape(cur_bring)}' "
                 "style='padding:6px;width:100%;max-width:420px'>"
+                + hosting +
                 "<p><button type='submit' style='padding:7px 18px;cursor:pointer'>"
                 "Save</button></p></form>" + optout)
         return _html(200, _page(body, title=evt.title))
@@ -3666,6 +3931,20 @@ def _flex_token_page(event: dict) -> dict:
         if single else
         "You said no to all dates. You won\\u2019t get future emails about this "
         "event. To stay informed, mark Maybe on at least one. Continue?")
+    # Hosting: with one date it's a real question now; with several it's only
+    # a heads-up, since nobody can offer their home for an unknown date.
+    if evt.host_user_id and evt.host_user_id == tok.user_id:
+        hosting = ("<p style='background:#f0fff5;border:1px solid #2a7;"
+                   "border-radius:6px;padding:8px 12px'>You're hosting "
+                   "&mdash; thank you!</p>")
+    elif _flex_host_question_open(evt, len(options)):
+        hosting = _flex_host_fields_html(evt, rsvp)
+    elif evt.ask_for_host and not evt.host_user_id and not single:
+        hosting = ("<p style='color:#555;font-size:0.92em;margin:12px 0'>Once "
+                   "we settle on a date, we'll ask who'd be willing to host."
+                   "</p>")
+    else:
+        hosting = ""
     body = (
         f"<h1>{html.escape(evt.title)}</h1>" + who_line + _hh_poll_detail(options)
         + (f"<p>{html.escape(evt.description)}</p>" if evt.description else "")
@@ -3683,6 +3962,7 @@ def _flex_token_page(event: dict) -> dict:
         f"{html.escape(bring_prompt)}</label>"
         f"<input type='text' name='bringing' value='{html.escape(cur_bring)}' "
         "style='padding:6px;width:100%;max-width:420px'>"
+        + hosting +
         "<p><button type='submit' style='padding:8px 22px;cursor:pointer;"
         "background:#2a7;color:#fff;border:none;border-radius:5px'>Submit"
         "</button></p></form>" + optout
@@ -3743,9 +4023,12 @@ def _api_flex_token_vote(event: dict) -> dict:
     if rsvp is None:
         rsvp = FlexibleRSVP(community_id=tok.community_id, app_id=tok.app_id,
                             event_id=tok.event_id, user_id=tok.user_id)
+    options = (list(db.list_flexible_poll_options(tok.app_id, tok.event_id))
+               if evt.state == "poll" else [])
+    was_host_volunteer = rsvp.willing_to_host
     if evt.state == "poll":
         votes: dict[str, str] = {}
-        for o in db.list_flexible_poll_options(tok.app_id, tok.event_id):
+        for o in options:
             v = (parsed.get(f"vote_{o.option_id}", [""])[0] or "").strip()
             if v in ("yes", "no", "maybe"):
                 votes[o.option_id] = v
@@ -3762,6 +4045,15 @@ def _api_flex_token_vote(event: dict) -> dict:
             pass
     bringing = (parsed.get("bringing", [""])[0] or "").strip()
     rsvp.bringing = bringing or None
+    # The hosting fields are only on the form while the question is open, so
+    # only then does their absence mean "unticked". A No clears any offer.
+    if _flex_host_question_open(evt, len(options)):
+        rsvp.willing_to_host = bool(
+            (parsed.get("willing_to_host", [""])[0] or "").strip())
+        rsvp.host_note = (parsed.get("host_note", [""])[0] or "").strip() or None
+    if rsvp.confirmed_response == "no":
+        rsvp.willing_to_host = False
+    new_host_offer = rsvp.willing_to_host and not was_host_volunteer
     rsvp.updated_at = dt.datetime.now(dt.timezone.utc).isoformat(
         timespec="seconds")
     try:
@@ -3791,6 +4083,9 @@ def _api_flex_token_vote(event: dict) -> dict:
             lines.append(f"  Headcount: {rsvp.party_size}")
         if rsvp.bringing:
             lines.append(f"  Bringing: {rsvp.bringing}")
+        if rsvp.willing_to_host:
+            lines.append("  Willing to host: yes"
+                         + (f" — {rsvp.host_note}" if rsvp.host_note else ""))
         if rsvp.confirmed_response == "no":
             lines.append("  (declined — no to all dates)")
         detail = "\n".join(lines) if lines else "  (no details)"
@@ -3802,6 +4097,27 @@ def _api_flex_token_vote(event: dict) -> dict:
                        f"results page:\n\n  {results_url}\n\n"
                        "-- Community Organizer\n"),
             kind="event_response_notice", related_user_id=tok.user_id)
+    elif new_host_offer:
+        # A hosting offer is rare and needs acting on, so the AAs hear about
+        # it even with per-response emails off (when on, the response email
+        # above already says so — don't send two).
+        member = db.get_user(tok.community_id, tok.user_id)
+        app = next((a for a in db.list_applications(tok.community_id)
+                    if a.app_id == tok.app_id), None)
+        org_name = app.name if app else tok.app_id
+        who = (member.name or member.email) if member else tok.user_id
+        results_url = (f"https://{_public_domain(db.get_community(tok.community_id))}"
+                       f"/flex/event/results?event={tok.event_id}")
+        _notify_app_admins(
+            community_id=tok.community_id, app_id=tok.app_id, org_name=org_name,
+            subject=f"{org_name}: {who} offered to host {evt.title}",
+            body_text=(f"Hi {{aa_name}},\n\n{who} has offered to host "
+                       f"{evt.title}."
+                       + (f"\n\nTheir note: {rsvp.host_note}"
+                          if rsvp.host_note else "")
+                       + f"\n\nYou can choose a host on the results page:\n\n"
+                       f"  {results_url}\n\n-- Community Organizer\n"),
+            kind="event_host_offer", related_user_id=tok.user_id)
     if rsvp.confirmed_response == "no":
         return _flex_terminal_page(
             "Got it — you won't get further emails about this event. Open "

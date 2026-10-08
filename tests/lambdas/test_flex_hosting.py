@@ -267,3 +267,17 @@ def test_ask_host_setting_and_create_flag(ddb_table) -> None:
         _post("/api/flex/event/ask-host", {"event": evt.event_id}),
         aa, db.get_community(cid), app, aa_mem)
     assert not db.get_flexible_event("a1", evt.event_id).ask_for_host
+
+
+def test_new_events_email_the_admins_on_each_response(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    web._api_flex_event_create(
+        _post("/api/flex/event/create", {"title": "Dinner", "date0": "2026-09-05"}),
+        aa, db.get_community(cid), app, aa_mem)
+    evt = next(iter(db.list_flexible_events("a1")))
+    assert evt.notify_on_response
+    opt = next(iter(db.list_flexible_poll_options("a1", evt.event_id)))
+    _mk_token(cid, evt, joe.user_id, token="tj")
+    web._api_flex_token_vote(_post("/api/e/vote", {
+        "token": "tj", f"vote_{opt.option_id}": "yes", "party_size": "1"}))
+    assert [m["kind"] for m in outbox] == ["event_response_notice"]

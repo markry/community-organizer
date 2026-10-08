@@ -2410,6 +2410,9 @@ def _api_flex_event_create(event: dict, user: User, community: Community | None,
         community_id=app.community_id, app_id=app.app_id, title=title,
         state="poll", description=description, location=location,
         winning_duration_minutes=duration, created_by=user.user_id,
+        # On by default: admins want to hear each response. Each event's
+        # results page can switch it off.
+        notify_on_response=True,
         ask_for_host=bool((parsed.get("ask_for_host", [""])[0] or "").strip()))
     db.put_flexible_event(evt)
     n = 0
@@ -2847,7 +2850,7 @@ def _flex_event_results_page(event: dict, user: User,
             "<label style='font-size:0.92em;color:#555;cursor:pointer'>"
             "<input type='checkbox' name='notify_on_response' value='1'"
             f"{checked} onchange='this.form.submit()'> "
-            "Email me each time someone responds</label></form>")
+            "Email the admins each time someone responds</label></form>")
 
     # Hosting: the per-event setting (with its wording), then — when on — who
     # has offered and who was chosen. AA-only, like the rest of this page.
@@ -3340,9 +3343,10 @@ def _api_flex_event_save_notify(event: dict, user: User,
     except db.ConcurrencyConflict:
         return _error_redirect(f"/flex/event/results?event={event_id}",
                                "Someone else just changed this — refresh.")
-    msg = ("You'll get an email for each response."
+    msg = ("The admins will get an email for each response."
            if evt.notify_on_response
-           else "Per-response emails are off.")
+           else "Per-response emails are off (hosting offers still email "
+                "the admins).")
     return _redirect(f"/flex/event/results?event={event_id}&notice="
                      + urllib.parse.quote(msg))
 

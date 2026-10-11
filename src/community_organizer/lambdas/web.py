@@ -3042,26 +3042,23 @@ def _flex_event_results_page(event: dict, user: User,
                     "4px;font-weight:600;color:#555;border-top:1px solid #ddd'>"
                     f"{label} ({len(rows)})</td></tr>" + "".join(rows))
 
+        # The caution sits where it applies — above the rows the AA can
+        # mark, below the members' own answers — and stays short.
         _note = (
-            "This event was arranged outside the app, so nobody was emailed "
-            "and nobody can answer online. Record the replies you get here."
+            "Arranged outside the app: nobody was emailed and nobody can "
+            "answer online. Record replies here."
             if evt.adopted else
-            "Record replies that reach you by text, by phone or in person. "
-            "You are answering on someone else's behalf, so it may not match "
-            "what they intend &mdash; and if they later answer through their "
-            "own link, <b>their answer replaces yours</b>.")
+            "Marking below answers for someone else. If they answer through "
+            "their own link later, <b>their answer replaces yours</b>. "
+            "Nothing is emailed.")
+        _note_row = (
+            f"<tr><td colspan='{len(_cols) + 2}' style='padding:10px 8px 2px;"
+            "color:#666;font-size:0.88em;border-top:1px solid #ddd'>"
+            f"{_note}</td></tr>")
         roster_html = (
             "<details open style='margin-top:18px'>"
             "<summary style='cursor:pointer;font-weight:600;font-size:1.05em'>"
-            "Replies &mdash; mark by hand</summary>"
-            "<p style='color:#666;font-size:0.88em;margin:6px auto;"
-            f"max-width:680px'>{_note} Nothing is emailed to anyone you mark. "
-            + ("A member's row is saved once every date has an answer, or a "
-               "few seconds after a partial one. "
-               if len(_cols) > 1 else
-               "Each change is saved as you make it. ")
-            + "<b>How many</b> is the household's total; leave it blank to "
-            "count just the people marked.</p>"
+            "Replies</summary>"
             "<form method='post' action='/api/flex/event/attendance' "
             "id='roster-form'>"
             f"<input type='hidden' name='event' value='{event_id}'>"
@@ -3072,8 +3069,11 @@ def _flex_event_results_page(event: dict, user: User,
             "<th style='padding:4px 8px'>Member</th>"
             + "".join(f"<th style='padding:4px 8px;text-align:center'>"
                       f"{html.escape(lbl)}</th>" for _, lbl in _cols)
-            + "<th style='padding:4px 8px'>How many</th></tr></thead><tbody>"
+            + "<th style='padding:4px 8px' title=\"The household's total. "
+            "Leave blank to count just the people marked.\">How many</th>"
+            "</tr></thead><tbody>"
             + _section("Answered online", groups["member"])
+            + _note_row
             + _section("Marked by organizer" if not evt.adopted
                        else "Marked", groups["aa"])
             + _section("Haven't answered", groups["none"])

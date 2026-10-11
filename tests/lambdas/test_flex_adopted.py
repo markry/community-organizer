@@ -113,8 +113,8 @@ def test_adopted_page_has_the_table_and_no_poll_machinery(
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
     _adopt(cid, app, aa, aa_mem)
     body = _results(cid, app, aa, aa_mem, _the_event())
-    assert "mark by hand" in body and "Save replies" in body
-    assert "arranged outside the app" in body
+    assert "id='roster-form'" in body and "Save replies" in body
+    assert "Arranged outside the app" in body
     for u in (bob, sue, joe):
         assert f"name='v_{u.user_id}_att'" in body
     assert "Date votes" not in body
@@ -213,7 +213,7 @@ def test_poll_table_has_a_column_per_date(ddb_table, outbox) -> None:
     evt, o1 = _mk_event(cid)
     o2 = _add_option(cid, evt, "2026-08-22")
     body = _results(cid, app, aa, aa_mem, evt)
-    assert "mark by hand" in body and "their answer replaces yours" in body
+    assert "id='roster-form'" in body and "their answer replaces yours" in body
     assert "warn=true" in body and "multi=true" in body
     # Who answered for themselves comes first, the unanswered last.
     order = [body.index(h) for h in ("Answered online (", "Marked by organizer (",

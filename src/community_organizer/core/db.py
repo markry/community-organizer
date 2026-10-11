@@ -2117,6 +2117,15 @@ def get_flexible_rsvp(app_id: str, event_id: str,
     return _hydrate(FlexibleRSVP, _strip_keys(item)) if item else None
 
 
+def delete_flexible_rsvp(app_id: str, event_id: str, user_id: str) -> None:
+    """Forget a member's response entirely (an AA un-marking someone on an
+    adopted event) — back to "haven't heard", not a decline."""
+    _table().delete_item(Key={
+        "PK": _app_pk(app_id),
+        "SK": _flex_rsvp_sk(event_id, user_id),
+    })
+
+
 def list_flexible_rsvps(app_id: str,
                         event_id: str) -> Iterator[FlexibleRSVP]:
     for item in _paginate_query(

@@ -1057,6 +1057,8 @@ def _dispatch(event: dict, context) -> dict:  # noqa: ARG001
         return _route(event, _api_flex_event_save_ask_host)
     if path == "/api/flex/event/host":
         return _route(event, _api_flex_event_choose_host)
+    if path == "/api/flex/event/attendance":
+        return _route(event, _api_flex_event_save_attendance)
     if path.startswith("/ics/"):
         return _route(event, _serve_ics_for_assignment)
     if path == "/launcher":
@@ -2377,8 +2379,16 @@ def _flex_event_new_page(event: dict, user: User, community: Community | None,
           "Maybe on each. Leave the time blank to decide it later.</p>"
         + date_rows
         + "</fieldset>"
+          "<label style='display:block;margin:14px 0 2px;cursor:pointer'>"
+          "<input type='checkbox' name='adopted' value='1'> "
+          "This event is already arranged &mdash; no poll, no invitations"
+          "</label>"
+          "<p style='color:#888;font-size:0.85em;margin:0 0 12px 22px'>For a "
+          "gathering whose invitations went out some other way. Give its "
+          "<b>one</b> date above; nothing is emailed. You then mark who's "
+          "coming yourself, and can write to them with Send Email.</p>"
           "<p><button type='submit' style='padding:8px 24px;cursor:pointer;"
-          "font-size:1em'>Create poll</button>"
+          "font-size:1em'>Create</button>"
           "<a href='/' style='margin-left:16px'>Cancel</a></p>"
           "</form>"
         # New-event form isn't a nav tab — pass no current so "App home"
@@ -2406,6 +2416,39 @@ def _api_flex_event_create(event: dict, user: User, community: Community | None,
         duration = max(15, int(parsed.get("duration", ["120"])[0] or 120))
     except ValueError:
         duration = 120
+    dates: list[tuple] = []
+    for i in range(20):
+        d = (parsed.get(f"date{i}", [""])[0] or "").strip()
+        if not d:
+            continue
+        t = (parsed.get(f"time{i}", [""])[0] or "").strip() or None
+        lbl = (parsed.get(f"label{i}", [""])[0] or "").strip() or None
+        dates.append((d, t, lbl))
+    if (parsed.get("adopted", [""])[0] or "").strip():
+        # Adopted: already arranged elsewhere, so there is nothing to ask and
+        # nobody to email — it starts life scheduled. See FlexibleEvent.adopted.
+        if len(dates) != 1:
+            return _error_redirect(
+                "/flex/event/new",
+                "An event that's already arranged needs exactly one date.")
+        d, t, _lbl = dates[0]
+        try:
+            dt.date.fromisoformat(d)
+        except ValueError:
+            return _error_redirect("/flex/event/new", "Please enter a valid date.")
+        evt = FlexibleEvent(
+            community_id=app.community_id, app_id=app.app_id, title=title,
+            state="scheduled", description=description, location=location,
+            winning_date=d, winning_start_time=t,
+            winning_duration_minutes=duration, created_by=user.user_id,
+            adopted=True)
+        db.put_flexible_event(evt)
+        log.info("flexible event adopted app=%s event=%s by=%s",
+                 app.app_id, evt.event_id, user.user_id)
+        return _redirect(
+            f"/flex/event/results?event={evt.event_id}&notice="
+            + urllib.parse.quote("Event added — nothing was emailed. Mark who's "
+                                 "coming below."))
     evt = FlexibleEvent(
         community_id=app.community_id, app_id=app.app_id, title=title,
         state="poll", description=description, location=location,
@@ -2416,12 +2459,7 @@ def _api_flex_event_create(event: dict, user: User, community: Community | None,
         ask_for_host=bool((parsed.get("ask_for_host", [""])[0] or "").strip()))
     db.put_flexible_event(evt)
     n = 0
-    for i in range(20):
-        d = (parsed.get(f"date{i}", [""])[0] or "").strip()
-        if not d:
-            continue
-        t = (parsed.get(f"time{i}", [""])[0] or "").strip() or None
-        lbl = (parsed.get(f"label{i}", [""])[0] or "").strip() or None
+    for d, t, lbl in dates:
         db.put_flexible_poll_option(FlexiblePollOption(
             community_id=app.community_id, app_id=app.app_id,
             event_id=evt.event_id, iso_date=d, start_time=t, label=lbl,
@@ -2841,7 +2879,7 @@ def _flex_event_results_page(event: dict, user: User,
     # Per-event toggle: email the AA(s) on each member response (and always
     # on a post-close rejoin). Off by default. Auto-submits on change.
     notify_html = ""
-    if evt.state in ("poll", "scheduled"):
+    if evt.state in ("poll", "scheduled") and not evt.adopted:
         checked = " checked" if evt.notify_on_response else ""
         notify_html = (
             "<form method='post' action='/api/flex/event/notify' "
@@ -2855,7 +2893,7 @@ def _flex_event_results_page(event: dict, user: User,
     # Hosting: the per-event setting (with its wording), then — when on — who
     # has offered and who was chosen. AA-only, like the rest of this page.
     host_html = ""
-    if evt.state in ("poll", "scheduled"):
+    if evt.state in ("poll", "scheduled") and not evt.adopted:
         host_checked = " checked" if evt.ask_for_host else ""
         host_html = (
             "<form method='post' action='/api/flex/event/ask-host' "
@@ -2924,6 +2962,69 @@ def _flex_event_results_page(event: dict, user: User,
             + (f"<ul style='padding-left:18px'>{host_rows}</ul>"
                if host_rows else ""))
 
+    # Adopted event: nobody was polled or sent a link, so instead of vote
+    # tallies the AA gets a roster to mark by hand. A blank count means "the
+    # members of this household marked coming"; a number overrides it (guests,
+    # children). Stored counts equal to that default are shown blank so they
+    # keep tracking the ticks.
+    attendance_html = ""
+    if evt.adopted:
+        _coming_hh: dict[str, int] = {}
+        for r in rsvps:
+            if r.confirmed_response == "yes":
+                k = _hh_key(users, r.user_id)
+                _coming_hh[k] = _coming_hh.get(k, 0) + 1
+        _editable = evt.state == "scheduled"
+        _dis = "" if _editable else " disabled"
+        att_rows = ""
+        for m in sorted(members, key=lambda m: (name_of(m.user_id) or "").lower()):
+            uid = m.user_id
+            r = rsvp_by_user.get(uid)
+            cur = r.confirmed_response if r and r.confirmed_response in (
+                "yes", "no") else ""
+            auto = _coming_hh.get(_hh_key(users, uid), 0)
+            size = (r.party_size if r and cur == "yes" and r.party_size
+                    and r.party_size != auto else "")
+            radios = "".join(
+                "<td style='padding:4px 10px;text-align:center'>"
+                f"<input type='radio' name='att_{uid}' value='{val}'"
+                + (" checked" if cur == val else "") + _dis
+                + f" title='{lbl}'></td>"
+                for val, lbl in (("yes", "Coming"), ("no", "Not coming"),
+                                 ("", "No answer")))
+            att_rows += (
+                "<tr style='border-top:1px solid #eee'>"
+                "<td style='padding:4px 10px'>"
+                f"<input type='hidden' name='member' value='{uid}'>"
+                f"{html.escape(name_of(uid))}</td>{radios}"
+                "<td style='padding:4px 10px;text-align:center'>"
+                f"<input type='number' name='size_{uid}' min='1' value='{size}'"
+                f"{_dis} style='padding:3px;width:60px;text-align:center'>"
+                "</td></tr>")
+        attendance_html = (
+            "<h2 style='font-size:1.05em;margin-top:18px'>Who's coming</h2>"
+            "<p style='color:#888;font-size:0.85em;margin:-4px auto 6px;"
+            "max-width:640px'>This event was arranged outside the app, so "
+            "nobody was emailed and nobody can answer online &mdash; record the "
+            "replies you've had here. <b>How many</b> is the household's total; "
+            "leave it blank to count just the people ticked.</p>"
+            "<form method='post' action='/api/flex/event/attendance'>"
+            f"<input type='hidden' name='event' value='{event_id}'>"
+            "<table style='border-collapse:collapse;text-align:left;margin:0 auto'>"
+            "<thead><tr style='color:#888;border-bottom:1px solid #ddd'>"
+            "<th style='padding:4px 10px'>Member</th>"
+            "<th style='padding:4px 10px'>Coming</th>"
+            "<th style='padding:4px 10px'>Not coming</th>"
+            "<th style='padding:4px 10px'>No answer</th>"
+            "<th style='padding:4px 10px'>How many</th></tr></thead>"
+            f"<tbody>{att_rows}</tbody></table>"
+            + ("<p><button type='submit' style='padding:7px 18px;"
+               "cursor:pointer;background:#2a7;color:#fff;border:none;"
+               "border-radius:5px'>Save attendance</button> "
+               "<a href='/admin/send-email' style='margin-left:14px'>Write to "
+               "the people coming &rarr;</a></p>" if _editable else "")
+            + "</form>")
+
     body = (
         f"<h1>{html.escape(evt.title)}</h1>"
         f"<p style='color:#666;margin-top:-6px'>{html.escape(app.name)}</p>"
@@ -2934,7 +3035,9 @@ def _flex_event_results_page(event: dict, user: User,
         + (send_html if evt.state == "poll" else "")
         + unanswered_names_html
         + notify_html
-        + "<h2 style='font-size:1.05em;margin-top:18px'>Date votes</h2>"
+        + attendance_html
+        + ("" if evt.adopted else
+          "<h2 style='font-size:1.05em;margin-top:18px'>Date votes</h2>"
           "<p style='color:#888;font-size:0.85em;margin:-4px 0 6px'>Counts read "
           "<b>households for people</b> — e.g. <b>6 for 12</b> means 6 households, "
           "12 people expected.</p>"
@@ -2945,7 +3048,7 @@ def _flex_event_results_page(event: dict, user: User,
           "<th style='padding:4px 10px'>Who voted</th></tr></thead><tbody>"
         + (tally_rows or "<tr><td colspan='2' style='padding:6px;color:#888'>"
            "no candidate dates</td></tr>")
-        + "</tbody></table>"
+        + "</tbody></table>")
         + (("<form method='post' action='/api/flex/event/add-date' "
             "style='margin:8px 0 4px;font-size:0.9em'>"
             f"<input type='hidden' name='event' value='{event_id}'>"
@@ -2973,6 +3076,80 @@ def _flex_event_results_page(event: dict, user: User,
         + _admin_nav_bar("", app=app)
     )
     return _html(200, _page(body, narrow=False, title=evt.title))
+
+
+# ---- AA: record attendance by hand (adopted events) ------------------------
+
+def _api_flex_event_save_attendance(event: dict, user: User,
+                                    community: Community | None,
+                                    app: Application,
+                                    membership: Membership | None) -> dict:
+    """Save the hand-marked roster of an adopted event. Only rows the form
+    actually carried are touched, so a member added since the page was loaded
+    is left alone. Sends nothing."""
+    if _http_method(event) != "POST":
+        return _text(405, "POST required")
+    guard = _flex_guard(user, membership, app)
+    if guard:
+        return guard
+    parsed = _parse_form(event)
+    event_id = (parsed.get("event", [""])[0] or "").strip()
+    evt = db.get_flexible_event(app.app_id, event_id)
+    if evt is None or not evt.adopted or evt.state != "scheduled":
+        return _error_redirect("/", "That event's attendance can't be edited.")
+    member_ids = {m.user_id for m in db.list_memberships_for_app(app.app_id)}
+    listed = [u for u in parsed.get("member", []) if u in member_ids]
+    users = {u.user_id: u for u in db.list_users(app.community_id)}
+    rsvps = {r.user_id: r for r in db.list_flexible_rsvps(app.app_id, event_id)}
+
+    def _answer(uid: str) -> str | None:
+        v = (parsed.get(f"att_{uid}", [""])[0] or "").strip()
+        return v if v in ("yes", "no") else None
+
+    # What each member will be after this save: the form's answer for listed
+    # rows, the stored one otherwise. Household counts are taken from that.
+    final = {uid: r.confirmed_response for uid, r in rsvps.items()}
+    final.update({uid: _answer(uid) for uid in listed})
+    coming_hh: dict[str, int] = {}
+    for uid, resp in final.items():
+        if resp == "yes":
+            k = _hh_key(users, uid)
+            coming_hh[k] = coming_hh.get(k, 0) + 1
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    for uid in listed:
+        want = _answer(uid)
+        r = rsvps.get(uid)
+        if want is None:
+            if r is not None:
+                db.delete_flexible_rsvp(app.app_id, event_id, uid)
+            continue
+        size = None
+        if want == "yes":
+            try:
+                size = int((parsed.get(f"size_{uid}", [""])[0] or "").strip())
+            except ValueError:
+                size = 0
+            if size < 1:
+                size = coming_hh[_hh_key(users, uid)]
+        if r is None:
+            r = FlexibleRSVP(community_id=app.community_id, app_id=app.app_id,
+                             event_id=event_id, user_id=uid)
+        elif r.confirmed_response == want and r.party_size == size:
+            continue
+        r.confirmed_response = want
+        r.party_size = size
+        if want == "no":
+            r.willing_to_host = False
+        r.updated_at = now
+        db.put_flexible_rsvp(r)
+    n_yes = sum(1 for v in final.values() if v == "yes")
+    n_no = sum(1 for v in final.values() if v == "no")
+    log.info("flex attendance saved app=%s event=%s coming=%d declined=%d by=%s",
+             app.app_id, event_id, n_yes, n_no, user.user_id)
+    return _redirect(
+        f"/flex/event/results?event={event_id}&notice="
+        + urllib.parse.quote(f"Attendance saved: {n_yes} coming, "
+                             f"{n_no} not coming."))
 
 
 # ---- AA: send the poll email (mint/reuse tokens + magic links) ------------
@@ -11262,14 +11439,36 @@ def _send_email_page(event: dict, user: User, community: Community | None,
                 if m_uid not in _responded
                 and users_by_id[m_uid].household_id not in _covered_households
             ]
+    # Adopted events (arranged outside the app, attendance marked by hand):
+    # one quick-pick per event for "the people coming" — writing to them is
+    # the whole reason to adopt an event.
+    coming_to: list[tuple] = []
+    if app.app_type == "flexible_event":
+        for _e in db.list_flexible_events(app.app_id):
+            if not (_e.adopted and _e.state == "scheduled"):
+                continue
+            _yes = {r.user_id
+                    for r in db.list_flexible_rsvps(app.app_id, _e.event_id)
+                    if r.confirmed_response == "yes"}
+            _who = [{"uid": m_uid, "name": users_by_id[m_uid].name}
+                    for m_uid, _ in members if m_uid in _yes]
+            if _who:
+                coming_to.append((_e.title, _who))
     import json as _json
     # json.dumps does NOT escape "</" — neutralize for inline <script>.
     never_logged_in_json = _json.dumps(never_logged_in).replace("</", "<\\/")
+    coming_to_json = _json.dumps(
+        [who for _, who in coming_to]).replace("</", "<\\/")
     not_responded_json = _json.dumps(not_responded).replace("</", "<\\/")
     _qp_style = ("font-size:0.85em;padding:2px 10px;cursor:pointer;color:#2a7;"
                  "background:none;border:1px solid #2a7;border-radius:4px")
     # "haven't responded" first (primary), then "never logged in".
     quick_pick_buttons = ""
+    for _i, (_title, _who) in enumerate(coming_to):
+        quick_pick_buttons += (
+            f" <button type='button' class='qp-coming' data-i='{_i}' "
+            f"style='{_qp_style}'>+ coming to {html.escape(_title)} "
+            f"({len(_who)})</button>")
     if not_responded:
         quick_pick_buttons += (
             f" <button type='button' id='qp-not-responded' style='{_qp_style}'>"
@@ -11419,6 +11618,15 @@ def _send_email_page(event: dict, user: User, community: Community | None,
         "this.style.borderColor='#ccc';"
         "this.style.cursor='default';"
         "};}"
+        f"var comingTo={coming_to_json};"
+        "document.querySelectorAll('.qp-coming').forEach(function(b){"
+        "b.onclick=function(){"
+        "comingTo[+b.dataset.i].forEach(function(u){addRecipient(u.uid,u.name)});"
+        "b.disabled=true;"
+        "b.style.color='#aaa';"
+        "b.style.borderColor='#ccc';"
+        "b.style.cursor='default';"
+        "};});"
         f"var notResponded={not_responded_json};"
         "var qpNR=document.getElementById('qp-not-responded');"
         "if(qpNR){qpNR.onclick=function(){"

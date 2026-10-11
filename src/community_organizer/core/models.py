@@ -614,6 +614,11 @@ class FlexibleEvent:
     ask_for_host: bool = False
     host_prompt: str | None = None               # None = default wording
     host_user_id: str | None = None              # the volunteer the AA chose
+    # Adopted: a gathering that was arranged outside the app (invitations
+    # already went out some other way). Created straight into `scheduled` with
+    # no poll options, no magic links and no emails; the AA records who's
+    # coming by hand on the results page, then uses Send Email from there on.
+    adopted: bool = False
     poll_closes_at: str | None = None            # optional ISO datetime
     # Event id this one was folded into, when an AA ran two polls for the
     # same gathering. The row stays as a tombstone rather than being deleted

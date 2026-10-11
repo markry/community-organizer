@@ -216,7 +216,7 @@ def test_poll_table_has_a_column_per_date(ddb_table, outbox) -> None:
     assert "id='roster-form'" in body and "their answer replaces yours" in body
     assert "warn=true" in body and "multi=true" in body
     # Who answered for themselves comes first, the unanswered last.
-    order = [body.index(h) for h in ("Answered online (", "Marked by organizer (",
+    order = [body.index(h) for h in ("Member direct feedback (", "Admin-created status (",
                                      "Haven't answered (") if h in body]
     assert order == sorted(order)
     for o in (o1, o2):
@@ -240,7 +240,7 @@ def test_marking_votes_on_a_several_date_poll(ddb_table, outbox) -> None:
     assert _rsvp(evt, bob).confirmed_response == "no"       # no to every date
     assert _rsvp(evt, sue) is None
     body = _results(cid, app, aa, aa_mem, evt)
-    assert "Marked by organizer (2)" in body and "Haven't answered (2)" in body
+    assert "Admin-created status (2)" in body and "Haven't answered (2)" in body
     # Closing on the second date invites Joe and sends Bob the courtesy note.
     confirmed, couldnt, _ = web._flex_cohorts(
         app, db.get_community(cid), evt.event_id, o2.option_id)
@@ -255,7 +255,7 @@ def test_a_members_own_answer_is_locked(ddb_table, outbox) -> None:
     _vote_online(cid, evt, joe, {opt.option_id: "yes"}, "tj", bringing="Salad")
     before = _rsvp(evt, joe)
     body = _results(cid, app, aa, aa_mem, evt)
-    assert "Answered online (1)" in body and "class='rs-unlock'" in body
+    assert "Member direct feedback (1)" in body and "class='rs-unlock'" in body
     assert f"name='override' value='{joe.user_id}' disabled" in body
     # Even a forged post of the row as an ordinary editable one changes nothing.
     _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {opt.option_id: "no"}})
@@ -273,7 +273,7 @@ def test_unlocking_lets_the_aa_change_a_members_answer(ddb_table, outbox) -> Non
     r = _rsvp(evt, joe)
     assert r.votes == {opt.option_id: "maybe"} and r.marked_by == aa.user_id
     assert r.bringing == "Salad" and r.party_size == 3      # the rest is kept
-    assert "Marked by organizer (1)" in _results(cid, app, aa, aa_mem, evt)
+    assert "Admin-created status (1)" in _results(cid, app, aa, aa_mem, evt)
 
 
 def test_unlocking_without_changing_anything_writes_nothing(
@@ -299,7 +299,7 @@ def test_a_later_reply_from_the_member_replaces_the_mark(
         "token": "tj", f"vote_{opt.option_id}": "no"}))
     r = _rsvp(evt, joe)
     assert r.confirmed_response == "no" and r.marked_by is None
-    assert "Answered online (1)" in _results(cid, app, aa, aa_mem, evt)
+    assert "Member direct feedback (1)" in _results(cid, app, aa, aa_mem, evt)
     assert "organizer recorded" not in web._flex_token_page(_get("/e/tj"))["body"]
 
 
@@ -393,8 +393,49 @@ def test_maybe_on_a_scheduled_event(ddb_table, outbox) -> None:
     ev = {"requestContext": {"http": {"method": "GET"}}}
     page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
     assert "+ coming to Autumn Dinner (1)</button>" in page
-    assert "+ coming or maybe to Autumn Dinner (2)</button>" in page
+    assert "+ coming plus maybes to Autumn Dinner (2)</button>" in page
     # Back to a plain yes: the second button has nothing to add, so it goes.
     _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
     page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
     assert "coming or maybe" not in page
+
+
+def test_groups_list_coming_then_maybe_then_no(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    # Alphabetical would be Bob, Joe, Sue; by answer it is Sue, Joe, Bob.
+    _mark(cid, app, aa, aa_mem, evt,
+          {bob.user_id: "no", joe.user_id: "maybe", sue.user_id: "yes"})
+    body = _results(cid, app, aa, aa_mem, evt)
+    section = body.split("Admin-created status (3)")[1].split("Haven't answered")[0]
+    order = [section.index(f"value='{u.user_id}'") for u in (sue, joe, bob)]
+    assert order == sorted(order)
+
+
+def test_send_email_names_the_event_and_opens_on_select(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    assert f"/admin/send-email?event={evt.event_id}" in _results(
+        cid, app, aa, aa_mem, evt)
+    ev = {"requestContext": {"http": {"method": "GET"}},
+          "queryStringParameters": {"event": evt.event_id}}
+    body = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
+    assert "About: <b>Autumn Dinner</b> &middot; Saturday, November 14" in body
+    assert "value='Book Club: Autumn Dinner -- '" in body
+    assert "id='mode-select' checked>" in body and "id='mode-all'>" in body
+
+
+def test_send_email_default_stays_all_after_a_poll_closes(ddb_table, outbox) -> None:
+    """An event that came through a poll and has its date: everyone was asked
+    and invited, so the page still opens on All members."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    ev = {"requestContext": {"http": {"method": "GET"}}}
+    body = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
+    assert "id='mode-select' checked>" in body          # poll still open
+    evt.state, evt.winning_date = "scheduled", opt.iso_date
+    db.put_flexible_event(evt)
+    body = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
+    assert "id='mode-all' checked>" in body and "About: <b>August Book Club</b>" in body

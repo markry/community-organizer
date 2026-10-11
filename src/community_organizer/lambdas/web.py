@@ -2998,7 +2998,9 @@ def _flex_event_results_page(event: dict, user: User,
                           for v, lbl in _vals)
                 + "</select></td>")
 
-        groups: dict[str, list[str]] = {"none": [], "aa": [], "member": []}
+        # Within a group: coming first, then maybe, then not coming (for a
+        # poll, by the best answer across its dates), each alphabetical.
+        groups: dict[str, list[tuple]] = {"none": [], "aa": [], "member": []}
         for m in sorted(members, key=lambda m: (name_of(m.user_id) or "").lower()):
             uid = m.user_id
             r = rsvp_by_user.get(uid)
@@ -3008,27 +3010,28 @@ def _flex_event_results_page(event: dict, user: User,
                 cells = "".join(
                     _cell(uid, k, (r.votes.get(k, "") if r else ""), locked)
                     for k, _ in _cols)
-                going = bool(r and any(v in ("yes", "maybe")
-                                       for v in r.votes.values()))
+                _vs = [r.votes.get(k) for k, _ in _cols] if r else []
+                best = ("yes" if "yes" in _vs else
+                        "maybe" if "maybe" in _vs else "no")
+                going = best != "no"
             else:
                 ans = _flex_roster_answer(evt, r, _win) or ""
                 cells = _cell(uid, "att", ans, locked)
+                best = ans or "no"
                 going = ans in ("yes", "maybe")
             size = (r.party_size if r and going and r.party_size
                     and not r.party_size_auto else "")
             tag = ""
-            if kind == "aa" and not evt.adopted:
-                tag = (" <span style='color:#b8860b;font-size:0.8em'>marked by "
-                       "organizer</span>")
-            elif kind == "member":
-                tag = (" <span style='color:#2a7;font-size:0.8em'>answered "
-                       "online</span> <button type='button' class='rs-unlock' "
+            if kind == "member":
+                tag = (" <button type='button' class='rs-unlock' "
                        "style='font-size:0.8em;padding:1px 8px;cursor:pointer'>"
                        "Change</button>")
             elif uid in _covered_ids and r is None:
                 tag = (" <span style='color:#888;font-size:0.8em'>household "
                        "answered</span>")
-            groups[kind].append(
+            groups[kind].append((
+                {"yes": 0, "maybe": 1, "no": 2}[best],
+                (name_of(uid) or "").lower(),
                 f"<tr style='border-top:1px solid #eee' data-kind='{kind}'>"
                 "<td style='padding:4px 8px'>"
                 f"<input type='hidden' name='{'override' if locked else 'member'}'"
@@ -3037,14 +3040,15 @@ def _flex_event_results_page(event: dict, user: User,
                 "<td style='padding:4px 8px;text-align:center'>"
                 f"<input type='number' name='size_{uid}' min='1' value='{size}'"
                 + (" disabled" if locked else "")
-                + " style='padding:3px;width:56px;text-align:center'></td></tr>")
+                + " style='padding:3px;width:56px;text-align:center'></td></tr>"))
 
-        def _section(label: str, rows: list[str]) -> str:
+        def _section(label: str, rows: list[tuple]) -> str:
             if not rows:
                 return ""
             return (f"<tr><td colspan='{len(_cols) + 2}' style='padding:10px 8px "
                     "4px;font-weight:600;color:#555;border-top:1px solid #ddd'>"
-                    f"{label} ({len(rows)})</td></tr>" + "".join(rows))
+                    f"{label} ({len(rows)})</td></tr>"
+                    + "".join(h for _, _, h in sorted(rows, key=lambda t: t[:2])))
 
         # The caution sits where it applies — above the rows the AA can
         # mark, below the members' own answers — and stays short.
@@ -3076,10 +3080,9 @@ def _flex_event_results_page(event: dict, user: User,
             + "<th style='padding:4px 8px' title=\"The household's total. "
             "Leave blank to count just the people marked.\">How many</th>"
             "</tr></thead><tbody>"
-            + _section("Answered online", groups["member"])
+            + _section("Member direct feedback", groups["member"])
             + _note_row
-            + _section("Marked by organizer" if not evt.adopted
-                       else "Marked", groups["aa"])
+            + _section("Admin-created status", groups["aa"])
             + _section("Haven't answered", groups["none"])
             + "</tbody></table></div>"
             # Every change saves itself (script below), so there is no Save
@@ -3087,8 +3090,9 @@ def _flex_event_results_page(event: dict, user: User,
             # JavaScript.
             "<noscript><p><button type='submit' style='padding:7px 18px;"
             "cursor:pointer'>Save replies</button></p></noscript>"
-            + ("<p><a href='/admin/send-email'>Write to the people coming "
-               "&rarr;</a></p>" if evt.state == "scheduled" else "")
+            + (f"<p><a href='/admin/send-email?event={event_id}'>Write to the "
+               "people coming &rarr;</a></p>"
+               if evt.state == "scheduled" else "")
             + "</form>"
             # Changes save themselves so a marked member moves straight into
             # the "marked" group. With a single choice that is at once. With
@@ -11663,7 +11667,36 @@ def _send_email_page(event: dict, user: User, community: Community | None,
                      for m_uid, _ in members
                      if _ans.get(m_uid) in ("yes", "maybe")]
             if len(_both) > len(_who):
-                coming_to.append((f"coming or maybe to {_e.title}", _both))
+                coming_to.append((f"coming plus maybes to {_e.title}", _both))
+    # Which event this email is about: the one named in the link that brought
+    # the AA here, else the app's only live event. It is shown under the
+    # heading and seeds the subject. Where replies are still coming in — an
+    # event adopted from outside, or a poll still open — "everyone" is rarely
+    # the audience, so the page opens on Select recipients instead.
+    ctx_evt = None
+    select_default = False
+    if app.app_type == "flexible_event":
+        _live = [e for e in db.list_flexible_events(app.app_id)
+                 if e.state in ("poll", "scheduled")]
+        _want = (_get_param(event, "event") or "").strip()
+        ctx_evt = (next((e for e in _live if e.event_id == _want), None)
+                   or (_live[0] if len(_live) == 1 else None))
+        select_default = any(e.adopted or e.state == "poll"
+                             for e in ([ctx_evt] if ctx_evt else _live))
+    event_line = ""
+    subject_default = f"{org_name} -- "
+    if ctx_evt is not None:
+        _when = (_fmt_iso_date(ctx_evt.winning_date)
+                 + (f" {_fmt_time(ctx_evt.winning_start_time)}"
+                    if ctx_evt.winning_start_time else "")
+                 if ctx_evt.winning_date else "date not set yet")
+        event_line = ("<p style='margin:-6px 0 14px;color:#444'>About: <b>"
+                      f"{html.escape(ctx_evt.title)}</b> &middot; "
+                      f"{html.escape(_when)}</p>")
+        subject_default = (
+            ctx_evt.title if (not org_name
+                              or org_name.lower() in ctx_evt.title.lower())
+            else f"{org_name}: {ctx_evt.title}") + " -- "
     import json as _json
     # json.dumps does NOT escape "</" — neutralize for inline <script>.
     never_logged_in_json = _json.dumps(never_logged_in).replace("</", "<\\/")
@@ -11698,6 +11731,7 @@ def _send_email_page(event: dict, user: User, community: Community | None,
     body = (
         f"<h1>{html.escape(org_name)}</h1>"
         "<h2 style='font-size:1.1em;color:#444'>Compose and send email</h2>"
+        + event_line
         + _flash_banner_html(event)
         + sent_msg
         + "<form method='post' action='/api/admin/send-email' "
@@ -11706,11 +11740,13 @@ def _send_email_page(event: dict, user: User, community: Community | None,
         "margin-bottom:16px'>"
         "<legend style='font-weight:600;color:#444;padding:0 8px'>Recipients</legend>"
         "<label style='display:block;margin:8px 0'>"
-        "<input type='radio' name='mode' value='all' id='mode-all' checked> "
+        "<input type='radio' name='mode' value='all' id='mode-all'"
+        + ("" if select_default else " checked") + "> "
         "All members</label>"
         + all_sched_block +
         "<label style='display:block;margin:8px 0'>"
-        "<input type='radio' name='mode' value='select' id='mode-select'> "
+        "<input type='radio' name='mode' value='select' id='mode-select'"
+        + (" checked" if select_default else "") + "> "
         "Select recipients</label>"
         "<div id='select-section' style='display:none;margin-left:24px;"
         "margin-top:8px'>"
@@ -11736,8 +11772,8 @@ def _send_email_page(event: dict, user: User, community: Community | None,
         "<label style='display:block;font-weight:600;color:#444;margin-bottom:4px'>"
         "Subject</label>"
         f"<input type='text' name='subject' id='subject-input' required "
-        f"value='{html.escape(org_name)} -- ' "
-        f"data-default='{html.escape(org_name)} -- ' "
+        f"value='{html.escape(subject_default)}' "
+        f"data-default='{html.escape(subject_default)}' "
         "style='width:100%;padding:8px;font-size:1em;border:1px solid #ccc;"
         "border-radius:4px;box-sizing:border-box'>"
         "</div>"

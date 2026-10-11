@@ -123,7 +123,7 @@ def test_adopted_page_has_the_table_and_no_poll_machinery(
     assert "Cancel this event" in body
     # No links exist, so there is nothing to override and no warning to give.
     assert "class='rs-unlock'" not in body
-    assert "their answer replaces yours" not in body
+    assert "warn=false" in body
 
 
 def test_marking_an_adopted_event(ddb_table, outbox) -> None:
@@ -214,6 +214,11 @@ def test_poll_table_has_a_column_per_date(ddb_table, outbox) -> None:
     o2 = _add_option(cid, evt, "2026-08-22")
     body = _results(cid, app, aa, aa_mem, evt)
     assert "mark by hand" in body and "their answer replaces yours" in body
+    assert "warn=true" in body and "multi=true" in body
+    # Who answered for themselves comes first, the unanswered last.
+    order = [body.index(h) for h in ("Answered online (", "Marked by organizer (",
+                                     "Haven't answered (") if h in body]
+    assert order == sorted(order)
     for o in (o1, o2):
         assert f"name='v_{joe.user_id}_{o.option_id}'" in body
     assert "Haven't answered (4)" in body        # the AA is a member too

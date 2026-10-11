@@ -3056,8 +3056,11 @@ def _flex_event_results_page(event: dict, user: User,
             "Replies &mdash; mark by hand</summary>"
             "<p style='color:#666;font-size:0.88em;margin:6px auto;"
             f"max-width:680px'>{_note} Nothing is emailed to anyone you mark. "
-            "<b>How many</b> is the household's total; leave it blank to count "
-            "just the people marked.</p>"
+            + ("Each change is saved once you move off that member's row. "
+               if len(_cols) > 1 else
+               "Each change is saved as you make it. ")
+            + "<b>How many</b> is the household's total; leave it blank to "
+            "count just the people marked.</p>"
             "<form method='post' action='/api/flex/event/attendance' "
             "id='roster-form'>"
             f"<input type='hidden' name='event' value='{event_id}'>"
@@ -3069,10 +3072,10 @@ def _flex_event_results_page(event: dict, user: User,
             + "".join(f"<th style='padding:4px 8px;text-align:center'>"
                       f"{html.escape(lbl)}</th>" for _, lbl in _cols)
             + "<th style='padding:4px 8px'>How many</th></tr></thead><tbody>"
-            + _section("Haven't answered", groups["none"])
+            + _section("Answered online", groups["member"])
             + _section("Marked by organizer" if not evt.adopted
                        else "Marked", groups["aa"])
-            + _section("Answered online", groups["member"])
+            + _section("Haven't answered", groups["none"])
             + "</tbody></table></div>"
             "<p><button type='submit' style='padding:7px 18px;"
             "cursor:pointer;background:#2a7;color:#fff;border:none;"
@@ -3081,32 +3084,43 @@ def _flex_event_results_page(event: dict, user: User,
                "to the people coming &rarr;</a>"
                if evt.state == "scheduled" else "")
             + "</p></form>"
-            # Unlocking a member's own answer is a deliberate, confirmed act;
-            # saving states how many people are being answered for. The
-            # strings are apostrophe-free: they sit inside JS '...' literals.
+            # Changes save themselves so a marked member moves straight into
+            # the "marked" group: at once when there is a single choice, on
+            # leaving the row when there is one per date (so a reply covering
+            # several dates is entered whole). The warning about answering for
+            # someone else is asked once per event per browser session, not on
+            # every click; unlocking a member's own answer is confirmed each
+            # time. Scroll position is carried across the reload. The strings
+            # are apostrophe-free: they sit inside JS '...' literals.
             "<script>(function(){var f=document.getElementById('roster-form');"
             "if(!f)return;"
+            f"var K='rs-{event_id}',multi={'true' if len(_cols) > 1 else 'false'},"
+            f"warn={'false' if evt.adopted else 'true'},dirty=null;"
+            "function ss(k,v){try{if(v===undefined)return sessionStorage.getItem"
+            "(k);if(v===null)sessionStorage.removeItem(k);else sessionStorage."
+            "setItem(k,v);}catch(e){}return null;}"
+            "var y=ss(K+'-y');if(y!==null){ss(K+'-y',null);window.scrollTo(0,+y);}"
+            "function ok(){if(!warn||ss(K+'-ok'))return true;"
+            "if(!confirm('You are recording a reply on behalf of a member.\\n\\n"
+            "It may not match what they intend. If they later answer through "
+            "their own link, their answer replaces yours.\\n\\nContinue? You "
+            "will not be asked again for this event in this session.'))"
+            "return false;ss(K+'-ok','1');return true;}"
+            "function go(){if(ok()){ss(K+'-y',String(window.scrollY));f.submit();}"
+            "else{location.reload();}}"
             "f.addEventListener('change',function(e){var tr=e.target.closest"
-            "('tr');if(tr)tr.dataset.touched='1';});"
+            "('tr');if(!tr)return;if(multi){dirty=tr;}else{go();}});"
+            "f.addEventListener('focusout',function(e){if(!dirty)return;"
+            "var to=e.relatedTarget;if(to&&dirty.contains(to))return;"
+            "dirty=null;go();});"
             "f.querySelectorAll('.rs-unlock').forEach(function(b){"
             "b.onclick=function(){if(!confirm('This member answered online "
             "themselves. Change their answer anyway?'))return;"
             "var tr=b.closest('tr');tr.querySelectorAll('[disabled]').forEach("
-            "function(i){i.disabled=false;});tr.dataset.unlocked='1';"
-            "b.remove();};});"
-            "f.addEventListener('submit',function(e){"
-            "var t=f.querySelectorAll('tr[data-touched]').length;"
-            "var o=f.querySelectorAll('tr[data-touched][data-unlocked]').length;"
-            "if(!t)return;"
-            + ("" if evt.adopted else
-               "var msg='Save replies for '+t+' member'+(t===1?'':'s')+'?"
-               "\\n\\nYou are answering on their behalf, which may not match "
-               "what they intend. If a member later answers through their own "
-               "link, their answer replaces yours.';"
-               "if(o)msg+='\\n\\n'+o+' of these answered online themselves: "
-               "you are replacing their own answer.';"
-               "if(!confirm(msg))e.preventDefault();")
-            + "});})();</script></details>")
+            "function(i){i.disabled=false;});b.remove();};});"
+            "f.addEventListener('submit',function(e){if(!ok()){e.preventDefault();"
+            "return;}ss(K+'-y',String(window.scrollY));});"
+            "})();</script></details>")
 
     body = (
         f"<h1>{html.escape(evt.title)}</h1>"

@@ -677,6 +677,11 @@ class FlexibleRSVP:
     # no count given ("the members of this household marked coming"), so a
     # later save can keep it in step. False once anyone states a number.
     party_size_auto: bool = False
+    # Set (to the AA's user_id) when an AA recorded this answer on the member's
+    # behalf — a reply that reached them by text, phone or in person. Cleared
+    # the moment the member answers for themselves, which always wins.
+    marked_by: str | None = None
+    marked_at: str | None = None
     rsvp_id: str = field(default_factory=_new_id)
     version: int = 0
     updated_at: str = field(default_factory=_now)

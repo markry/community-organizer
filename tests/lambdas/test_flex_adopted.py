@@ -1,9 +1,14 @@
-"""Adopted events on flexible_event, and the hand-marked roster.
+"""Marking replies by hand on flexible_event, and adopted events.
 
-A gathering arranged outside the app is created straight into `scheduled` — no
-poll, no links, no email. From there it is an ordinary scheduled event whose
-roster the AA keeps by hand. The same roster is on every event with a known
-date, because replies also arrive by text, by phone and in person."""
+Replies reach an organizer by text, by phone and in person, so an AA can record
+them on any event: per candidate date while a poll is open, coming / not coming
+once the date is set. A member's own answer always wins — it is locked unless
+the AA unlocks that row, and it replaces an AA's mark when the member answers
+later.
+
+An adopted event is one arranged outside the app: created straight into
+`scheduled` with no poll, no links and no email, so every answer on it is the
+AA's."""
 from __future__ import annotations
 
 import pytest
@@ -13,7 +18,7 @@ from community_organizer.core.models import FlexibleRSVP
 from community_organizer.lambdas import web
 
 from .test_flexible_event import (
-    _add_option, _mk_event, _mk_token, _post, _seed,
+    _add_option, _get, _mk_event, _mk_token, _post, _seed,
 )
 
 
@@ -46,16 +51,34 @@ def _results(cid, app, aa, aa_mem, evt) -> str:
         ev, aa, db.get_community(cid), app, aa_mem)["body"]
 
 
-def _mark(cid, app, aa, aa_mem, evt, answers: dict, sizes: dict | None = None):
-    """Post the attendance form: `answers` maps user_id -> "yes" / "no" / ""."""
-    form: dict = {"event": evt.event_id, "member": list(answers)}
+def _mark(cid, app, aa, aa_mem, evt, answers: dict, *, sizes: dict | None = None,
+          override: tuple = ()):
+    """Post the replies form. `answers` maps user_id -> an answer: a plain
+    "yes" / "no" / "" for a scheduled event, or {option_id: vote} for a poll.
+    Users in `override` are posted as unlocked rows, the rest as editable."""
+    form: dict = {"event": evt.event_id,
+                  "member": [u for u in answers if u not in override],
+                  "override": list(override)}
     for uid, a in answers.items():
-        form[f"att_{uid}"] = a
+        for key, val in (a.items() if isinstance(a, dict) else [("att", a)]):
+            form[f"v_{uid}_{key}"] = val
         form[f"size_{uid}"] = str((sizes or {}).get(uid, ""))
     return web._api_flex_event_save_attendance(
         _post("/api/flex/event/attendance", form),
         aa, db.get_community(cid), app, aa_mem)
 
+
+def _vote_online(cid, evt, user, votes: dict, token: str, **extra):
+    _mk_token(cid, evt, user.user_id, token=token)
+    web._api_flex_token_vote(_post("/api/e/vote", {
+        "token": token, **{f"vote_{k}": v for k, v in votes.items()}, **extra}))
+
+
+def _rsvp(evt, user):
+    return db.get_flexible_rsvp("a1", evt.event_id, user.user_id)
+
+
+# ---- adopting --------------------------------------------------------------
 
 def test_adopting_creates_a_scheduled_event_and_emails_nobody(
         ddb_table, outbox) -> None:
@@ -85,32 +108,35 @@ def test_a_poll_is_still_the_default(ddb_table) -> None:
     assert len(list(db.list_flexible_poll_options("a1", evt.event_id))) == 1
 
 
-def test_results_page_offers_a_roster_not_a_poll(ddb_table, outbox) -> None:
+def test_adopted_page_has_the_table_and_no_poll_machinery(
+        ddb_table, outbox) -> None:
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
     _adopt(cid, app, aa, aa_mem)
     body = _results(cid, app, aa, aa_mem, _the_event())
-    assert "Mark replies by hand" in body and "Save replies" in body
+    assert "mark by hand" in body and "Save replies" in body
     assert "arranged outside the app" in body
     for u in (bob, sue, joe):
-        assert f"name='att_{u.user_id}'" in body
-    # None of the poll machinery: no votes table, no send, no host question.
+        assert f"name='v_{u.user_id}_att'" in body
     assert "Date votes" not in body
     assert "/api/flex/event/send-poll" not in body
     assert "/api/flex/event/ask-host" not in body
     assert "Cancel this event" in body
+    # No links exist, so there is nothing to override and no warning to give.
+    assert "class='rs-unlock'" not in body
+    assert "their answer replaces yours" not in body
 
 
-def test_marking_attendance_by_hand(ddb_table, outbox) -> None:
+def test_marking_an_adopted_event(ddb_table, outbox) -> None:
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
     _adopt(cid, app, aa, aa_mem)
     evt = _the_event()
     resp = _mark(cid, app, aa, aa_mem, evt,
-          {bob.user_id: "yes", sue.user_id: "yes", joe.user_id: "no"})
+                 {bob.user_id: "yes", sue.user_id: "yes", joe.user_id: "no"})
     assert resp["statusCode"] == 302
-    assert db.get_flexible_rsvp("a1", evt.event_id, joe.user_id
-                                ).confirmed_response == "no"
-    # Bob + Sue share a household: both ticked, no count given -> 2 expected.
-    assert db.get_flexible_rsvp("a1", evt.event_id, bob.user_id).party_size == 2
+    assert _rsvp(evt, joe).confirmed_response == "no"
+    assert _rsvp(evt, joe).marked_by == aa.user_id
+    # Bob + Sue share a household: both marked, no count given -> 2 expected.
+    assert _rsvp(evt, bob).party_size == 2
     body = _results(cid, app, aa, aa_mem, evt)
     assert "<b>Expected headcount:</b> 2 " in body
     assert "<b>Declined:</b> 1" in body
@@ -127,7 +153,7 @@ def test_a_given_count_overrides_the_household_default(ddb_table, outbox) -> Non
     body = _results(cid, app, aa, aa_mem, evt)
     assert "<b>Expected headcount:</b> 5 " in body          # 4 + Joe
     assert f"name='size_{bob.user_id}' min='1' value='4'" in body
-    # A count that is just the default is shown blank, so it keeps tracking.
+    # A defaulted count is shown blank, so it keeps tracking who is marked.
     assert f"name='size_{joe.user_id}' min='1' value=''" in body
 
 
@@ -143,13 +169,13 @@ def test_default_count_follows_later_changes(ddb_table, outbox) -> None:
     assert "<b>Expected headcount:</b> 2 " in _results(cid, app, aa, aa_mem, evt)
 
 
-def test_no_answer_forgets_the_response(ddb_table, outbox) -> None:
+def test_blank_forgets_the_reply(ddb_table, outbox) -> None:
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
     _adopt(cid, app, aa, aa_mem)
     evt = _the_event()
     _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "no"})
     _mark(cid, app, aa, aa_mem, evt, {joe.user_id: ""})
-    assert db.get_flexible_rsvp("a1", evt.event_id, joe.user_id) is None
+    assert _rsvp(evt, joe) is None
 
 
 def test_rows_not_on_the_form_are_left_alone(ddb_table, outbox) -> None:
@@ -157,9 +183,8 @@ def test_rows_not_on_the_form_are_left_alone(ddb_table, outbox) -> None:
     _adopt(cid, app, aa, aa_mem)
     evt = _the_event()
     _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
-    _mark(cid, app, aa, aa_mem, evt, {bob.user_id: "no"})            # Joe not posted
-    assert db.get_flexible_rsvp("a1", evt.event_id, joe.user_id
-                                ).confirmed_response == "yes"
+    _mark(cid, app, aa, aa_mem, evt, {bob.user_id: "no"})    # Joe not posted
+    assert _rsvp(evt, joe).confirmed_response == "yes"
 
 
 def test_marking_is_admin_only(ddb_table, outbox) -> None:
@@ -169,60 +194,131 @@ def test_marking_is_admin_only(ddb_table, outbox) -> None:
     resp = _mark(cid, app, bob, db.get_membership("a1", bob.user_id), evt,
                  {bob.user_id: "yes"})
     assert resp["statusCode"] == 403
-    assert db.get_flexible_rsvp("a1", evt.event_id, bob.user_id) is None
+    assert _rsvp(evt, bob) is None
 
 
-# ---- the same roster on ordinary events -----------------------------------
-
-def test_one_date_invitation_can_be_marked_by_hand(ddb_table, outbox) -> None:
-    """A reply that came by text is recorded as that member's answer to the
-    one date, so the tallies and the eventual invite list agree with it."""
+def test_non_members_cannot_be_marked(ddb_table, outbox) -> None:
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
-    evt, opt = _mk_event(cid)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    _mark(cid, app, aa, aa_mem, evt, {"stranger": "yes"})
+    _mark(cid, app, aa, aa_mem, evt, {"stranger": "yes"}, override=("stranger",))
+    assert list(db.list_flexible_rsvps("a1", evt.event_id)) == []
+
+
+# ---- the same table on a poll ---------------------------------------------
+
+def test_poll_table_has_a_column_per_date(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, o1 = _mk_event(cid)
+    o2 = _add_option(cid, evt, "2026-08-22")
     body = _results(cid, app, aa, aa_mem, evt)
-    assert "Mark replies by hand" in body and ">Maybe</th>" in body
-    assert "arranged outside the app" not in body
-    _mark(cid, app, aa, aa_mem, evt,
-          {joe.user_id: "maybe", bob.user_id: "no", sue.user_id: ""})
-    r = db.get_flexible_rsvp("a1", evt.event_id, joe.user_id)
-    assert r.votes == {opt.option_id: "maybe"} and r.confirmed_response == "yes"
-    assert db.get_flexible_rsvp("a1", evt.event_id, bob.user_id
-                                ).confirmed_response == "no"
+    assert "mark by hand" in body and "their answer replaces yours" in body
+    for o in (o1, o2):
+        assert f"name='v_{joe.user_id}_{o.option_id}'" in body
+    assert "Haven't answered (4)" in body        # the AA is a member too
+
+
+def test_marking_votes_on_a_several_date_poll(ddb_table, outbox) -> None:
+    """A member texts which dates suit them: the AA records it per date, and
+    it counts exactly as if they had answered online."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, o1 = _mk_event(cid)
+    o2 = _add_option(cid, evt, "2026-08-22")
+    _mark(cid, app, aa, aa_mem, evt, {
+        joe.user_id: {o1.option_id: "no", o2.option_id: "maybe"},
+        bob.user_id: {o1.option_id: "no", o2.option_id: "no"},
+        sue.user_id: {o1.option_id: "", o2.option_id: ""}})
+    j = _rsvp(evt, joe)
+    assert j.votes == {o1.option_id: "no", o2.option_id: "maybe"}
+    assert j.confirmed_response == "yes" and j.marked_by == aa.user_id
+    assert _rsvp(evt, bob).confirmed_response == "no"       # no to every date
+    assert _rsvp(evt, sue) is None
+    body = _results(cid, app, aa, aa_mem, evt)
+    assert "Marked by organizer (2)" in body and "Haven't answered (2)" in body
+    # Closing on the second date invites Joe and sends Bob the courtesy note.
     confirmed, couldnt, _ = web._flex_cohorts(
-        app, db.get_community(cid), evt.event_id, opt.option_id)
-    assert bob.user_id in {u.user_id for u in couldnt}
+        app, db.get_community(cid), evt.event_id, o2.option_id)
     assert joe.user_id in {u.user_id for u in confirmed}
+    assert bob.user_id in {u.user_id for u in couldnt}
     assert outbox == []
 
 
-def test_several_dates_cannot_be_marked_yet(ddb_table, outbox) -> None:
-    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
-    evt, _opt = _mk_event(cid)
-    _add_option(cid, evt, "2026-08-22")
-    assert "Mark replies by hand" not in _results(cid, app, aa, aa_mem, evt)
-    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
-    assert db.get_flexible_rsvp("a1", evt.event_id, joe.user_id) is None
-
-
-def test_saving_leaves_a_members_own_answer_alone(ddb_table, outbox) -> None:
-    """The form posts every row. A member who answered online — count, dish
-    and all — must come through a save untouched unless the AA changed them."""
+def test_a_members_own_answer_is_locked(ddb_table, outbox) -> None:
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
     evt, opt = _mk_event(cid)
+    _vote_online(cid, evt, joe, {opt.option_id: "yes"}, "tj", bringing="Salad")
+    before = _rsvp(evt, joe)
+    body = _results(cid, app, aa, aa_mem, evt)
+    assert "Answered online (1)" in body and "class='rs-unlock'" in body
+    assert f"name='override' value='{joe.user_id}' disabled" in body
+    # Even a forged post of the row as an ordinary editable one changes nothing.
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {opt.option_id: "no"}})
+    assert _rsvp(evt, joe) == before
+
+
+def test_unlocking_lets_the_aa_change_a_members_answer(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _vote_online(cid, evt, joe, {opt.option_id: "yes"}, "tj", bringing="Salad",
+                 party_size="3")
+    # The unlocked row posts what it showed, including their stated count.
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {opt.option_id: "maybe"}},
+          sizes={joe.user_id: 3}, override=(joe.user_id,))
+    r = _rsvp(evt, joe)
+    assert r.votes == {opt.option_id: "maybe"} and r.marked_by == aa.user_id
+    assert r.bringing == "Salad" and r.party_size == 3      # the rest is kept
+    assert "Marked by organizer (1)" in _results(cid, app, aa, aa_mem, evt)
+
+
+def test_unlocking_without_changing_anything_writes_nothing(
+        ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _vote_online(cid, evt, joe, {opt.option_id: "yes"}, "tj")
+    before = _rsvp(evt, joe)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {opt.option_id: "yes"}},
+          override=(joe.user_id,))
+    assert _rsvp(evt, joe) == before and before.marked_by is None
+
+
+def test_a_later_reply_from_the_member_replaces_the_mark(
+        ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {opt.option_id: "yes"}})
     _mk_token(cid, evt, joe.user_id, token="tj")
+    page = web._flex_token_page(_get("/e/tj"))["body"]
+    assert "The organizer recorded the answer below for you" in page
     web._api_flex_token_vote(_post("/api/e/vote", {
-        "token": "tj", f"vote_{opt.option_id}": "yes", "bringing": "Salad"}))
-    before = db.get_flexible_rsvp("a1", evt.event_id, joe.user_id)
-    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes", bob.user_id: "yes"})
-    after = db.get_flexible_rsvp("a1", evt.event_id, joe.user_id)
-    assert after == before and after.bringing == "Salad"
+        "token": "tj", f"vote_{opt.option_id}": "no"}))
+    r = _rsvp(evt, joe)
+    assert r.confirmed_response == "no" and r.marked_by is None
+    assert "Answered online (1)" in _results(cid, app, aa, aa_mem, evt)
+    assert "organizer recorded" not in web._flex_token_page(_get("/e/tj"))["body"]
 
 
-def test_scheduled_event_from_a_poll_can_be_marked(ddb_table, outbox) -> None:
-    """After the date is chosen, someone who had said no tells the AA they
-    can come after all: marking them moves them into the people coming."""
+def test_marked_members_are_not_chased_as_unanswered(ddb_table, outbox) -> None:
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
     evt, opt = _mk_event(cid)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {opt.option_id: "yes"}})
+    covered = web._flex_covered_or_responded_ids(
+        list(db.list_memberships_for_app("a1")),
+        {u.user_id: u for u in db.list_users(cid)},
+        list(db.list_flexible_rsvps("a1", evt.event_id)))
+    assert joe.user_id in covered and bob.user_id not in covered
+
+
+# ---- and once the date is set ---------------------------------------------
+
+def test_scheduled_event_from_a_poll_collapses_to_coming_or_not(
+        ddb_table, outbox) -> None:
+    """After the date is chosen the table is a single coming / not coming.
+    Someone who had declined online tells the AA they can come after all:
+    unlocking and marking them moves them into the people coming."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _add_option(cid, evt, "2026-08-22")
     db.put_flexible_rsvp(FlexibleRSVP(
         community_id=cid, app_id="a1", event_id=evt.event_id,
         user_id=joe.user_id, votes={opt.option_id: "no"},
@@ -230,26 +326,17 @@ def test_scheduled_event_from_a_poll_can_be_marked(ddb_table, outbox) -> None:
     evt.state, evt.winning_date = "scheduled", opt.iso_date
     db.put_flexible_event(evt)
     body = _results(cid, app, aa, aa_mem, evt)
-    assert "Mark replies by hand" in body and ">Maybe</th>" not in body
-    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
-    r = db.get_flexible_rsvp("a1", evt.event_id, joe.user_id)
+    assert f"name='v_{bob.user_id}_att'" in body
+    assert f"name='v_{bob.user_id}_{opt.option_id}'" not in body
+    assert ">Maybe</option>" not in body
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes", bob.user_id: "yes"},
+          override=(joe.user_id,))
+    r = _rsvp(evt, joe)
     assert r.confirmed_response == "yes" and r.votes[opt.option_id] == "yes"
     ev = {"requestContext": {"http": {"method": "GET"}}}
     page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)
-    assert "+ coming to August Book Club (1)</button>" in page["body"]
+    assert "+ coming to August Book Club (2)</button>" in page["body"]
     assert outbox == []
-
-
-def test_non_members_cannot_be_marked(ddb_table, outbox) -> None:
-    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
-    _adopt(cid, app, aa, aa_mem)
-    evt = _the_event()
-    web._api_flex_event_save_attendance(
-        _post("/api/flex/event/attendance",
-              {"event": evt.event_id, "member": ["stranger"],
-               "att_stranger": "yes"}),
-        aa, db.get_community(cid), app, aa_mem)
-    assert list(db.list_flexible_rsvps("a1", evt.event_id)) == []
 
 
 def test_send_email_offers_the_people_coming(ddb_table, outbox) -> None:

@@ -1,6 +1,9 @@
-"""Adopted events on flexible_event: a gathering arranged outside the app is
-created straight into `scheduled` — no poll, no links, no email — and the AA
-records who's coming by hand, then writes to them with Send Email."""
+"""Adopted events on flexible_event, and the hand-marked roster.
+
+A gathering arranged outside the app is created straight into `scheduled` — no
+poll, no links, no email. From there it is an ordinary scheduled event whose
+roster the AA keeps by hand. The same roster is on every event with a known
+date, because replies also arrive by text, by phone and in person."""
 from __future__ import annotations
 
 import pytest
@@ -9,7 +12,9 @@ from community_organizer.core import db
 from community_organizer.core.models import FlexibleRSVP
 from community_organizer.lambdas import web
 
-from .test_flexible_event import _mk_event, _post, _seed
+from .test_flexible_event import (
+    _add_option, _mk_event, _mk_token, _post, _seed,
+)
 
 
 @pytest.fixture
@@ -84,7 +89,8 @@ def test_results_page_offers_a_roster_not_a_poll(ddb_table, outbox) -> None:
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
     _adopt(cid, app, aa, aa_mem)
     body = _results(cid, app, aa, aa_mem, _the_event())
-    assert "Who's coming" in body and "Save attendance" in body
+    assert "Mark replies by hand" in body and "Save replies" in body
+    assert "arranged outside the app" in body
     for u in (bob, sue, joe):
         assert f"name='att_{u.user_id}'" in body
     # None of the poll machinery: no votes table, no send, no host question.
@@ -156,18 +162,82 @@ def test_rows_not_on_the_form_are_left_alone(ddb_table, outbox) -> None:
                                 ).confirmed_response == "yes"
 
 
-def test_attendance_is_admin_only_and_adopted_only(ddb_table, outbox) -> None:
+def test_marking_is_admin_only(ddb_table, outbox) -> None:
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
     _adopt(cid, app, aa, aa_mem)
     evt = _the_event()
     resp = _mark(cid, app, bob, db.get_membership("a1", bob.user_id), evt,
                  {bob.user_id: "yes"})
     assert resp["statusCode"] == 403
-    # An ordinary poll can't be marked by hand — members answer for themselves.
-    poll, _opt = _mk_event(cid)
-    _mark(cid, app, aa, aa_mem, poll, {joe.user_id: "yes"})
-    assert db.get_flexible_rsvp("a1", poll.event_id, joe.user_id) is None
     assert db.get_flexible_rsvp("a1", evt.event_id, bob.user_id) is None
+
+
+# ---- the same roster on ordinary events -----------------------------------
+
+def test_one_date_invitation_can_be_marked_by_hand(ddb_table, outbox) -> None:
+    """A reply that came by text is recorded as that member's answer to the
+    one date, so the tallies and the eventual invite list agree with it."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    body = _results(cid, app, aa, aa_mem, evt)
+    assert "Mark replies by hand" in body and ">Maybe</th>" in body
+    assert "arranged outside the app" not in body
+    _mark(cid, app, aa, aa_mem, evt,
+          {joe.user_id: "maybe", bob.user_id: "no", sue.user_id: ""})
+    r = db.get_flexible_rsvp("a1", evt.event_id, joe.user_id)
+    assert r.votes == {opt.option_id: "maybe"} and r.confirmed_response == "yes"
+    assert db.get_flexible_rsvp("a1", evt.event_id, bob.user_id
+                                ).confirmed_response == "no"
+    confirmed, couldnt, _ = web._flex_cohorts(
+        app, db.get_community(cid), evt.event_id, opt.option_id)
+    assert bob.user_id in {u.user_id for u in couldnt}
+    assert joe.user_id in {u.user_id for u in confirmed}
+    assert outbox == []
+
+
+def test_several_dates_cannot_be_marked_yet(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, _opt = _mk_event(cid)
+    _add_option(cid, evt, "2026-08-22")
+    assert "Mark replies by hand" not in _results(cid, app, aa, aa_mem, evt)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
+    assert db.get_flexible_rsvp("a1", evt.event_id, joe.user_id) is None
+
+
+def test_saving_leaves_a_members_own_answer_alone(ddb_table, outbox) -> None:
+    """The form posts every row. A member who answered online — count, dish
+    and all — must come through a save untouched unless the AA changed them."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _mk_token(cid, evt, joe.user_id, token="tj")
+    web._api_flex_token_vote(_post("/api/e/vote", {
+        "token": "tj", f"vote_{opt.option_id}": "yes", "bringing": "Salad"}))
+    before = db.get_flexible_rsvp("a1", evt.event_id, joe.user_id)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes", bob.user_id: "yes"})
+    after = db.get_flexible_rsvp("a1", evt.event_id, joe.user_id)
+    assert after == before and after.bringing == "Salad"
+
+
+def test_scheduled_event_from_a_poll_can_be_marked(ddb_table, outbox) -> None:
+    """After the date is chosen, someone who had said no tells the AA they
+    can come after all: marking them moves them into the people coming."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    db.put_flexible_rsvp(FlexibleRSVP(
+        community_id=cid, app_id="a1", event_id=evt.event_id,
+        user_id=joe.user_id, votes={opt.option_id: "no"},
+        confirmed_response="no"))
+    evt.state, evt.winning_date = "scheduled", opt.iso_date
+    db.put_flexible_event(evt)
+    body = _results(cid, app, aa, aa_mem, evt)
+    assert "Mark replies by hand" in body and ">Maybe</th>" not in body
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
+    r = db.get_flexible_rsvp("a1", evt.event_id, joe.user_id)
+    assert r.confirmed_response == "yes" and r.votes[opt.option_id] == "yes"
+    ev = {"requestContext": {"http": {"method": "GET"}}}
+    page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)
+    assert "+ coming to August Book Club (1)</button>" in page["body"]
+    assert outbox == []
 
 
 def test_non_members_cannot_be_marked(ddb_table, outbox) -> None:

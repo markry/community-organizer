@@ -2962,36 +2962,29 @@ def _flex_event_results_page(event: dict, user: User,
             + (f"<ul style='padding-left:18px'>{host_rows}</ul>"
                if host_rows else ""))
 
-    # Adopted event: nobody was polled or sent a link, so instead of vote
-    # tallies the AA gets a roster to mark by hand. A blank count means "the
-    # members of this household marked coming"; a number overrides it (guests,
-    # children). Stored counts equal to that default are shown blank so they
-    # keep tracking the ticks.
-    attendance_html = ""
-    if evt.adopted:
-        _coming_hh: dict[str, int] = {}
-        for r in rsvps:
-            if r.confirmed_response == "yes":
-                k = _hh_key(users, r.user_id)
-                _coming_hh[k] = _coming_hh.get(k, 0) + 1
-        _editable = evt.state == "scheduled"
-        _dis = "" if _editable else " disabled"
+    # Hand-marked roster. Replies also arrive by text, by phone and in person,
+    # so wherever the date is known the AA can record them here. For an
+    # adopted event this is the only way answers get in.
+    roster_html = ""
+    if _flex_roster_open(evt, options):
+        _opt = _flex_roster_option(evt, options)
+        _answers = {r.user_id: _flex_roster_answer(evt, r, _opt) for r in rsvps}
+        _choices = [("yes", "Coming"), ("no", "Not coming"), ("", "No answer")]
+        if evt.state == "poll":
+            _choices.insert(1, ("maybe", "Maybe"))
         att_rows = ""
         for m in sorted(members, key=lambda m: (name_of(m.user_id) or "").lower()):
             uid = m.user_id
             r = rsvp_by_user.get(uid)
-            cur = r.confirmed_response if r and r.confirmed_response in (
-                "yes", "no") else ""
-            auto = _coming_hh.get(_hh_key(users, uid), 0)
-            size = (r.party_size if r and cur == "yes" and r.party_size
-                    and r.party_size != auto else "")
+            cur = _answers.get(uid) or ""
+            size = (r.party_size if r and cur in ("yes", "maybe")
+                    and r.party_size and not r.party_size_auto else "")
             radios = "".join(
                 "<td style='padding:4px 10px;text-align:center'>"
                 f"<input type='radio' name='att_{uid}' value='{val}'"
-                + (" checked" if cur == val else "") + _dis
+                + (" checked" if cur == val else "")
                 + f" title='{lbl}'></td>"
-                for val, lbl in (("yes", "Coming"), ("no", "Not coming"),
-                                 ("", "No answer")))
+                for val, lbl in _choices)
             att_rows += (
                 "<tr style='border-top:1px solid #eee'>"
                 "<td style='padding:4px 10px'>"
@@ -2999,31 +2992,38 @@ def _flex_event_results_page(event: dict, user: User,
                 f"{html.escape(name_of(uid))}</td>{radios}"
                 "<td style='padding:4px 10px;text-align:center'>"
                 f"<input type='number' name='size_{uid}' min='1' value='{size}'"
-                f"{_dis} style='padding:3px;width:60px;text-align:center'>"
+                " style='padding:3px;width:60px;text-align:center'>"
                 "</td></tr>")
-        attendance_html = (
-            "<h2 style='font-size:1.05em;margin-top:18px'>Who's coming</h2>"
-            "<p style='color:#888;font-size:0.85em;margin:-4px auto 6px;"
-            "max-width:640px'>This event was arranged outside the app, so "
-            "nobody was emailed and nobody can answer online &mdash; record the "
-            "replies you've had here. <b>How many</b> is the household's total; "
-            "leave it blank to count just the people ticked.</p>"
+        roster_html = (
+            "<details style='margin-top:18px'"
+            + (" open" if evt.adopted else "") + ">"
+            "<summary style='cursor:pointer;font-weight:600;font-size:1.05em'>"
+            "Mark replies by hand</summary>"
+            "<p style='color:#888;font-size:0.85em;margin:6px auto;"
+            "max-width:640px'>"
+            + ("This event was arranged outside the app, so nobody was emailed "
+               "and nobody can answer online. " if evt.adopted else "")
+            + "Record the replies you get by text, by phone or in person. "
+            "Nothing is sent to anyone you mark. <b>How many</b> is the "
+            "household's total; leave it blank to count just the people "
+            "ticked.</p>"
             "<form method='post' action='/api/flex/event/attendance'>"
             f"<input type='hidden' name='event' value='{event_id}'>"
-            "<table style='border-collapse:collapse;text-align:left;margin:0 auto'>"
+            "<table style='border-collapse:collapse;text-align:left;"
+            "margin:0 auto'>"
             "<thead><tr style='color:#888;border-bottom:1px solid #ddd'>"
             "<th style='padding:4px 10px'>Member</th>"
-            "<th style='padding:4px 10px'>Coming</th>"
-            "<th style='padding:4px 10px'>Not coming</th>"
-            "<th style='padding:4px 10px'>No answer</th>"
-            "<th style='padding:4px 10px'>How many</th></tr></thead>"
+            + "".join(f"<th style='padding:4px 10px'>{lbl}</th>"
+                      for _, lbl in _choices)
+            + "<th style='padding:4px 10px'>How many</th></tr></thead>"
             f"<tbody>{att_rows}</tbody></table>"
-            + ("<p><button type='submit' style='padding:7px 18px;"
-               "cursor:pointer;background:#2a7;color:#fff;border:none;"
-               "border-radius:5px'>Save attendance</button> "
-               "<a href='/admin/send-email' style='margin-left:14px'>Write to "
-               "the people coming &rarr;</a></p>" if _editable else "")
-            + "</form>")
+            "<p><button type='submit' style='padding:7px 18px;"
+            "cursor:pointer;background:#2a7;color:#fff;border:none;"
+            "border-radius:5px'>Save replies</button>"
+            + (" <a href='/admin/send-email' style='margin-left:14px'>Write "
+               "to the people coming &rarr;</a>"
+               if evt.state == "scheduled" else "")
+            + "</p></form></details>")
 
     body = (
         f"<h1>{html.escape(evt.title)}</h1>"
@@ -3035,7 +3035,7 @@ def _flex_event_results_page(event: dict, user: User,
         + (send_html if evt.state == "poll" else "")
         + unanswered_names_html
         + notify_html
-        + attendance_html
+        + (roster_html if evt.adopted else "")
         + ("" if evt.adopted else
           "<h2 style='font-size:1.05em;margin-top:18px'>Date votes</h2>"
           "<p style='color:#888;font-size:0.85em;margin:-4px 0 6px'>Counts read "
@@ -3068,6 +3068,7 @@ def _flex_event_results_page(event: dict, user: User,
         + "</p>"
         + ("<h2 style='font-size:1.05em;margin-top:14px'>Bringing</h2>"
            f"<ul>{bringing_rows}</ul>" if bringing_rows else "")
+        + ("" if evt.adopted else roster_html)
         + host_html
         + close_html
         + cancel_html
@@ -3078,15 +3079,46 @@ def _flex_event_results_page(event: dict, user: User,
     return _html(200, _page(body, narrow=False, title=evt.title))
 
 
-# ---- AA: record attendance by hand (adopted events) ------------------------
+# ---- AA: mark replies by hand ----------------------------------------------
+# Wherever an event's date is known — a one-date invitation, or anything
+# scheduled — an AA can record answers that reached them outside the app. With
+# several candidate dates there is no single "coming", so that waits for the
+# poll to close.
+
+def _flex_roster_open(evt: FlexibleEvent, options: list) -> bool:
+    return evt.state == "scheduled" or (evt.state == "poll"
+                                        and len(options) == 1)
+
+
+def _flex_roster_option(evt: FlexibleEvent, options: list):
+    """The poll option the roster answers for: the single candidate date, or
+    the one that won. None for an adopted event (it never had options)."""
+    if evt.state == "poll":
+        return options[0] if len(options) == 1 else None
+    return next((o for o in options if o.iso_date == evt.winning_date), None)
+
+
+def _flex_roster_answer(evt: FlexibleEvent, rsvp: FlexibleRSVP | None,
+                        opt) -> str | None:
+    """A member's standing as the roster shows it: yes / maybe / no / None."""
+    if rsvp is None:
+        return None
+    vote = rsvp.votes.get(opt.option_id) if opt is not None else None
+    if rsvp.confirmed_response == "no" or vote == "no":
+        return "no"
+    if evt.state == "poll":
+        return vote if vote in ("yes", "maybe") else None
+    return "yes" if rsvp.confirmed_response == "yes" else None
+
 
 def _api_flex_event_save_attendance(event: dict, user: User,
                                     community: Community | None,
                                     app: Application,
                                     membership: Membership | None) -> dict:
-    """Save the hand-marked roster of an adopted event. Only rows the form
-    actually carried are touched, so a member added since the page was loaded
-    is left alone. Sends nothing."""
+    """Save the hand-marked roster. Only rows the form carried are considered,
+    and of those only the ones the AA actually changed are written — a member's
+    own answer, count and notes are otherwise left exactly as they gave them.
+    Sends nothing."""
     if _http_method(event) != "POST":
         return _text(405, "POST required")
     guard = _flex_guard(user, membership, app)
@@ -3095,60 +3127,78 @@ def _api_flex_event_save_attendance(event: dict, user: User,
     parsed = _parse_form(event)
     event_id = (parsed.get("event", [""])[0] or "").strip()
     evt = db.get_flexible_event(app.app_id, event_id)
-    if evt is None or not evt.adopted or evt.state != "scheduled":
-        return _error_redirect("/", "That event's attendance can't be edited.")
+    options = (list(db.list_flexible_poll_options(app.app_id, event_id))
+               if evt else [])
+    if evt is None or evt.merged_into or not _flex_roster_open(evt, options):
+        return _error_redirect("/", "Replies can't be marked on that event.")
+    opt = _flex_roster_option(evt, options)
+    allowed = ("yes", "maybe", "no") if evt.state == "poll" else ("yes", "no")
     member_ids = {m.user_id for m in db.list_memberships_for_app(app.app_id)}
     listed = [u for u in parsed.get("member", []) if u in member_ids]
     users = {u.user_id: u for u in db.list_users(app.community_id)}
     rsvps = {r.user_id: r for r in db.list_flexible_rsvps(app.app_id, event_id)}
 
-    def _answer(uid: str) -> str | None:
+    def _wanted(uid: str) -> str | None:
         v = (parsed.get(f"att_{uid}", [""])[0] or "").strip()
-        return v if v in ("yes", "no") else None
+        return v if v in allowed else None
 
-    # What each member will be after this save: the form's answer for listed
-    # rows, the stored one otherwise. Household counts are taken from that.
-    final = {uid: r.confirmed_response for uid, r in rsvps.items()}
-    final.update({uid: _answer(uid) for uid in listed})
+    # Everyone's standing once this save lands: the form's answer for listed
+    # rows, the stored one otherwise. Default counts are taken from that.
+    final = {uid: _flex_roster_answer(evt, r, opt) for uid, r in rsvps.items()}
+    final.update({uid: _wanted(uid) for uid in listed})
     coming_hh: dict[str, int] = {}
-    for uid, resp in final.items():
-        if resp == "yes":
+    for uid, ans in final.items():
+        if ans in ("yes", "maybe"):
             k = _hh_key(users, uid)
             coming_hh[k] = coming_hh.get(k, 0) + 1
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    changed = 0
     for uid in listed:
-        want = _answer(uid)
+        want = _wanted(uid)
         r = rsvps.get(uid)
         if want is None:
             if r is not None:
                 db.delete_flexible_rsvp(app.app_id, event_id, uid)
+                changed += 1
             continue
-        size = None
-        if want == "yes":
-            try:
-                size = int((parsed.get(f"size_{uid}", [""])[0] or "").strip())
-            except ValueError:
-                size = 0
-            if size < 1:
-                size = coming_hh[_hh_key(users, uid)]
+        try:
+            given = int((parsed.get(f"size_{uid}", [""])[0] or "").strip())
+        except ValueError:
+            given = 0
+        same_answer = r is not None and _flex_roster_answer(evt, r, opt) == want
+        if want == "no":
+            size, auto = None, False
+            if same_answer:
+                continue
+        elif given >= 1:
+            size, auto = given, False
+        elif same_answer and not r.party_size_auto:
+            continue                       # their own answer, untouched
+        else:
+            size, auto = coming_hh[_hh_key(users, uid)], True
+        if (same_answer and r.party_size == size
+                and r.party_size_auto == auto):
+            continue
         if r is None:
             r = FlexibleRSVP(community_id=app.community_id, app_id=app.app_id,
                              event_id=event_id, user_id=uid)
-        elif r.confirmed_response == want and r.party_size == size:
-            continue
-        r.confirmed_response = want
-        r.party_size = size
+        r.confirmed_response = "no" if want == "no" else "yes"
+        if opt is not None:
+            r.votes = {**r.votes, opt.option_id: want}
+        r.party_size, r.party_size_auto = size, auto
         if want == "no":
             r.willing_to_host = False
         r.updated_at = now
         db.put_flexible_rsvp(r)
-    n_yes = sum(1 for v in final.values() if v == "yes")
+        changed += 1
+    n_yes = sum(1 for v in final.values() if v in ("yes", "maybe"))
     n_no = sum(1 for v in final.values() if v == "no")
-    log.info("flex attendance saved app=%s event=%s coming=%d declined=%d by=%s",
-             app.app_id, event_id, n_yes, n_no, user.user_id)
+    log.info("flex roster saved app=%s event=%s changed=%d coming=%d "
+             "declined=%d by=%s", app.app_id, event_id, changed, n_yes, n_no,
+             user.user_id)
     return _redirect(
         f"/flex/event/results?event={event_id}&notice="
-        + urllib.parse.quote(f"Attendance saved: {n_yes} coming, "
+        + urllib.parse.quote(f"Replies saved: {n_yes} coming, "
                              f"{n_no} not coming."))
 
 
@@ -4222,6 +4272,7 @@ def _api_flex_token_vote(event: dict) -> dict:
     if ps != "":
         try:
             rsvp.party_size = max(0, int(ps))
+            rsvp.party_size_auto = False
         except ValueError:
             pass
     bringing = (parsed.get("bringing", [""])[0] or "").strip()
@@ -11439,17 +11490,18 @@ def _send_email_page(event: dict, user: User, community: Community | None,
                 if m_uid not in _responded
                 and users_by_id[m_uid].household_id not in _covered_households
             ]
-    # Adopted events (arranged outside the app, attendance marked by hand):
-    # one quick-pick per event for "the people coming" — writing to them is
-    # the whole reason to adopt an event.
+    # One quick-pick per scheduled event for "the people coming" — those who
+    # said yes (online or marked by hand) and didn't rule out the chosen date.
     coming_to: list[tuple] = []
     if app.app_type == "flexible_event":
         for _e in db.list_flexible_events(app.app_id):
-            if not (_e.adopted and _e.state == "scheduled"):
+            if _e.state != "scheduled":
                 continue
+            _o = _flex_roster_option(_e, list(
+                db.list_flexible_poll_options(app.app_id, _e.event_id)))
             _yes = {r.user_id
                     for r in db.list_flexible_rsvps(app.app_id, _e.event_id)
-                    if r.confirmed_response == "yes"}
+                    if _flex_roster_answer(_e, r, _o) == "yes"}
             _who = [{"uid": m_uid, "name": users_by_id[m_uid].name}
                     for m_uid, _ in members if m_uid in _yes]
             if _who:

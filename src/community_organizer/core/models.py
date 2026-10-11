@@ -616,8 +616,9 @@ class FlexibleEvent:
     host_user_id: str | None = None              # the volunteer the AA chose
     # Adopted: a gathering that was arranged outside the app (invitations
     # already went out some other way). Created straight into `scheduled` with
-    # no poll options, no magic links and no emails; the AA records who's
-    # coming by hand on the results page, then uses Send Email from there on.
+    # no poll options, no magic links and no emails. From there it is an
+    # ordinary scheduled event, minus what needs a link (members answering
+    # online, the hosting question): the AA keeps the roster by hand.
     adopted: bool = False
     poll_closes_at: str | None = None            # optional ISO datetime
     # Event id this one was folded into, when an AA ran two polls for the
@@ -672,6 +673,10 @@ class FlexibleRSVP:
     # member answers for their whole family. Summed (household-grouped)
     # for the AA's total expected attendance.
     party_size: int | None = None
+    # True when party_size was filled in for an AA's hand-marked answer with
+    # no count given ("the members of this household marked coming"), so a
+    # later save can keep it in step. False once anyone states a number.
+    party_size_auto: bool = False
     rsvp_id: str = field(default_factory=_new_id)
     version: int = 0
     updated_at: str = field(default_factory=_now)

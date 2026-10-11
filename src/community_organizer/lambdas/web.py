@@ -3078,13 +3078,14 @@ def _flex_event_results_page(event: dict, user: User,
                        else "Marked", groups["aa"])
             + _section("Haven't answered", groups["none"])
             + "</tbody></table></div>"
-            "<p><button type='submit' style='padding:7px 18px;"
-            "cursor:pointer;background:#2a7;color:#fff;border:none;"
-            "border-radius:5px'>Save replies</button>"
-            + (" <a href='/admin/send-email' style='margin-left:14px'>Write "
-               "to the people coming &rarr;</a>"
-               if evt.state == "scheduled" else "")
-            + "</p></form>"
+            # Every change saves itself (script below), so there is no Save
+            # button to press — only a fallback for a browser without
+            # JavaScript.
+            "<noscript><p><button type='submit' style='padding:7px 18px;"
+            "cursor:pointer'>Save replies</button></p></noscript>"
+            + ("<p><a href='/admin/send-email'>Write to the people coming "
+               "&rarr;</a></p>" if evt.state == "scheduled" else "")
+            + "</form>"
             # Changes save themselves so a marked member moves straight into
             # the "marked" group. With a single choice that is at once. With
             # one per date it is as soon as every date has an answer (or all

@@ -3056,7 +3056,8 @@ def _flex_event_results_page(event: dict, user: User,
             "Replies &mdash; mark by hand</summary>"
             "<p style='color:#666;font-size:0.88em;margin:6px auto;"
             f"max-width:680px'>{_note} Nothing is emailed to anyone you mark. "
-            + ("Each change is saved once you move off that member's row. "
+            + ("A member's row is saved once every date has an answer, or a "
+               "few seconds after a partial one. "
                if len(_cols) > 1 else
                "Each change is saved as you make it. ")
             + "<b>How many</b> is the household's total; leave it blank to "
@@ -3085,9 +3086,13 @@ def _flex_event_results_page(event: dict, user: User,
                if evt.state == "scheduled" else "")
             + "</p></form>"
             # Changes save themselves so a marked member moves straight into
-            # the "marked" group: at once when there is a single choice, on
-            # leaving the row when there is one per date (so a reply covering
-            # several dates is entered whole). The warning about answering for
+            # the "marked" group. With a single choice that is at once. With
+            # one per date it is as soon as every date has an answer (or all
+            # are cleared); a part-filled row waits a few seconds for the
+            # rest, so a reply covering several dates isn't saved one date at
+            # a time. (Not on focus leaving the row: Safari doesn't focus a
+            # select on click, so that never fired.) The edited row is tinted
+            # while it waits. The warning about answering for
             # someone else is asked once per event per browser session, not on
             # every click; unlocking a member's own answer is confirmed each
             # time. Scroll position is carried across the reload. The strings
@@ -3095,7 +3100,7 @@ def _flex_event_results_page(event: dict, user: User,
             "<script>(function(){var f=document.getElementById('roster-form');"
             "if(!f)return;"
             f"var K='rs-{event_id}',multi={'true' if len(_cols) > 1 else 'false'},"
-            f"warn={'false' if evt.adopted else 'true'},dirty=null;"
+            f"warn={'false' if evt.adopted else 'true'},dirty=0;"
             "function ss(k,v){try{if(v===undefined)return sessionStorage.getItem"
             "(k);if(v===null)sessionStorage.removeItem(k);else sessionStorage."
             "setItem(k,v);}catch(e){}return null;}"
@@ -3109,10 +3114,13 @@ def _flex_event_results_page(event: dict, user: User,
             "function go(){if(ok()){ss(K+'-y',String(window.scrollY));f.submit();}"
             "else{location.reload();}}"
             "f.addEventListener('change',function(e){var tr=e.target.closest"
-            "('tr');if(!tr)return;if(multi){dirty=tr;}else{go();}});"
-            "f.addEventListener('focusout',function(e){if(!dirty)return;"
-            "var to=e.relatedTarget;if(to&&dirty.contains(to))return;"
-            "dirty=null;go();});"
+            "('tr');if(!tr)return;clearTimeout(dirty);"
+            "tr.style.background='#fffbe6';"
+            "if(!multi){go();return;}"
+            "var n=0,sel=tr.querySelectorAll('select');"
+            "sel.forEach(function(x){if(x.value)n++;});"
+            "if(n===0||n===sel.length){go();}"
+            "else{dirty=setTimeout(go,3000);}});"
             "f.querySelectorAll('.rs-unlock').forEach(function(b){"
             "b.onclick=function(){if(!confirm('This member answered online "
             "themselves. Change their answer anyway?'))return;"

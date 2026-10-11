@@ -2662,6 +2662,7 @@ def _flex_event_results_page(event: dict, user: User,
             hh_best[hh] = max(hh_best.get(hh, 0), r.party_size)
     total_headcount = sum(hh_best.values())
     declined = [r.user_id for r in rsvps if r.confirmed_response == "no"]
+    maybe_ct = sum(1 for r in rsvps if r.confirmed_response == "maybe")
 
     # Close form (only while still a poll). The AA's deliberate click here is
     # the go/no-go decision gate — she reviews turnout first and may instead
@@ -2981,8 +2982,11 @@ def _flex_event_results_page(event: dict, user: User,
             _vals = [("", "&mdash;"), ("yes", "Yes"), ("maybe", "Maybe"),
                      ("no", "No")]
         else:
+            # Plans stay uncertain after a date is set ("if I can get a
+            # ride"), so Maybe is an answer here too.
             _cols = [("att", "Coming?")]
-            _vals = [("", "&mdash;"), ("yes", "Coming"), ("no", "Not coming")]
+            _vals = [("", "&mdash;"), ("yes", "Coming"), ("maybe", "Maybe"),
+                     ("no", "Not coming")]
 
         def _cell(uid: str, key: str, cur: str, locked: bool) -> str:
             return (
@@ -3009,7 +3013,7 @@ def _flex_event_results_page(event: dict, user: User,
             else:
                 ans = _flex_roster_answer(evt, r, _win) or ""
                 cells = _cell(uid, "att", ans, locked)
-                going = ans == "yes"
+                going = ans in ("yes", "maybe")
             size = (r.party_size if r and going and r.party_size
                     and not r.party_size_auto else "")
             tag = ""
@@ -3168,6 +3172,7 @@ def _flex_event_results_page(event: dict, user: User,
         + f"<p style='margin-top:14px'><b>Expected headcount:</b> "
           f"{total_headcount} "
           "<span style='color:#888;font-size:0.9em'>(household-deduped)</span>"
+          + (f" &middot; <b>Maybe:</b> {maybe_ct}" if maybe_ct else "")
           + (f" &middot; <b>Declined:</b> {len(declined)}" if declined else "")
           + (f" &middot; <b>Opted out of the group:</b> {len(opted_out_ids)}"
              if opted_out_ids else "")
@@ -3204,13 +3209,16 @@ def _flex_roster_option(evt: FlexibleEvent, options: list):
 
 def _flex_roster_answer(evt: FlexibleEvent, rsvp: FlexibleRSVP | None,
                         opt) -> str | None:
-    """A member's standing on a SCHEDULED event: "yes" / "no" / None."""
+    """A member's standing on a SCHEDULED event: "yes" / "maybe" / "no" /
+    None. Only an AA's mark makes a "maybe" here — a Maybe vote in the poll
+    that led to this date counted as coming and got the invite."""
     if rsvp is None:
         return None
     vote = rsvp.votes.get(opt.option_id) if opt is not None else None
     if rsvp.confirmed_response == "no" or vote == "no":
         return "no"
-    return "yes" if rsvp.confirmed_response == "yes" else None
+    return (rsvp.confirmed_response
+            if rsvp.confirmed_response in ("yes", "maybe") else None)
 
 
 def _flex_rsvp_origin(evt: FlexibleEvent, rsvp: FlexibleRSVP | None) -> str:
@@ -3259,7 +3267,7 @@ def _api_flex_event_save_attendance(event: dict, user: User,
         """What the form says for this member: {option_id: vote} while
         polling, {"att": yes|no} once scheduled. Blank choices are absent."""
         keys = opt_ids if polling else ["att"]
-        allowed = ("yes", "maybe", "no") if polling else ("yes", "no")
+        allowed = ("yes", "maybe", "no")
         out = {}
         for k in keys:
             v = (parsed.get(f"v_{uid}_{k}", [""])[0] or "").strip()
@@ -3319,7 +3327,10 @@ def _api_flex_event_save_attendance(event: dict, user: User,
                        if k not in opt_ids} | want
         elif win is not None:
             r.votes = {**r.votes, win.option_id: want["att"]}
-        r.confirmed_response = "yes" if _going(want) else "no"
+        # A poll keeps the member-side rule (any yes/maybe = in, all no =
+        # declined); a scheduled event stores the answer itself.
+        r.confirmed_response = (("yes" if _going(want) else "no") if polling
+                                else want["att"])
         r.party_size, r.party_size_auto = size, auto
         if not _going(want):
             r.willing_to_host = False
@@ -11642,13 +11653,17 @@ def _send_email_page(event: dict, user: User, community: Community | None,
                 continue
             _o = _flex_roster_option(_e, list(
                 db.list_flexible_poll_options(app.app_id, _e.event_id)))
-            _yes = {r.user_id
-                    for r in db.list_flexible_rsvps(app.app_id, _e.event_id)
-                    if _flex_roster_answer(_e, r, _o) == "yes"}
+            _ans = {r.user_id: _flex_roster_answer(_e, r, _o)
+                    for r in db.list_flexible_rsvps(app.app_id, _e.event_id)}
             _who = [{"uid": m_uid, "name": users_by_id[m_uid].name}
-                    for m_uid, _ in members if m_uid in _yes]
+                    for m_uid, _ in members if _ans.get(m_uid) == "yes"]
             if _who:
-                coming_to.append((_e.title, _who))
+                coming_to.append((f"coming to {_e.title}", _who))
+            _both = [{"uid": m_uid, "name": users_by_id[m_uid].name}
+                     for m_uid, _ in members
+                     if _ans.get(m_uid) in ("yes", "maybe")]
+            if len(_both) > len(_who):
+                coming_to.append((f"coming or maybe to {_e.title}", _both))
     import json as _json
     # json.dumps does NOT escape "</" — neutralize for inline <script>.
     never_logged_in_json = _json.dumps(never_logged_in).replace("</", "<\\/")
@@ -11662,7 +11677,7 @@ def _send_email_page(event: dict, user: User, community: Community | None,
     for _i, (_title, _who) in enumerate(coming_to):
         quick_pick_buttons += (
             f" <button type='button' class='qp-coming' data-i='{_i}' "
-            f"style='{_qp_style}'>+ coming to {html.escape(_title)} "
+            f"style='{_qp_style}'>+ {html.escape(_title)} "
             f"({len(_who)})</button>")
     if not_responded:
         quick_pick_buttons += (

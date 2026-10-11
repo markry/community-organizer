@@ -333,7 +333,6 @@ def test_scheduled_event_from_a_poll_collapses_to_coming_or_not(
     body = _results(cid, app, aa, aa_mem, evt)
     assert f"name='v_{bob.user_id}_att'" in body
     assert f"name='v_{bob.user_id}_{opt.option_id}'" not in body
-    assert ">Maybe</option>" not in body
     _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes", bob.user_id: "yes"},
           override=(joe.user_id,))
     r = _rsvp(evt, joe)
@@ -376,3 +375,26 @@ def test_home_lists_an_adopted_event_as_scheduled(ddb_table, outbox) -> None:
                               org_name="Book Club")["body"]
     assert "Scheduled" in body and "Autumn Dinner" in body
     assert "3 attending" in body and "Open polls" not in body
+
+
+def test_maybe_on_a_scheduled_event(ddb_table, outbox) -> None:
+    """Plans stay uncertain after the date is set. A maybe counts toward the
+    expected headcount but is not one of "the people coming"."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    assert ">Maybe</option>" in _results(cid, app, aa, aa_mem, evt)
+    _mark(cid, app, aa, aa_mem, evt, {bob.user_id: "yes", joe.user_id: "maybe"})
+    assert _rsvp(evt, joe).confirmed_response == "maybe"
+    assert _rsvp(evt, joe).party_size == 1
+    body = _results(cid, app, aa, aa_mem, evt)
+    assert "<b>Expected headcount:</b> 2 " in body and "<b>Maybe:</b> 1" in body
+    assert f"<option value='maybe' selected>" in body
+    ev = {"requestContext": {"http": {"method": "GET"}}}
+    page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
+    assert "+ coming to Autumn Dinner (1)</button>" in page
+    assert "+ coming or maybe to Autumn Dinner (2)</button>" in page
+    # Back to a plain yes: the second button has nothing to add, so it goes.
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
+    page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
+    assert "coming or maybe" not in page

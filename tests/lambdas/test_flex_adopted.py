@@ -358,7 +358,7 @@ def test_scheduled_event_from_a_poll_collapses_to_coming_or_not(
     assert r.confirmed_response == "yes" and r.votes[opt.option_id] == "yes"
     ev = {"requestContext": {"http": {"method": "GET"}}}
     page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)
-    assert "+ coming to August Book Club (2)</button>" in page["body"]
+    assert "+ coming (2)</button>" in page["body"]
     assert outbox == []
 
 
@@ -376,7 +376,7 @@ def test_send_email_offers_the_people_coming(ddb_table, outbox) -> None:
     _mark(cid, app, aa, aa_mem, evt,
           {bob.user_id: "yes", sue.user_id: "no", joe.user_id: "yes"})
     body = page()
-    assert "+ coming to Autumn Dinner (2)</button>" in body
+    assert "+ coming (2)</button>" in body
     picked = body.split("var comingTo=")[1].split(";")[0]
     assert bob.user_id in picked and joe.user_id in picked
     assert sue.user_id not in picked
@@ -411,8 +411,8 @@ def test_maybe_on_a_scheduled_event(ddb_table, outbox) -> None:
     assert f"<option value='maybe' selected>" in body
     ev = {"requestContext": {"http": {"method": "GET"}}}
     page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
-    assert "+ coming to Autumn Dinner (1)</button>" in page
-    assert "+ coming plus maybes to Autumn Dinner (2)</button>" in page
+    assert "+ coming (1)</button>" in page
+    assert "+ coming plus maybes (2)</button>" in page
     # Back to a plain yes: the second button has nothing to add, so it goes.
     _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
     page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
@@ -682,3 +682,25 @@ def test_a_blank_email_matches_nobody(ddb_table) -> None:
     db.put_user(User(community_id=cid, email="", name="Guest", channel="none"))
     assert db.get_user_by_email(cid, "") is None
     assert db.get_user_by_email(cid, "   ") is None
+
+
+def test_quick_picks_name_the_event_only_when_there_are_several(
+        ddb_table, outbox) -> None:
+    """About one event, the buttons just say "coming". With two scheduled
+    events and none chosen, each button has to say which event it means."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    first = _the_event()
+    _adopt(cid, app, aa, aa_mem, title="Winter Dinner", date0="2026-12-12")
+    second = next(e for e in db.list_flexible_events("a1")
+                  if e.event_id != first.event_id)
+    _mark(cid, app, aa, aa_mem, first, {bob.user_id: "yes"})
+    _mark(cid, app, aa, aa_mem, second, {joe.user_id: "yes", sue.user_id: "yes"})
+    ev = {"requestContext": {"http": {"method": "GET"}}}
+    body = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
+    assert "+ coming to Autumn Dinner (1)</button>" in body
+    assert "+ coming to Winter Dinner (2)</button>" in body
+    # Arriving from one event's page: only that event, unnamed.
+    ev["queryStringParameters"] = {"event": second.event_id}
+    body = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
+    assert "+ coming (2)</button>" in body and "Autumn Dinner" not in body

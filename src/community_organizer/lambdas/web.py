@@ -11823,26 +11823,6 @@ def _send_email_page(event: dict, user: User, community: Community | None,
                 if m_uid not in _responded
                 and users_by_id[m_uid].household_id not in _covered_households
             ]
-    # One quick-pick per scheduled event for "the people coming" — those who
-    # said yes (online or marked by hand) and didn't rule out the chosen date.
-    coming_to: list[tuple] = []
-    if app.app_type == "flexible_event":
-        for _e in db.list_flexible_events(app.app_id):
-            if _e.state != "scheduled":
-                continue
-            _o = _flex_roster_option(_e, list(
-                db.list_flexible_poll_options(app.app_id, _e.event_id)))
-            _ans = {r.user_id: _flex_roster_answer(_e, r, _o)
-                    for r in db.list_flexible_rsvps(app.app_id, _e.event_id)}
-            _who = [{"uid": m_uid, "name": users_by_id[m_uid].name}
-                    for m_uid, _ in members if _ans.get(m_uid) == "yes"]
-            if _who:
-                coming_to.append((f"coming to {_e.title}", _who))
-            _both = [{"uid": m_uid, "name": users_by_id[m_uid].name}
-                     for m_uid, _ in members
-                     if _ans.get(m_uid) in ("yes", "maybe")]
-            if len(_both) > len(_who):
-                coming_to.append((f"coming plus maybes to {_e.title}", _both))
     # Which event this email is about: the one named in the link that brought
     # the AA here, else the app's only live event. It is shown under the
     # heading and seeds the subject. Where replies are still coming in — an
@@ -11850,6 +11830,7 @@ def _send_email_page(event: dict, user: User, community: Community | None,
     # the audience, so the page opens on Select recipients instead.
     ctx_evt = None
     select_default = False
+    _live: list = []
     if app.app_type == "flexible_event":
         _live = [e for e in db.list_flexible_events(app.app_id)
                  if e.state in ("poll", "scheduled")]
@@ -11858,6 +11839,29 @@ def _send_email_page(event: dict, user: User, community: Community | None,
                    or (_live[0] if len(_live) == 1 else None))
         select_default = any(e.adopted or e.state == "poll"
                              for e in ([ctx_evt] if ctx_evt else _live))
+    # Quick-picks for "the people coming" — those who said yes (online or
+    # marked by hand) and didn't rule out the chosen date — and for them plus
+    # the maybes. When the page is about one event the buttons are for that
+    # event and need not name it; otherwise there is one pair per scheduled
+    # event, each naming its event so they can be told apart.
+    coming_to: list[tuple] = []
+    for _e in ([ctx_evt] if ctx_evt else _live):
+        if _e.state != "scheduled":
+            continue
+        _o = _flex_roster_option(_e, list(
+            db.list_flexible_poll_options(app.app_id, _e.event_id)))
+        _ans = {r.user_id: _flex_roster_answer(_e, r, _o)
+                for r in db.list_flexible_rsvps(app.app_id, _e.event_id)}
+        _to = "" if ctx_evt else f" to {_e.title}"
+        _who = [{"uid": m_uid, "name": users_by_id[m_uid].name}
+                for m_uid, _ in members if _ans.get(m_uid) == "yes"]
+        if _who:
+            coming_to.append((f"coming{_to}", _who))
+        _both = [{"uid": m_uid, "name": users_by_id[m_uid].name}
+                 for m_uid, _ in members
+                 if _ans.get(m_uid) in ("yes", "maybe")]
+        if len(_both) > len(_who):
+            coming_to.append((f"coming plus maybes{_to}", _both))
     event_line = ""
     subject_default = f"{org_name} -- "
     if ctx_evt is not None:

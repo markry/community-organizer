@@ -684,23 +684,30 @@ def test_a_blank_email_matches_nobody(ddb_table) -> None:
     assert db.get_user_by_email(cid, "   ") is None
 
 
-def test_quick_picks_name_the_event_only_when_there_are_several(
-        ddb_table, outbox) -> None:
-    """About one event, the buttons just say "coming". With two scheduled
-    events and none chosen, each button has to say which event it means."""
+def test_send_email_is_always_about_one_event(ddb_table, outbox) -> None:
+    """With several live events the page picks the soonest, names it in a
+    switcher at the top, and the quick-picks are for that event alone — so
+    they never need to say which event they mean."""
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
-    _adopt(cid, app, aa, aa_mem)
-    first = _the_event()
     _adopt(cid, app, aa, aa_mem, title="Winter Dinner", date0="2026-12-12")
-    second = next(e for e in db.list_flexible_events("a1")
-                  if e.event_id != first.event_id)
-    _mark(cid, app, aa, aa_mem, first, {bob.user_id: "yes"})
-    _mark(cid, app, aa, aa_mem, second, {joe.user_id: "yes", sue.user_id: "yes"})
+    winter = _the_event()
+    _adopt(cid, app, aa, aa_mem)                       # Autumn, 2026-11-14
+    autumn = next(e for e in db.list_flexible_events("a1")
+                  if e.event_id != winter.event_id)
+    _mark(cid, app, aa, aa_mem, autumn, {bob.user_id: "yes"})
+    _mark(cid, app, aa, aa_mem, winter, {joe.user_id: "yes", sue.user_id: "yes"})
     ev = {"requestContext": {"http": {"method": "GET"}}}
-    body = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
-    assert "+ coming to Autumn Dinner (1)</button>" in body
-    assert "+ coming to Winter Dinner (2)</button>" in body
-    # Arriving from one event's page: only that event, unnamed.
-    ev["queryStringParameters"] = {"event": second.event_id}
-    body = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
-    assert "+ coming (2)</button>" in body and "Autumn Dinner" not in body
+
+    def page():
+        return web._send_email_page(ev, aa, db.get_community(cid), app,
+                                    aa_mem)["body"]
+
+    body = page()                                      # none chosen: soonest
+    assert f"<option value='{autumn.event_id}' selected>Autumn Dinner" in body
+    assert f"<option value='{winter.event_id}'>Winter Dinner" in body
+    assert "+ coming (1)</button>" in body and "coming to" not in body
+    assert "value='Book Club: Autumn Dinner -- '" in body
+    ev["queryStringParameters"] = {"event": winter.event_id}
+    body = page()
+    assert f"<option value='{winter.event_id}' selected>Winter Dinner" in body
+    assert "+ coming (2)</button>" in body and "coming to" not in body

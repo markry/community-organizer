@@ -3097,7 +3097,7 @@ def _flex_event_results_page(event: dict, user: User,
             # JavaScript.
             "<noscript><p><button type='submit' style='padding:7px 18px;"
             "cursor:pointer'>Save replies</button></p></noscript>"
-            + (f"<p><a href='/admin/send-email?event={event_id}'>Write to the "
+            + (f"<p><a href='/admin/send-email?event={event_id}'>Email the "
                "people coming &rarr;</a></p>"
                if evt.state == "scheduled" else "")
             + "</form>"
@@ -11834,34 +11834,34 @@ def _send_email_page(event: dict, user: User, community: Community | None,
     if app.app_type == "flexible_event":
         _live = [e for e in db.list_flexible_events(app.app_id)
                  if e.state in ("poll", "scheduled")]
+        # Soonest first; an open poll (no date yet) sorts after dated events.
+        _live.sort(key=lambda e: (e.winning_date or "9999", e.created_at))
         _want = (_get_param(event, "event") or "").strip()
+        # The page is always about ONE event when the app has any: the one
+        # asked for, else the soonest. With several, the heading offers a
+        # switcher (below), so the quick-picks never need to name an event.
         ctx_evt = (next((e for e in _live if e.event_id == _want), None)
-                   or (_live[0] if len(_live) == 1 else None))
-        select_default = any(e.adopted or e.state == "poll"
-                             for e in ([ctx_evt] if ctx_evt else _live))
-    # Quick-picks for "the people coming" — those who said yes (online or
-    # marked by hand) and didn't rule out the chosen date — and for them plus
-    # the maybes. When the page is about one event the buttons are for that
-    # event and need not name it; otherwise there is one pair per scheduled
-    # event, each naming its event so they can be told apart.
+                   or (_live[0] if _live else None))
+        select_default = bool(ctx_evt and (ctx_evt.adopted
+                                           or ctx_evt.state == "poll"))
+    # Quick-picks for the event the page is about: "the people coming" —
+    # those who said yes (online or marked by hand) and didn't rule out the
+    # chosen date — and them plus the maybes.
     coming_to: list[tuple] = []
-    for _e in ([ctx_evt] if ctx_evt else _live):
-        if _e.state != "scheduled":
-            continue
-        _o = _flex_roster_option(_e, list(
-            db.list_flexible_poll_options(app.app_id, _e.event_id)))
-        _ans = {r.user_id: _flex_roster_answer(_e, r, _o)
-                for r in db.list_flexible_rsvps(app.app_id, _e.event_id)}
-        _to = "" if ctx_evt else f" to {_e.title}"
+    if ctx_evt is not None and ctx_evt.state == "scheduled":
+        _o = _flex_roster_option(ctx_evt, list(
+            db.list_flexible_poll_options(app.app_id, ctx_evt.event_id)))
+        _ans = {r.user_id: _flex_roster_answer(ctx_evt, r, _o)
+                for r in db.list_flexible_rsvps(app.app_id, ctx_evt.event_id)}
         _who = [{"uid": m_uid, "name": users_by_id[m_uid].name}
                 for m_uid, _ in members if _ans.get(m_uid) == "yes"]
         if _who:
-            coming_to.append((f"coming{_to}", _who))
+            coming_to.append(("coming", _who))
         _both = [{"uid": m_uid, "name": users_by_id[m_uid].name}
                  for m_uid, _ in members
                  if _ans.get(m_uid) in ("yes", "maybe")]
         if len(_both) > len(_who):
-            coming_to.append((f"coming plus maybes{_to}", _both))
+            coming_to.append(("coming plus maybes", _both))
     event_line = ""
     subject_default = f"{org_name} -- "
     if ctx_evt is not None:
@@ -11869,9 +11869,23 @@ def _send_email_page(event: dict, user: User, community: Community | None,
                  + (f" {_fmt_time(ctx_evt.winning_start_time)}"
                     if ctx_evt.winning_start_time else "")
                  if ctx_evt.winning_date else "date not set yet")
-        event_line = ("<p style='margin:-6px 0 14px;color:#444'>About: <b>"
-                      f"{html.escape(ctx_evt.title)}</b> &middot; "
-                      f"{html.escape(_when)}</p>")
+        if len(_live) > 1:
+            # Several live events: name the current one in a switcher. Picking
+            # another reloads the page about that event.
+            _name = (
+                "<select aria-label='Event this email is about' "
+                "style='font-size:1em;font-weight:600;padding:2px 4px' "
+                "onchange=\"location.href='/admin/send-email?event='+"
+                "encodeURIComponent(this.value)\">"
+                + "".join(
+                    f"<option value='{html.escape(e.event_id)}'"
+                    + (" selected" if e.event_id == ctx_evt.event_id else "")
+                    + f">{html.escape(e.title)}</option>" for e in _live)
+                + "</select>")
+        else:
+            _name = f"<b>{html.escape(ctx_evt.title)}</b>"
+        event_line = ("<p style='margin:-6px 0 14px;color:#444'>About: "
+                      f"{_name} &middot; {html.escape(_when)}</p>")
         subject_default = (
             ctx_evt.title if (not org_name
                               or org_name.lower() in ctx_evt.title.lower())

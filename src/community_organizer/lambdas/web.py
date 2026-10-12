@@ -3252,7 +3252,10 @@ def _flex_roster_option(evt: FlexibleEvent, options: list):
 def _flex_rsvp_stamp(rsvp: FlexibleRSVP | None) -> str:
     """Identifies the exact state of one member's reply, so a save can tell
     whether the row it was shown is still the row that is stored."""
-    return "" if rsvp is None else f"{rsvp.version}.{rsvp.updated_at}"
+    # rsvp_id is new for every row ever created, so a reply that was cleared
+    # and recorded again within the same second is still a different stamp.
+    return "" if rsvp is None else (
+        f"{rsvp.rsvp_id}.{rsvp.version}.{rsvp.updated_at}")
 
 
 def _flex_roster_sig(evt: FlexibleEvent, options: list) -> str:
@@ -3341,7 +3344,12 @@ def _api_flex_event_save_attendance(event: dict, user: User,
         if (_flex_rsvp_origin(evt, rsvps.get(u)) == "member"
                 and u not in overrides):
             # Locked when the page was built, or answered by the member since.
-            conflicts += u in dirty
+            # Either the organizer touched it, or (no markers: a form posted
+            # without JavaScript) it was posted as editable and no longer
+            # matches what that page showed: both are refusals worth saying.
+            conflicts += (u in dirty) or (
+                not dirty and (parsed.get(f"base_{u}", [""])[0] or "")
+                != _flex_rsvp_stamp(rsvps.get(u)))
             continue
         if (parsed.get(f"base_{u}", [""])[0] or "") != _flex_rsvp_stamp(
                 rsvps.get(u)):
@@ -3435,22 +3443,34 @@ def _api_flex_event_save_attendance(event: dict, user: User,
             if is_new:
                 db.put_flexible_rsvp(r, create_only=True)
             else:
-                db.put_flexible_rsvp(r, expected_version=r.version)
+                db.put_flexible_rsvp(r, expected_version=r.version,
+                                     update_only=True)
             changed += 1
         except db.ConcurrencyConflict:
             conflicts += 1
     # Household-mates whose count was a default: keep it in step with who in
-    # the household is coming now. Only the count moves — not whose answer it
-    # is — and a row that changed underneath is simply left for next time.
+    # the household is coming. Worked out from what is STORED now, after the
+    # writes above — not from what this request asked for, since some of it
+    # may have been refused. Only the count moves, not whose answer it is,
+    # and a row that changed underneath is simply left for next time.
     touched_hh = {_hh_key(users, uid) for uid in listed}
-    for uid, r in rsvps.items():
+    now_stored = {r.user_id: r
+                  for r in db.list_flexible_rsvps(app.app_id, event_id)}
+    really_coming: dict[str, int] = {}
+    for uid, r in now_stored.items():
+        if _going(_stored(r)):
+            k = _hh_key(users, uid)
+            really_coming[k] = really_coming.get(k, 0) + 1
+    for uid, r in now_stored.items():
         k = _hh_key(users, uid)
-        if (uid in listed or k not in touched_hh or not r.party_size_auto
-                or not _going(_stored(r)) or r.party_size == coming_hh.get(k)):
+        if (k not in touched_hh or not r.party_size_auto
+                or not _going(_stored(r))
+                or r.party_size == really_coming.get(k)):
             continue
-        r.party_size = coming_hh.get(k)
+        r.party_size = really_coming.get(k)
         try:
-            db.put_flexible_rsvp(r, expected_version=r.version)
+            db.put_flexible_rsvp(r, expected_version=r.version,
+                                 update_only=True)
         except db.ConcurrencyConflict:
             pass
     log.info("flex roster saved app=%s event=%s changed=%d conflicts=%d "
@@ -4395,10 +4415,12 @@ def _flex_token_page(event: dict) -> dict:
                     "<p style='color:#666;font-size:0.9em;margin:0 0 6px'>"
                     "We have you down as a maybe.</p>"
                     + "".join(
+                        # Nothing preselected: a preselected choice is
+                        # posted with every save, and saving just a dish
+                        # would then count as the member answering.
                         "<label style='display:block;margin:3px 0;"
                         "cursor:pointer'><input type='radio' name='attend' "
-                        f"value='{v}'" + (" checked" if v == "maybe" else "")
-                        + f"> {lbl}</label>"
+                        f"value='{v}'> {lbl}</label>"
                         for v, lbl in (("yes", "Yes, I'm coming"),
                                        ("maybe", "Still not sure"),
                                        ("no", "No, I can't make it")))
@@ -11928,41 +11950,6 @@ def _send_email_page(event: dict, user: User, community: Community | None,
         if not (users_by_id[m_uid].login_count or 0)
         and not users_by_id[m_uid].last_login_at
     ]
-    # For a flexible_event app with an open poll, ALSO offer "haven't
-    # responded" (the primary shortcut for a poll) — members answer via a
-    # login-free magic link, so "never logged in" would wrongly include people
-    # who DID respond. Both buttons are shown so "never logged in" stays handy.
-    not_responded = []
-    if app.app_type == "flexible_event":
-        _open_polls = [e for e in db.list_flexible_events(app.app_id)
-                       if e.state == "poll"]
-        if _open_polls:
-            _poll = max(_open_polls, key=lambda e: e.created_at)
-            _rsvps = list(db.list_flexible_rsvps(app.app_id, _poll.event_id))
-            _responded = {r.user_id for r in _rsvps}
-            # Household size = number of THIS app's members sharing a household_id.
-            _hh_size: dict[str, int] = {}
-            for m_uid, _ in members:
-                hid = users_by_id[m_uid].household_id
-                if hid:
-                    _hh_size[hid] = _hh_size.get(hid, 0) + 1
-            # A household is "fully covered" when a responder in it reported a
-            # party_size that EXACTLY equals that household's member count — the
-            # whole family is then accounted for, so we skip its other members.
-            # If the numbers don't match (e.g. "2 of 3"), we can't tell who was
-            # covered, so fall back to reminding that household's non-responders.
-            _covered_households = set()
-            for r in _rsvps:
-                ru = users_by_id.get(r.user_id)
-                hid = ru.household_id if ru else None
-                if hid and r.party_size and r.party_size == _hh_size.get(hid):
-                    _covered_households.add(hid)
-            not_responded = [
-                {"uid": m_uid, "name": users_by_id[m_uid].name}
-                for m_uid, _ in members
-                if m_uid not in _responded
-                and users_by_id[m_uid].household_id not in _covered_households
-            ]
     # Which event this email is about: the one named in the link that brought
     # the AA here, else the app's only live event. It is shown under the
     # heading and seeds the subject. Where replies are still coming in — an
@@ -11995,6 +11982,41 @@ def _send_email_page(event: dict, user: User, community: Community | None,
                        else _live[-1] if _live else None))
         select_default = bool(ctx_evt and (ctx_evt.adopted
                                            or ctx_evt.state == "poll"))
+    # For a flexible_event app with an open poll, ALSO offer "haven't
+    # responded" (the primary shortcut for a poll) — members answer via a
+    # login-free magic link, so "never logged in" would wrongly include people
+    # who DID respond. Both buttons are shown so "never logged in" stays handy.
+    # It is for the event this page is about, and only while that event is
+    # an open poll — not for whichever poll happens to be newest.
+    not_responded = []
+    if app.app_type == "flexible_event":
+        if ctx_evt is not None and ctx_evt.state == "poll":
+            _poll = ctx_evt
+            _rsvps = list(db.list_flexible_rsvps(app.app_id, _poll.event_id))
+            _responded = {r.user_id for r in _rsvps}
+            # Household size = number of THIS app's members sharing a household_id.
+            _hh_size: dict[str, int] = {}
+            for m_uid, _ in members:
+                hid = users_by_id[m_uid].household_id
+                if hid:
+                    _hh_size[hid] = _hh_size.get(hid, 0) + 1
+            # A household is "fully covered" when a responder in it reported a
+            # party_size that EXACTLY equals that household's member count — the
+            # whole family is then accounted for, so we skip its other members.
+            # If the numbers don't match (e.g. "2 of 3"), we can't tell who was
+            # covered, so fall back to reminding that household's non-responders.
+            _covered_households = set()
+            for r in _rsvps:
+                ru = users_by_id.get(r.user_id)
+                hid = ru.household_id if ru else None
+                if hid and r.party_size and r.party_size == _hh_size.get(hid):
+                    _covered_households.add(hid)
+            not_responded = [
+                {"uid": m_uid, "name": users_by_id[m_uid].name}
+                for m_uid, _ in members
+                if m_uid not in _responded
+                and users_by_id[m_uid].household_id not in _covered_households
+            ]
     # Quick-picks for the event the page is about: "the people coming" —
     # those who said yes (online or marked by hand) and didn't rule out the
     # chosen date — and them plus the maybes.

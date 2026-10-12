@@ -739,3 +739,155 @@ def test_send_email_opens_on_the_next_upcoming_event(ddb_table, outbox) -> None:
     # A poll with no date yet counts as ahead of anything already past.
     _mk_event(cid)
     assert about() == "August Book Club"
+
+
+# ---- round 2 review ---------------------------------------------------------
+
+def test_havent_responded_is_for_the_event_the_page_is_about(
+        ddb_table, outbox) -> None:
+    """Two open polls, each answered by a different member. The shortcut on
+    the older poll's page must list who has not answered THAT poll — it used
+    to take whichever poll was newest."""
+    import json
+    from community_organizer.core.models import FlexibleEvent, FlexiblePollOption
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    older, o1 = _mk_event(cid)
+    newer = FlexibleEvent(community_id=cid, app_id="a1", title="Later Poll",
+                          state="poll", created_at="2099-01-01T00:00:00+00:00")
+    db.put_flexible_event(newer)
+    o2 = FlexiblePollOption(community_id=cid, app_id="a1",
+                            event_id=newer.event_id, iso_date="2026-09-01")
+    db.put_flexible_poll_option(o2)
+    _mark(cid, app, aa, aa_mem, older, {joe.user_id: {o1.option_id: "yes"}})
+    _mark(cid, app, aa, aa_mem, newer, {bob.user_id: {o2.option_id: "yes"}})
+
+    def not_responded(event_id) -> set:
+        ev = {"requestContext": {"http": {"method": "GET"}},
+              "queryStringParameters": {"event": event_id}}
+        body = web._send_email_page(ev, aa, db.get_community(cid), app,
+                                    aa_mem)["body"]
+        blob = body.split("var notResponded=")[1].split(";")[0]
+        return {u["uid"] for u in json.loads(blob)}
+
+    assert joe.user_id not in not_responded(older.event_id)
+    assert bob.user_id in not_responded(older.event_id)
+    assert bob.user_id not in not_responded(newer.event_id)
+    assert joe.user_id in not_responded(newer.event_id)
+
+
+def test_the_maybe_form_as_a_browser_posts_it_leaves_the_mark_alone(
+        ddb_table, outbox) -> None:
+    """Post exactly what the rendered form would send when the member only
+    types a dish: every named control with its current value. No attendance
+    choice may be preselected, or the save would count as their answer."""
+    import re
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _mk_token(cid, evt, joe.user_id, token="tj")
+    _close(cid, app, aa, aa_mem, evt, opt)
+    evt = db.get_flexible_event("a1", evt.event_id)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "maybe"})
+    page = web._flex_token_page(_get("/e/tj"))["body"]
+    form = page.split("action='/api/e/vote'")[1].split("</form>")[0]
+    posted = {}
+    for tag in re.findall(r"<input[^>]*>", form):
+        name = re.search(r"name='([^']*)'", tag)
+        if not name:
+            continue
+        kind = re.search(r"type='([^']*)'", tag)
+        if kind and kind.group(1) in ("radio", "checkbox") and " checked" not in tag:
+            continue                                # unchecked: not sent
+        value = re.search(r"value='([^']*)'", tag)
+        posted[name.group(1)] = value.group(1) if value else ""
+    assert "attend" not in posted
+    posted["bringing"] = "Salad"
+    web._api_flex_token_vote(_post("/api/e/vote", posted))
+    r = _rsvp(evt, joe)
+    assert r.bringing == "Salad" and r.confirmed_response == "maybe"
+    assert r.marked_by == aa.user_id
+
+
+def test_a_refused_edit_does_not_change_a_household_mates_count(
+        ddb_table, outbox, monkeypatch) -> None:
+    """Both of a household are coming, count 2 by default. The organizer
+    marks one of them No, but that row changes underneath and the edit is
+    refused. The other's count must stay 2: nobody actually dropped out."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    _mark(cid, app, aa, aa_mem, evt, {bob.user_id: "yes", sue.user_id: "yes"})
+    assert _rsvp(evt, bob).party_size == 2
+    real_put = db.put_flexible_rsvp
+    fired = []
+
+    def put(rsvp, **kw):
+        if not fired and rsvp.user_id == sue.user_id:
+            fired.append(1)
+            monkeypatch.setattr(db, "put_flexible_rsvp", real_put)
+            other = db.get_flexible_rsvp("a1", evt.event_id, sue.user_id)
+            other.host_note = "changed meanwhile"
+            real_put(other, expected_version=other.version)
+        return real_put(rsvp, **kw)
+    monkeypatch.setattr(db, "put_flexible_rsvp", put)
+    resp = _mark(cid, app, aa, aa_mem, evt, {sue.user_id: "no"})
+    assert fired and "error=" in resp["headers"]["Location"]
+    assert _rsvp(evt, sue).confirmed_response == "yes"
+    assert _rsvp(evt, bob).party_size == 2
+
+
+def test_a_reply_cleared_and_recorded_again_is_a_different_row(
+        ddb_table, outbox) -> None:
+    """Same member, same version, same second: the old page's stamp must
+    still not match the new reply."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
+    first = _rsvp(evt, joe)
+    old_page = _load(evt)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: ""})
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "no"})
+    second = _rsvp(evt, joe)
+    # Force the coincidence the review described.
+    second.version, second.updated_at = first.version, first.updated_at
+    db.put_flexible_rsvp(second)
+    assert web._flex_rsvp_stamp(second) != web._flex_rsvp_stamp(first)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"}, page=old_page,
+          dirty=[])
+    assert _rsvp(evt, joe).confirmed_response == "no"
+
+
+def test_an_update_does_not_bring_back_a_reply_cleared_meanwhile(
+        ddb_table, outbox, monkeypatch) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
+    real_put = db.put_flexible_rsvp
+    fired = []
+
+    def put(rsvp, **kw):
+        if not fired and rsvp.user_id == joe.user_id:
+            fired.append(1)
+            monkeypatch.setattr(db, "put_flexible_rsvp", real_put)
+            db.delete_flexible_rsvp("a1", evt.event_id, joe.user_id)
+        return real_put(rsvp, **kw)
+    monkeypatch.setattr(db, "put_flexible_rsvp", put)
+    resp = _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "no"})
+    assert fired and "error=" in resp["headers"]["Location"]
+    assert _rsvp(evt, joe) is None
+
+
+def test_without_javascript_a_members_new_answer_is_reported_not_ignored(
+        ddb_table, outbox) -> None:
+    """The organizer's page showed the member as unanswered. They answer
+    online; the organizer then submits a different answer from a form with no
+    change markers. The member's answer stands, and the organizer is told."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    old_page = _load(evt)
+    _vote_online(cid, evt, joe, {opt.option_id: "yes"}, "tj")
+    resp = _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {opt.option_id: "no"}},
+                 page=old_page, dirty=[])
+    assert _rsvp(evt, joe).votes == {opt.option_id: "yes"}
+    assert "error=" in resp["headers"]["Location"]

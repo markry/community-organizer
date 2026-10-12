@@ -2458,11 +2458,15 @@ def delete_flexible_poll_option(app_id: str, event_id: str,
 
 def put_flexible_rsvp(rsvp: FlexibleRSVP, *,
                       expected_version: int | None = None,
-                      create_only: bool = False) -> None:
+                      create_only: bool = False,
+                      update_only: bool = False) -> None:
     """Persist an RSVP. ``expected_version`` makes it a conditional update
     (ConcurrencyConflict if the row moved on). ``create_only`` makes it a
     create that fails with ConcurrencyConflict if ANY row is already there —
-    stricter than ``expected_version=0``, which a version-0 row would pass."""
+    stricter than ``expected_version=0``, which a version-0 row would pass.
+    ``update_only`` (with ``expected_version``) also fails if the row is no
+    longer there: without it the version check accepts a missing row, so an
+    update racing a delete would quietly bring the reply back."""
     from botocore.exceptions import ClientError
     if create_only:
         rsvp.version = 1
@@ -2479,6 +2483,7 @@ def put_flexible_rsvp(rsvp: FlexibleRSVP, *,
         kwargs["ConditionExpression"] = "attribute_not_exists(PK)"
     elif expected_version is not None:
         kwargs["ConditionExpression"] = (
+            "attribute_exists(PK) AND version = :expected" if update_only else
             "attribute_not_exists(version) OR version = :expected")
         kwargs["ExpressionAttributeValues"] = {":expected": expected_version}
     try:

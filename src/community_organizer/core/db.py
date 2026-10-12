@@ -1866,11 +1866,16 @@ def revive_cancelled_notification(ntf: Notification) -> bool:
 
 def list_notifications_for_month(app_id: str,
                                  yyyy_mm: str) -> Iterator[Notification]:
-    """Every notification queued for one month of one app, any state."""
+    """Every notification queued for one month of one app, any state.
+
+    A strongly consistent read: the reconcile decides what to queue from what
+    this returns, and a row it failed to see would be queued a second time.
+    """
     for item in _paginate_query(
         KeyConditionExpression=Key("PK").eq(_app_pk(app_id))
         & Key("SK").begins_with("NTF#"),
         FilterExpression=Attr("yyyy_mm").eq(yyyy_mm),
+        ConsistentRead=True,
     ):
         yield _hydrate(Notification, _strip_keys(item))
 

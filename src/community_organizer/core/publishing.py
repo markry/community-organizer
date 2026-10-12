@@ -919,9 +919,16 @@ def reconcile_reminders(community: Community, app: Application,
             surplus = [r for r in pending if r is not keep]
             if keep is None:
                 pending = []                  # wrong time (slot moved): requeue
+        lost_to_a_claim = False
         for r in surplus:
-            cancelled += db.cancel_pending_notification(r)
-        if want is not None and (claimed or settled
+            if db.cancel_pending_notification(r):
+                cancelled += 1
+            else:
+                # A poll claimed it between our read and our cancel, so it is
+                # being sent now. Queueing a replacement as well would remind
+                # the member twice; leave this reminder to that send.
+                lost_to_a_claim = True
+        if want is not None and (claimed or settled or lost_to_a_claim
                                  or any(r not in surplus for r in pending)):
             del owed[key]
     for ntf in owed.values():

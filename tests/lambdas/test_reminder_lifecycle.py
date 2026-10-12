@@ -56,7 +56,7 @@ def world(ddb_table, monkeypatch):
     monkeypatch.setattr(notifier, "_get_sms", lambda: None)
     # The periodic sweep runs on wall-clock minutes; keep it out of tests
     # that are not about it.
-    monkeypatch.setattr(notifier, "_RECONCILE_EVERY_MIN", 61)
+    monkeypatch.setattr(notifier, "_RECONCILE_EVERY_MIN", 0)     # off
     community = Community(community_id=CID, name="Parish",
                           default_timezone="UTC")
     db.put_community(community)
@@ -639,3 +639,29 @@ def test_event_time_is_right_across_a_clock_change(ddb_table) -> None:
     naive = (dt.datetime.fromisoformat(day_before.send_at)
              + dt.timedelta(minutes=1440))
     assert naive.isoformat() == "2030-11-03T12:00:00+00:00"
+
+
+def test_no_replacement_is_queued_for_a_reminder_a_poll_has_just_claimed(
+        world, monkeypatch) -> None:
+    """A slot is moved while its reminder is being sent. The sweep cannot
+    cancel that reminder (a poll holds it) and must not queue a second one
+    at the new time on top of it."""
+    community, app, slot, member = world
+    member("ann"); _assign(slot, "ann")
+    publishing.reconcile_reminders(community, app, slot.yyyy_mm)
+    moved = db.find_slot_in_month(APP, slot.yyyy_mm, slot.slot_id)
+    h = (int(slot.start_time[:2]) + 1) % 24
+    moved.start_time = f"{h:02d}:{slot.start_time[3:]}"
+    db.put_slot(moved)
+    # Between the sweep reading the rows and cancelling them, a poll claims
+    # every pending one.
+    real_cancel = db.cancel_pending_notification
+
+    def claimed_first(ntf):
+        db.claim_notification_row(ntf.notification_id, ntf.app_id, ntf.send_at)
+        return real_cancel(ntf)
+    monkeypatch.setattr(db, "cancel_pending_notification", claimed_first)
+    out = publishing.reconcile_reminders(community, app, slot.yyyy_mm)
+    assert out == {"queued": 0, "cancelled": 0}
+    states = sorted(n.state for n in _reminders(slot, "ann"))
+    assert states == ["in_flight", "in_flight"]              # and nothing new

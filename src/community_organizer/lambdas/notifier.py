@@ -248,7 +248,7 @@ def _handle_scheduled() -> dict:
                 log.exception("could not settle reminder %s",
                               ntf.notification_id)
     reconciled = None
-    if now_dt.minute % _RECONCILE_EVERY_MIN == 0:
+    if _RECONCILE_EVERY_MIN and now_dt.minute % _RECONCILE_EVERY_MIN == 0:
         try:
             reconciled = _reconcile_published_months(now_dt)
         except Exception:
@@ -262,13 +262,15 @@ def _handle_scheduled() -> dict:
 # reminder queue from its assignments (publishing.reconcile_reminders). The
 # stream handler does the same the moment an assignment changes; the sweep is
 # what makes that reliable — a stream record that failed, was dropped or
-# never came is caught here instead of leaving someone unreminded.
+# never came is caught here instead of leaving someone unreminded. Falsy = off.
 _RECONCILE_EVERY_MIN = 10
 
 
 def _reconcile_published_months(now_dt: dt.datetime) -> dict:
     """Reconcile reminders for every published month that is not yet over."""
-    this_month = now_dt.strftime("%Y-%m")
+    # From last month on: around a month's end the current UTC month runs
+    # ahead of local time, and the last evening's slots are still to come.
+    earliest = (now_dt.replace(day=1) - dt.timedelta(days=1)).strftime("%Y-%m")
     totals = {"months": 0, "queued": 0, "cancelled": 0}
     community = db.get_community(COMMUNITY_ID) if COMMUNITY_ID else None
     if community is None:
@@ -277,9 +279,15 @@ def _reconcile_published_months(now_dt: dt.datetime) -> dict:
         if app.app_type in ("standing_event", "flexible_event"):
             continue                    # no slot reminders
         for sch in db.list_schedules(app.app_id):
-            if sch.state != "published" or sch.yyyy_mm < this_month:
+            if sch.state != "published" or sch.yyyy_mm < earliest:
                 continue
-            out = publishing.reconcile_reminders(community, app, sch.yyyy_mm)
+            try:
+                out = publishing.reconcile_reminders(community, app, sch.yyyy_mm)
+            except Exception:
+                # One month failing must not stop the others being checked.
+                log.exception("reminder reconcile failed for %s/%s",
+                              app.app_id, sch.yyyy_mm)
+                continue
             totals["months"] += 1
             totals["queued"] += out["queued"]
             totals["cancelled"] += out["cancelled"]

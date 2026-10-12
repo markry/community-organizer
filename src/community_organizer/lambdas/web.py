@@ -9993,7 +9993,9 @@ def _settings_page(event: dict, user: User, community: Community | None,
                 f"<tbody>{rows}</tbody></table>"
             )
 
-    current_leads = set(user.lead_times_minutes or [1440, 120])
+    # An empty list means the member turned every reminder off — show that,
+    # not the defaults (see publishing.effective_lead_times).
+    current_leads = set(publishing.effective_lead_times(user))
     checks = "".join(
         f"<label style='display:block;margin:6px 0'>"
         f"<input type='checkbox' name='lead' value='{mins}'"
@@ -10207,7 +10209,9 @@ def _template_defaults_fieldset(app: Application) -> str:
 def _default_reminders_form(app: Application,
                             user: User | None = None,
                             community: Community | None = None) -> str:
-    current = set(app.default_lead_times or [1440, 120])
+    current = set(publishing.DEFAULT_LEAD_TIMES
+                  if app.default_lead_times is None
+                  else app.default_lead_times)
     checks = "".join(
         f"<label style='display:inline-block;margin:4px 12px 4px 0'>"
         f"<input type='checkbox' name='lead' value='{mins}'"
@@ -10525,6 +10529,10 @@ def _users_page(event: dict, user: User, community: Community | None,
                 f"Notes<input name='notes' value='{html.escape(u.notes or '')}' "
                 "style='padding:4px;width:140px'></label>"
                 + ("" if is_event else (
+                    # Tells the handler this form carries the reminder boxes:
+                    # only then does "none ticked" mean "no reminders". A form
+                    # without them must leave the member's setting alone.
+                    "<input type='hidden' name='has_leads' value='1'>"
                     "<div style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
                     "Reminders<div style='display:flex;gap:8px;flex-wrap:wrap;margin-top:2px'>"
                     + "".join(
@@ -10771,7 +10779,10 @@ def _api_user_add(event: dict, user: User, community: Community | None,
     # Case 1: net-new community user.
     new_user = User(community_id=user.community_id, email=email, name=name,
                     community_role="member", phone=phone, notes=notes,
-                    lead_times_minutes=list(app.default_lead_times or [1440, 120]))
+                    lead_times_minutes=list(
+                        publishing.DEFAULT_LEAD_TIMES
+                        if app.default_lead_times is None
+                        else app.default_lead_times))
     # Auto-provision the Cognito identity so the unified
     # new-user/forgot-password flow works immediately.
     cognito_sub = _create_cognito_user(email, name)
@@ -10872,10 +10883,12 @@ def _api_user_edit(event: dict, user: User, community: Community | None,
     if event.get("isBase64Encoded"):
         body_str = base64.b64decode(body_str).decode("utf-8", errors="replace")
     parsed = urllib.parse.parse_qs(body_str)
-    if "lead" in parsed:
-        target.lead_times_minutes = sorted([int(v) for v in parsed["lead"]], reverse=True)
-    elif body_str and "lead" not in parsed:
-        target.lead_times_minutes = []
+    # Only a form that showed the reminder boxes may change them. The edit
+    # forms for event apps and for community users have none; treating their
+    # saves as "none ticked" used to blank the member's reminders.
+    if "has_leads" in parsed:
+        target.lead_times_minutes = sorted(
+            [int(v) for v in parsed.get("lead", [])], reverse=True)
     raw_next = _get_param(event, "next")
     next_url = _safe_next(raw_next) if raw_next else "/admin/users"
     try:

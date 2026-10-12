@@ -419,7 +419,9 @@ class BlockedDate:
     created_at: str = field(default_factory=_now)
 
 
-NotificationState = Literal["pending", "in_flight", "sent", "cancelled"]
+# "failed": every attempt inside the retry window errored; nothing was sent.
+NotificationState = Literal["pending", "in_flight", "sent", "cancelled",
+                            "failed"]
 
 
 @dataclass
@@ -442,6 +444,13 @@ class Notification:
     sent_at: str | None = None
     email_id: str | None = None
     created_at: str = field(default_factory=_now)
+    # Delivery bookkeeping, so a failed send is retried instead of being
+    # recorded as sent. A channel that has gone out is never sent again on a
+    # retry; `claimed_at` lets a claim abandoned by a crashed run be recovered.
+    attempts: int = 0
+    email_done: bool = False
+    sms_done: bool = False
+    claimed_at: str | None = None
 
 
 @dataclass

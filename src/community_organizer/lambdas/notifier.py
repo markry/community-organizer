@@ -13,7 +13,7 @@ import re
 
 from boto3.dynamodb.types import TypeDeserializer
 
-from community_organizer.core import db
+from community_organizer.core import db, publishing
 from community_organizer.core.ical import make_event_ics, make_occurrence_ics
 from community_organizer.core.models import (
     Application, EmailLog, Notification, Slot, StandingOccurrence,
@@ -156,9 +156,46 @@ def lambda_handler(event: dict, context) -> dict:  # noqa: ARG001
     return {"ok": True, "notified": n}
 
 
+# A reminder that fails to send is retried on the following polls (one a
+# minute) for this long after it was due...
+_RETRY_WINDOW = dt.timedelta(minutes=30)
+# ...and a claim older than this was abandoned by a run that died mid-send.
+_STALE_CLAIM = dt.timedelta(minutes=5)
+
+
+def _utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _event_time(ntf: Notification) -> dt.datetime:
+    """When the thing being reminded about happens: reminders are queued at
+    (arrival time - lead), so it is send_at + lead."""
+    return (dt.datetime.fromisoformat(ntf.send_at)
+            + dt.timedelta(minutes=ntf.lead_minutes))
+
+
+def _retry_deadline(ntf: Notification) -> dt.datetime:
+    """Stop retrying after the retry window, and never after the event has
+    begun — a reminder that arrives once it is under way is just noise."""
+    return min(dt.datetime.fromisoformat(ntf.send_at) + _RETRY_WINDOW,
+               _event_time(ntf))
+
+
 def _handle_scheduled() -> dict:
-    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    now_dt = _utcnow()
+    now = now_dt.isoformat(timespec="seconds")
     log.info("reminder poll, up_to=%s", now)
+    # Recover claims abandoned by a run that died between claiming and
+    # recording the outcome; they would otherwise sit in_flight for good.
+    # The run may have died after the send went out, so this can repeat a
+    # reminder: a duplicate is the lesser harm next to a missed one.
+    recovered = 0
+    for stale in list(db.list_in_flight_notifications()):
+        claimed = dt.datetime.fromisoformat(stale.claimed_at or stale.send_at)
+        if now_dt - claimed > _STALE_CLAIM and db.release_stale_claim(stale):
+            recovered += 1
+    if recovered:
+        log.warning("released %d abandoned reminder claim(s)", recovered)
     pending = list(db.list_pending_notifications(up_to=now))
     log.info("found %d pending notifications", len(pending))
     sent = 0
@@ -173,18 +210,81 @@ def _handle_scheduled() -> dict:
                      ntf.notification_id)
             skipped += 1
             continue
-        # We own the row now. The local Notification object's state
-        # still reads "pending"; _send_reminder mutates it to "sent"
-        # or "cancelled" and writes back. If we crash between claim
-        # and _send_reminder, the row sits in "in_flight" — a
-        # known gap; manual recovery via admin DB edit.
+        # We own the row now. _send_reminder settles it: sent, cancelled,
+        # failed, or back to pending for the next poll to retry.
+        ntf.state = "in_flight"
         try:
             if _send_reminder(ntf):
                 sent += 1
         except Exception:
             log.exception("error sending reminder %s", ntf.notification_id)
+            # Whatever blew up, do not leave the claim hanging.
+            try:
+                _retry_or_give_up(ntf)
+            except Exception:
+                log.exception("could not settle reminder %s",
+                              ntf.notification_id)
     return {"ok": True, "polled": len(pending), "sent": sent,
-            "skipped": skipped}
+            "skipped": skipped, "recovered": recovered}
+
+
+def _retry_or_give_up(ntf: Notification) -> None:
+    """Settle a reminder whose send did not fully succeed."""
+    ntf.attempts = (ntf.attempts or 0) + 1
+    if _utcnow() < _retry_deadline(ntf):
+        ntf.state = "pending"              # next poll retries what is left
+        ntf.claimed_at = None
+        db.put_notification(ntf)
+        log.warning("reminder %s not fully sent (attempt %d); will retry",
+                    ntf.notification_id, ntf.attempts)
+        return
+    if ntf.email_done or ntf.sms_done:
+        # One channel got through; the other never did. That is a sent
+        # reminder, not a failed one.
+        ntf.state = "sent"
+        ntf.sent_at = _utcnow().isoformat(timespec="seconds")
+    else:
+        ntf.state = "failed"
+        log.error("reminder %s FAILED after %d attempt(s); giving up",
+                  ntf.notification_id, ntf.attempts)
+    db.put_notification(ntf)
+
+
+def _deliver(ntf: Notification, user: User, want_email: bool, want_sms: bool,
+             send_email, send_sms) -> bool:
+    """Send whichever of this reminder's channels are still owed, record what
+    got through, and settle the notification. Returns True if it is now sent.
+
+    ``send_email()`` returns the provider's EmailLog; ``send_sms()`` returns
+    whether the text was accepted. A channel that has already gone out is
+    never sent again on a retry. The email provider reports a failed send as
+    an EmailLog with outcome "error" rather than raising, so the outcome is
+    what counts — not merely getting a log back.
+    """
+    def _email() -> None:
+        row = send_email()
+        if row is not None and getattr(row, "outcome", None) != "error":
+            ntf.email_done = True
+            ntf.email_id = row.email_id
+
+    if want_email and not ntf.email_done:
+        _email()
+    if want_sms and not ntf.sms_done:
+        if send_sms():
+            ntf.sms_done = True
+        elif (not want_email and not ntf.email_done and user.email
+              and not user.email_undeliverable):
+            # A text-only member whose text did not go: fall back to email
+            # now rather than risk the reminder not arriving at all.
+            _email()
+    if ((not want_email or ntf.email_done) and (not want_sms or ntf.sms_done)):
+        ntf.attempts = (ntf.attempts or 0) + 1
+        ntf.state = "sent"
+        ntf.sent_at = _utcnow().isoformat(timespec="seconds")
+        db.put_notification(ntf)
+        return True
+    _retry_or_give_up(ntf)
+    return ntf.state == "sent"
 
 
 def _send_reminder(ntf: Notification) -> bool:
@@ -198,6 +298,14 @@ def _send_reminder(ntf: Notification) -> bool:
     if not want_email and not want_sms:
         ntf.state = "cancelled"
         db.put_notification(ntf)
+        return False
+    if _utcnow() >= _event_time(ntf):
+        # Due before now, but the event itself has started (a long outage, or
+        # retries that ran out the clock). Too late to be of use.
+        ntf.state = "failed" if (ntf.attempts or 0) else "cancelled"
+        db.put_notification(ntf)
+        log.warning("reminder %s dropped: event already started",
+                    ntf.notification_id)
         return False
     if ntf.source == "occurrence":
         return _send_occurrence_reminder(ntf, user, community_id)
@@ -226,9 +334,8 @@ def _send_reminder(ntf: Notification) -> bool:
     subject, body = _reminder_email(user, slot, org_name, ntf.lead_minutes,
                                     event_type, co_names=co_names,
                                     host=_community_host(community))
-    email_log = None
-    if want_email:
-        email_log = _get_provider().send(
+    def send_email():
+        return _get_provider().send(
             community_id=community_id,
             from_addr=FROM_ADDR,
             to_addr=user.email,
@@ -240,23 +347,17 @@ def _send_reminder(ntf: Notification) -> bool:
             related_slot_id=slot.slot_id,
             related_yyyy_mm=ntf.yyyy_mm,
         )
-    sms_sent = False
-    if want_sms:
-        sms_text = _reminder_sms(slot, org_name, _community_host(community))
-        sms_sent = _send_sms_reminder(user, sms_text, ntf, slot.slot_id)
-    if email_log is None and not sms_sent:
-        # Both channels failed/skipped — leave pending for retry rather than
-        # marking sent (don't lose the reminder on a transient SMS/SES error).
-        return False
-    ntf.state = "sent"
-    ntf.sent_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    if email_log is not None:
-        ntf.email_id = email_log.email_id
-    db.put_notification(ntf)
-    log.info("sent reminder to %s for slot %s (lead=%d min, email=%s sms=%s)",
-             user.email, slot.slot_id, ntf.lead_minutes,
-             email_log is not None, sms_sent)
-    return True
+
+    def send_sms():
+        return _send_sms_reminder(
+            user, _reminder_sms(slot, org_name, _community_host(community)),
+            ntf, slot.slot_id)
+
+    done = _deliver(ntf, user, want_email, want_sms, send_email, send_sms)
+    log.info("reminder for slot %s (lead=%d min): state=%s email=%s sms=%s "
+             "attempts=%d", slot.slot_id, ntf.lead_minutes, ntf.state,
+             ntf.email_done, ntf.sms_done, ntf.attempts)
+    return done
 
 
 def _send_occurrence_reminder(ntf: Notification, user: User,
@@ -305,9 +406,9 @@ def _send_occurrence_reminder(ntf: Notification, user: User,
                           occ.occurrence_id)
 
     want_email, want_sms = _channels_for(user)
-    email_log = None
-    if want_email:
-        email_log = _get_provider().send(
+
+    def send_email():
+        return _get_provider().send(
             community_id=community_id,
             from_addr=FROM_ADDR,
             to_addr=user.email,
@@ -320,22 +421,18 @@ def _send_occurrence_reminder(ntf: Notification, user: User,
             related_yyyy_mm=ntf.yyyy_mm,
             ics_content=ics_content,
         )
-    sms_sent = False
-    if want_sms:
-        sms_text = _occurrence_reminder_sms(occ, series, app, org_name)
-        sms_sent = _send_sms_reminder(user, sms_text, ntf, ntf.slot_id)
-    if email_log is None and not sms_sent:
-        return False
-    ntf.state = "sent"
-    ntf.sent_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    if email_log is not None:
-        ntf.email_id = email_log.email_id
-    db.put_notification(ntf)
-    log.info("sent occurrence reminder to %s for %s on %s "
-             "(lead=%d min, email=%s sms=%s)",
-             user.email, ntf.app_id, iso_date, ntf.lead_minutes,
-             email_log is not None, sms_sent)
-    return True
+
+    def send_sms():
+        return _send_sms_reminder(
+            user, _occurrence_reminder_sms(occ, series, app, org_name),
+            ntf, ntf.slot_id)
+
+    done = _deliver(ntf, user, want_email, want_sms, send_email, send_sms)
+    log.info("occurrence reminder for %s on %s (lead=%d min): state=%s "
+             "email=%s sms=%s attempts=%d", ntf.app_id, iso_date,
+             ntf.lead_minutes, ntf.state, ntf.email_done, ntf.sms_done,
+             ntf.attempts)
+    return done
 
 
 def _fmt_hhmm(t: str | None) -> str | None:
@@ -471,6 +568,28 @@ def _process(rec: dict) -> bool:
                  event_name, app_id, yyyy_mm)
         return False
 
+    # Keep the reminder queue in step with the assignment. Publishing queued
+    # reminders only for the assignments that existed then; every later
+    # change arrives here, whichever screen or admin action made it.
+    if event_name == "REMOVE":
+        try:
+            n = publishing.cancel_reminders_for_assignment(
+                app_id, yyyy_mm, slot_id, user_id)
+            if n:
+                log.info("cancelled %d pending reminder(s) for released "
+                         "slot=%s user=%s", n, slot_id, user_id)
+        except Exception:
+            log.exception("could not cancel reminders slot=%s user=%s",
+                          slot_id, user_id)
+        return False
+    if event_name == "INSERT":
+        try:
+            _queue_reminders(community_id, app_id, yyyy_mm, slot_id, user_id)
+        except Exception:
+            # Never let a reminder problem stop the sign-up emails below.
+            log.exception("could not queue reminders slot=%s user=%s",
+                          slot_id, user_id)
+
     user = db.get_user(community_id, user_id)
     if user is None or user.email_undeliverable or not user.email or user.channel == "none":
         log.info("skipping notification for user_id=%s (missing/undeliverable)", user_id)
@@ -593,6 +712,23 @@ def _process(rec: dict) -> bool:
                 related_yyyy_mm=yyyy_mm,
             )
     return True
+
+
+def _queue_reminders(community_id: str, app_id: str, yyyy_mm: str,
+                     slot_id: str, user_id: str) -> None:
+    """Queue reminders for an assignment created in an already-published
+    month. Idempotent, so a redelivered stream record adds nothing."""
+    community = db.get_community(community_id)
+    app = next((a for a in db.list_applications(community_id)
+                if a.app_id == app_id), None)
+    slot = db.find_slot_in_month(app_id, yyyy_mm, slot_id)
+    user = db.get_user(community_id, user_id)
+    if community is None or app is None or slot is None or user is None:
+        return
+    n = publishing.queue_reminders_for_assignment(
+        community, app, yyyy_mm, slot, user)
+    log.info("queued %d reminder(s) for late assignment slot=%s user=%s",
+             n, slot_id, user_id)
 
 
 def _deserialize(image: dict) -> dict:

@@ -313,7 +313,12 @@ def _build_email(*, user: User, community: Community, app: Application,
     month = _month_human(yyyy_mm)
     org_name = app.name
     site_url = f"https://{_community_host(community)}/your-schedule"
-    lead_desc = _lead_time_desc(user.lead_times_minutes or [1440, 120])
+    _leads = effective_lead_times(user)
+    lead_desc = _lead_time_desc(_leads)
+    # A member who has turned every reminder off is told so, not promised some.
+    reminder_sentence = (
+        f"You will receive reminder emails {lead_desc} before each event."
+        if _leads else "You have reminder emails turned off.")
     event_type = app.event_noun or "event"
     subject = f"{org_name} -- {month} schedule published"
     # arrival_label is on every Application now, but the hasattr guard
@@ -332,8 +337,7 @@ def _build_email(*, user: User, community: Community, app: Application,
             f"You are assigned to the following {len(slots)} "
             f"slot{'s' if len(slots) != 1 else ''}:\n\n"
             f"{rows}\n\n"
-            f"You will receive reminder emails {lead_desc} before each "
-            f"event. You can change your reminder settings at:\n"
+            f"{reminder_sentence} You can change your reminder settings at:\n"
             f"  {site_url}\n\n"
             f"If you need to withdraw from any of these, you can decline "
             f"the calendar event or visit the link above to release your "
@@ -355,8 +359,7 @@ def _build_email(*, user: User, community: Community, app: Application,
             f'You are assigned to the following '
             f'{len(slots)} slot{"s" if len(slots) != 1 else ""}:</p>'
             f'<ul>{slot_rows_html}</ul>'
-            f'<p>You will receive reminder emails {_h(lead_desc)} before each '
-            f'event. You can change your reminder settings at '
+            f'<p>{_h(reminder_sentence)} You can change your reminder settings at '
             f'<a href="{_h(site_url)}">{_h(site_url)}</a>.</p>'
             f'<p>If you need to withdraw from any of these, you can decline '
             f'the calendar event or visit the link above to release your '
@@ -768,6 +771,105 @@ def send_published_schedule_broadcast(
     }
 
 
+DEFAULT_LEAD_TIMES = [1440, 120]
+
+
+def effective_lead_times(user: User) -> list[int]:
+    """The reminder lead times that apply to a member.
+
+    An EMPTY list is a choice: the member unticked every reminder and gets
+    none. Only a record with no setting at all (None) falls back to the
+    defaults. Treating empty as "unset" used to hand a member who had turned
+    reminders off the defaults anyway.
+    """
+    if user.lead_times_minutes is None:
+        return list(DEFAULT_LEAD_TIMES)
+    return list(user.lead_times_minutes)
+
+
+def _reminder_id(slot_id: str, user_id: str, lead: int) -> str:
+    """One reminder per (slot, member, lead time), under a fixed id: queueing
+    the same one twice overwrites it rather than adding a second."""
+    return f"{slot_id}.{user_id}.{lead}"
+
+
+def _reminders_for(community: Community, app: Application, yyyy_mm: str,
+                   slot: Slot, user: User) -> list[Notification]:
+    """The reminders one member is owed for one slot, as of now: one per lead
+    time whose moment has not passed. Empty when they get none — reminders
+    off, undeliverable, the slot cancelled or its template opted out being
+    the caller's checks, this covers only the member's own settings."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(app.default_timezone or community.default_timezone)
+    h, m = (int(x) for x in slot.start_time.split(":"))
+    y, mo, d = (int(x) for x in slot.local_date.split("-"))
+    arrival = dt.datetime(y, mo, d, h, m, tzinfo=tz) - dt.timedelta(
+        minutes=slot.arrival_offset_minutes)
+    now = dt.datetime.now(dt.timezone.utc)
+    out: list[Notification] = []
+    for lead in effective_lead_times(user):
+        send_at_utc = (arrival - dt.timedelta(minutes=lead)).astimezone(
+            dt.timezone.utc)
+        if send_at_utc <= now:
+            continue
+        out.append(Notification(
+            community_id=community.community_id,
+            app_id=app.app_id,
+            user_id=user.user_id,
+            slot_id=slot.slot_id,
+            yyyy_mm=yyyy_mm,
+            send_at=send_at_utc.isoformat(timespec="seconds"),
+            lead_minutes=lead,
+            notification_id=_reminder_id(slot.slot_id, user.user_id, lead),
+        ))
+    return out
+
+
+def _gets_reminders(app: Application, slot: Slot | None,
+                    user: User | None) -> bool:
+    """Whether this member is sent reminders for this slot at all."""
+    if not slot or slot.cancelled:
+        return False
+    if not user or user.email_undeliverable or user.channel == "none":
+        return False
+    tpl = next((t for t in db.list_templates(app.app_id)
+                if t.template_id == slot.template_id), None)
+    return tpl is None or tpl.auto_reminders
+
+
+def queue_reminders_for_assignment(community: Community, app: Application,
+                                   yyyy_mm: str, slot: Slot,
+                                   user: User) -> int:
+    """Queue reminders for ONE assignment made after its month was published
+    (a late sign-up, a place taken over, an admin adding someone). Publishing
+    only queues reminders for the assignments that exist at that moment, so
+    without this anyone joining afterwards was never reminded.
+
+    Safe to call more than once for the same assignment: the ids are fixed,
+    so a repeat rewrites the same rows. Returns how many were queued."""
+    if not _gets_reminders(app, slot, user):
+        return 0
+    ntfs = _reminders_for(community, app, yyyy_mm, slot, user)
+    if ntfs:
+        db.put_notifications(ntfs)
+    return len(ntfs)
+
+
+def cancel_reminders_for_assignment(app_id: str, yyyy_mm: str, slot_id: str,
+                                    user_id: str) -> int:
+    """Cancel the still-pending reminders for an assignment that has gone
+    (released, traded away, removed). The notifier also re-checks at send
+    time, so this is tidiness plus one guarantee: if the member takes the
+    slot again, the reminders queued then are not shadowed by stale ones."""
+    n = 0
+    for ntf in db.list_notifications_for_slot_user(app_id, slot_id, user_id):
+        if ntf.state == "pending" and ntf.yyyy_mm == yyyy_mm:
+            ntf.state = "cancelled"
+            db.put_notification(ntf)
+            n += 1
+    return n
+
+
 def _materialize_reminders(community: Community, app: Application,
                            yyyy_mm: str) -> int:
     """Wipe and recreate the pending Notifications for a published month.
@@ -794,11 +896,6 @@ def _materialize_reminders(community: Community, app: Application,
     Returns the count of Notifications actually inserted (for the
     publish summary).
     """
-    from zoneinfo import ZoneInfo
-    tz_name = app.default_timezone or community.default_timezone
-    tz = ZoneInfo(tz_name)
-    default_leads = [1440, 120]
-
     db.delete_notifications_for_schedule(app.app_id, yyyy_mm)
 
     slots_by_id = {s.slot_id: s for s in db.list_slots(app.app_id, yyyy_mm)}
@@ -824,25 +921,7 @@ def _materialize_reminders(community: Community, app: Application,
         user = users_by_id.get(a.user_id)
         if not user or user.email_undeliverable or user.channel == "none":
             continue
-        leads = user.lead_times_minutes or default_leads
-        h, m = (int(x) for x in slot.start_time.split(":"))
-        y, mo, d = (int(x) for x in slot.local_date.split("-"))
-        arrival = dt.datetime(y, mo, d, h, m, tzinfo=tz) - dt.timedelta(
-            minutes=slot.arrival_offset_minutes)
-        for lead in leads:
-            send_at = arrival - dt.timedelta(minutes=lead)
-            send_at_utc = send_at.astimezone(dt.timezone.utc)
-            if send_at_utc <= dt.datetime.now(dt.timezone.utc):
-                continue
-            ntfs.append(Notification(
-                community_id=community.community_id,
-                app_id=app.app_id,
-                user_id=a.user_id,
-                slot_id=a.slot_id,
-                yyyy_mm=yyyy_mm,
-                send_at=send_at_utc.isoformat(timespec="seconds"),
-                lead_minutes=lead,
-            ))
+        ntfs.extend(_reminders_for(community, app, yyyy_mm, slot, user))
     if ntfs:
         db.put_notifications(ntfs)
     return len(ntfs)

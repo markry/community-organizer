@@ -1615,13 +1615,65 @@ def claim_notification(notification_id: str, app_id: str, send_at: str) -> bool:
         _table().update_item(
             Key={"PK": _app_pk(app_id),
                  "SK": _ntf_sk(send_at, notification_id)},
-            UpdateExpression="SET #s = :inflight, GSI1PK = :gsi",
+            UpdateExpression=("SET #s = :inflight, GSI1PK = :gsi, "
+                              "claimed_at = :now"),
             ConditionExpression="#s = :expected",
             ExpressionAttributeNames={"#s": "state"},
             ExpressionAttributeValues={
                 ":inflight": "in_flight",
                 ":expected": "pending",
                 ":gsi": "STATE#in_flight",
+                ":now": dt.datetime.now(dt.timezone.utc).isoformat(
+                    timespec="seconds"),
+            },
+        )
+        return True
+    except ClientError as e:
+        if (e.response.get("Error", {}).get("Code")
+                == "ConditionalCheckFailedException"):
+            return False
+        raise
+
+
+def list_notifications_for_slot_user(app_id: str, slot_id: str,
+                                     user_id: str) -> Iterator[Notification]:
+    """Every notification queued for one member on one slot, any state."""
+    for item in _paginate_query(
+        KeyConditionExpression=Key("PK").eq(_app_pk(app_id))
+        & Key("SK").begins_with("NTF#"),
+        FilterExpression=Attr("slot_id").eq(slot_id) & Attr("user_id").eq(user_id),
+    ):
+        yield _hydrate(Notification, _strip_keys(item))
+
+
+def list_in_flight_notifications() -> Iterator[Notification]:
+    """Every notification currently claimed. Normally empty between polls: a
+    claim is settled (sent / cancelled / back to pending) within the run that
+    made it. Anything that lingers was abandoned by a run that died."""
+    for item in _paginate_query(
+        IndexName="GSI1",
+        KeyConditionExpression=Key("GSI1PK").eq("STATE#in_flight"),
+    ):
+        yield _hydrate(Notification, _strip_keys(item))
+
+
+def release_stale_claim(ntf: Notification) -> bool:
+    """Put an abandoned claim back to ``pending`` so the next poll retries
+    it. Conditional on the row still being ``in_flight`` with the same claim
+    time, so it cannot disturb a claim another run made in the meantime."""
+    from botocore.exceptions import ClientError
+    try:
+        _table().update_item(
+            Key={"PK": _app_pk(ntf.app_id),
+                 "SK": _ntf_sk(ntf.send_at, ntf.notification_id)},
+            UpdateExpression="SET #s = :pending, GSI1PK = :gsi",
+            ConditionExpression=("#s = :inflight AND "
+                                 "(attribute_not_exists(claimed_at) "
+                                 "OR claimed_at = :claimed)"),
+            ExpressionAttributeNames={"#s": "state"},
+            ExpressionAttributeValues={
+                ":pending": "pending", ":inflight": "in_flight",
+                ":gsi": "STATE#pending", ":claimed": ntf.claimed_at,
             },
         )
         return True

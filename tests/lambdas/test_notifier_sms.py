@@ -13,6 +13,14 @@ from community_organizer.lambdas import notifier
 
 # ---- SMS body formatters --------------------------------------------------
 
+def _just_due() -> str:
+    """send_at for a reminder that came due a minute ago. A fixed date
+    would eventually fall after its event and be dropped, not sent."""
+    import datetime as _dt
+    return (_dt.datetime.now(_dt.timezone.utc)
+            - _dt.timedelta(minutes=1)).isoformat(timespec="seconds")
+
+
 def test_reminder_sms_is_tight_and_gsm7():
     slot = Slot(community_id="c", app_id="a", yyyy_mm="2026-06",
                 template_id="t", name="Usher for Sun 12:00 PM", day_of_week=6,
@@ -139,7 +147,7 @@ def _make_occ(channel="both", phone="555-555-0100", uid="member-uid"):
     ntf = Notification(community_id="c1", app_id="a1", user_id=u.user_id,
                        slot_id=occ.occurrence_id, yyyy_mm="2026-12",
                        source="occurrence",
-                       send_at="2026-12-13T00:00:00+00:00", lead_minutes=1440)
+                       send_at=_just_due(), lead_minutes=1440)
     return ntf
 
 

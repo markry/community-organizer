@@ -9,6 +9,14 @@ from community_organizer.core.models import (
 )
 
 
+def _just_due() -> str:
+    """send_at for a reminder that came due a minute ago. A fixed date
+    would eventually fall after its event and be dropped, not sent."""
+    import datetime as _dt
+    return (_dt.datetime.now(_dt.timezone.utc)
+            - _dt.timedelta(minutes=1)).isoformat(timespec="seconds")
+
+
 def _make(lead_days: int = 2, channel: str = "email",
           email: str = "m@example.com") -> tuple:
     app = Application(community_id="c1", name="K of C",
@@ -129,7 +137,7 @@ def _occ_notification(app, series, user, invites: bool):
     return Notification(
         community_id="c1", app_id="a1", user_id=user.user_id,
         slot_id=occ.occurrence_id, yyyy_mm="2026-12", source="occurrence",
-        send_at="2026-12-13T00:00:00+00:00", lead_minutes=1440)
+        send_at=_just_due(), lead_minutes=1440)
 
 
 def test_send_path_attaches_ics_only_when_enabled(ddb_table, monkeypatch) -> None:

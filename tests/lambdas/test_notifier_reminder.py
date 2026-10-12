@@ -14,6 +14,14 @@ from community_organizer.core.models import (
 from community_organizer.lambdas import notifier
 
 
+def _just_due() -> str:
+    """send_at for a reminder that came due a minute ago. A fixed date
+    would eventually fall after its event and be dropped, not sent."""
+    import datetime as _dt
+    return (_dt.datetime.now(_dt.timezone.utc)
+            - _dt.timedelta(minutes=1)).isoformat(timespec="seconds")
+
+
 def _make_slot_reminder(*, assigned: bool):
     """Build a coverage app + slot + queued slot reminder for one member.
 
@@ -42,7 +50,7 @@ def _make_slot_reminder(*, assigned: bool):
             slot_id="s1", user_id=u.user_id, local_date="2026-08-09"))
     return Notification(community_id="c1", app_id="a1", user_id=u.user_id,
                         slot_id="s1", yyyy_mm="2026-08",
-                        send_at="2026-08-08T13:45:00+00:00", lead_minutes=1440)
+                        send_at=_just_due(), lead_minutes=1440)
 
 
 class _FakeEmail:

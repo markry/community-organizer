@@ -603,6 +603,10 @@ class FlexibleEvent:
     location: str | None = None                  # None = series default
     winning_date: str | None = None              # ISO date
     winning_start_time: str | None = None        # "HH:MM" 24h
+    # The poll option that won. A poll can offer two times on one date, so
+    # the date alone does not identify it. None on events closed before this
+    # was recorded (matched by date + time instead) and on adopted events.
+    winning_option_id: str | None = None
     winning_duration_minutes: int = 120          # for the calendar invite
     notify_on_response: bool = False             # email AA(s) on each response
     # Hosting: when on, members who are coming are asked whether they'd be

@@ -51,18 +51,37 @@ def _results(cid, app, aa, aa_mem, evt) -> str:
         ev, aa, db.get_community(cid), app, aa_mem)["body"]
 
 
+def _load(evt) -> dict:
+    """What a replies page built right now would carry: the table's shape and
+    each member's row as stored. Keep one to post a stale form later."""
+    evt = db.get_flexible_event("a1", evt.event_id)
+    options = list(db.list_flexible_poll_options("a1", evt.event_id))
+    rsvps = {r.user_id: r for r in db.list_flexible_rsvps("a1", evt.event_id)}
+    return {"sig": web._flex_roster_sig(evt, options),
+            "base": {m.user_id: web._flex_rsvp_stamp(rsvps.get(m.user_id))
+                     for m in db.list_memberships_for_app("a1")}}
+
+
 def _mark(cid, app, aa, aa_mem, evt, answers: dict, *, sizes: dict | None = None,
-          override: tuple = ()):
+          override: tuple = (), page: dict | None = None,
+          dirty: list | None = None):
     """Post the replies form. `answers` maps user_id -> an answer: a plain
     "yes" / "no" / "" for a scheduled event, or {option_id: vote} for a poll.
-    Users in `override` are posted as unlocked rows, the rest as editable."""
-    form: dict = {"event": evt.event_id,
+    Users in `override` are posted as unlocked rows, the rest as editable.
+
+    `page` is the page the form came from (default: one loaded this instant);
+    `dirty` the rows the organizer touched (default: every row in `answers`;
+    pass [] for a browser without JavaScript, which sends no markers)."""
+    page = page or _load(evt)
+    form: dict = {"event": evt.event_id, "sig": page["sig"],
                   "member": [u for u in answers if u not in override],
-                  "override": list(override)}
+                  "override": list(override),
+                  "dirty": list(answers) if dirty is None else dirty}
     for uid, a in answers.items():
         for key, val in (a.items() if isinstance(a, dict) else [("att", a)]):
             form[f"v_{uid}_{key}"] = val
         form[f"size_{uid}"] = str((sizes or {}).get(uid, ""))
+        form[f"base_{uid}"] = page["base"].get(uid, "")
     return web._api_flex_event_save_attendance(
         _post("/api/flex/event/attendance", form),
         aa, db.get_community(cid), app, aa_mem)
@@ -397,7 +416,7 @@ def test_maybe_on_a_scheduled_event(ddb_table, outbox) -> None:
     # Back to a plain yes: the second button has nothing to add, so it goes.
     _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
     page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
-    assert "coming or maybe" not in page
+    assert "coming plus maybes" not in page
 
 
 def test_groups_list_coming_then_maybe_then_no(ddb_table, outbox) -> None:
@@ -439,3 +458,215 @@ def test_send_email_default_stays_all_after_a_poll_closes(ddb_table, outbox) -> 
     db.put_flexible_event(evt)
     body = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
     assert "id='mode-all' checked>" in body and "About: <b>August Book Club</b>" in body
+
+
+# ---- a stale page must not destroy newer replies ---------------------------
+# Found in review: the form used to post every row and treat a blank as "no
+# answer", so a page loaded earlier would erase whatever had been recorded
+# since. Each test here saves from a page that is out of date.
+
+def test_a_stale_page_does_not_erase_a_reply_recorded_elsewhere(
+        ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    old_page = _load(evt)                                    # first tab
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})   # second tab
+    # Back in the first tab the organizer changes only Bob. The browser also
+    # posts Joe's row, still blank as that page drew it.
+    _mark(cid, app, aa, aa_mem, evt, {bob.user_id: "no", joe.user_id: ""},
+          page=old_page, dirty=[bob.user_id])
+    assert _rsvp(evt, joe).confirmed_response == "yes"
+    assert _rsvp(evt, bob).confirmed_response == "no"
+
+
+def test_a_stale_row_is_refused_even_when_touched(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    old_page = _load(evt)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
+    resp = _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "no"}, page=old_page)
+    assert _rsvp(evt, joe).confirmed_response == "yes"       # left alone
+    assert "error=" in resp["headers"]["Location"]           # and said so
+
+
+def test_without_javascript_a_stale_page_still_cannot_erase(
+        ddb_table, outbox) -> None:
+    """No dirty markers: every posted row is considered, so the per-row check
+    is all that stands between an old page and newer data."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    old_page = _load(evt)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})
+    _mark(cid, app, aa, aa_mem, evt, {bob.user_id: "no", joe.user_id: ""},
+          page=old_page, dirty=[])
+    assert _rsvp(evt, joe).confirmed_response == "yes"
+    assert _rsvp(evt, bob).confirmed_response == "no"
+
+
+def test_a_page_from_before_a_date_was_added_is_refused(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, o1 = _mk_event(cid)
+    old_page = _load(evt)
+    o2 = _add_option(cid, evt, "2026-08-22")
+    _mark(cid, app, aa, aa_mem, evt,
+          {joe.user_id: {o1.option_id: "no", o2.option_id: "yes"}})
+    resp = _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {o1.option_id: "yes"}},
+                 page=old_page)
+    assert _rsvp(evt, joe).votes == {o1.option_id: "no", o2.option_id: "yes"}
+    assert "error=" in resp["headers"]["Location"]
+
+
+def test_a_poll_page_left_open_cannot_wipe_replies_after_it_closes(
+        ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {opt.option_id: "yes"},
+                                      bob.user_id: {opt.option_id: "yes"}})
+    old_page = _load(evt)
+    evt = db.get_flexible_event("a1", evt.event_id)
+    evt.state, evt.winning_date = "scheduled", opt.iso_date
+    db.put_flexible_event(evt)
+    # The old page posts per-date fields; the event now wants a single answer.
+    _mark(cid, app, aa, aa_mem, evt,
+          {joe.user_id: {opt.option_id: "yes"}, bob.user_id: {opt.option_id: "no"}},
+          page=old_page)
+    assert _rsvp(evt, joe).confirmed_response == "yes"
+    assert _rsvp(evt, bob).confirmed_response == "yes"
+
+
+def test_a_member_answering_mid_save_is_not_overwritten(
+        ddb_table, outbox, monkeypatch) -> None:
+    """The member's answer lands after the save has read the row and before it
+    writes. The conditional write must lose, not the member."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {opt.option_id: "yes"}})
+    _mk_token(cid, evt, joe.user_id, token="tj")
+    real_put = db.put_flexible_rsvp
+    fired = []
+
+    def put_after_member(rsvp, **kw):
+        if not fired and rsvp.user_id == joe.user_id and rsvp.marked_by:
+            fired.append(1)
+            monkeypatch.setattr(db, "put_flexible_rsvp", real_put)
+            web._api_flex_token_vote(_post("/api/e/vote", {
+                "token": "tj", f"vote_{opt.option_id}": "no"}))
+        return real_put(rsvp, **kw)
+
+    monkeypatch.setattr(db, "put_flexible_rsvp", put_after_member)
+    resp = _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {opt.option_id: "maybe"}})
+    r = _rsvp(evt, joe)
+    assert fired and r.votes == {opt.option_id: "no"} and r.marked_by is None
+    assert "error=" in resp["headers"]["Location"]
+
+
+def test_clearing_a_stated_count_restores_the_default(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"}, sizes={joe.user_id: 4})
+    assert _rsvp(evt, joe).party_size == 4
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "yes"})   # box blanked
+    r = _rsvp(evt, joe)
+    assert r.party_size == 1 and r.party_size_auto
+
+
+def test_a_household_default_count_drops_when_one_of_them_drops_out(
+        ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    _mark(cid, app, aa, aa_mem, evt, {bob.user_id: "yes", sue.user_id: "yes"})
+    _mark(cid, app, aa, aa_mem, evt, {sue.user_id: "no"})    # only Sue touched
+    assert _rsvp(evt, bob).party_size == 1
+    assert "<b>Expected headcount:</b> 1 " in _results(cid, app, aa, aa_mem, evt)
+
+
+# ---- which option won, and what the member says afterwards -----------------
+
+def _close(cid, app, aa, aa_mem, evt, opt):
+    return web._api_flex_event_close(
+        _post("/api/flex/event/close",
+              {"event": evt.event_id, "winning_option": opt.option_id}),
+        aa, db.get_community(cid), app, aa_mem)
+
+
+def test_two_times_on_one_date_use_the_time_that_won(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, early = _mk_event(cid)                              # 18:30
+    late = _add_option(cid, evt, early.iso_date, start_time="20:00")
+    _vote_online(cid, evt, joe, {early.option_id: "no", late.option_id: "yes"}, "tj")
+    _close(cid, app, aa, aa_mem, evt, late)
+    evt = db.get_flexible_event("a1", evt.event_id)
+    assert evt.winning_option_id == late.option_id
+    options = list(db.list_flexible_poll_options("a1", evt.event_id))
+    won = web._flex_roster_option(evt, options)
+    assert won.option_id == late.option_id
+    assert web._flex_roster_answer(evt, _rsvp(evt, joe), won) == "yes"
+    # An event closed before the winner's id was stored: matched by time.
+    evt.winning_option_id = None
+    assert web._flex_roster_option(evt, options).option_id == late.option_id
+
+
+def test_rejoining_after_an_organizers_no_shows_as_coming(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _mk_token(cid, evt, joe.user_id, token="tj")
+    _close(cid, app, aa, aa_mem, evt, opt)
+    evt = db.get_flexible_event("a1", evt.event_id)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "no"})
+    web._api_flex_token_join(_post("/api/e/join", {"token": "tj"}))
+    r = _rsvp(evt, joe)
+    assert r.confirmed_response == "yes" and r.votes[opt.option_id] == "yes"
+    assert r.marked_by is None
+    ev = {"requestContext": {"http": {"method": "GET"}}}
+    page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
+    assert joe.user_id in page.split("var comingTo=")[1].split(";")[0]
+
+
+def test_a_member_can_settle_an_organizers_maybe(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _mk_token(cid, evt, joe.user_id, token="tj")
+    _close(cid, app, aa, aa_mem, evt, opt)
+    evt = db.get_flexible_event("a1", evt.event_id)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: "maybe"})
+    page = web._flex_token_page(_get("/e/tj"))["body"]
+    assert "We have you down as a maybe" in page and "name='attend'" in page
+    # Saving only a dish says nothing about attendance: still the organizer's.
+    web._api_flex_token_vote(_post("/api/e/vote", {
+        "token": "tj", "bringing": "Salad"}))
+    r = _rsvp(evt, joe)
+    assert r.confirmed_response == "maybe" and r.marked_by == aa.user_id
+    assert r.bringing == "Salad"
+    # Saying yes is theirs.
+    web._api_flex_token_vote(_post("/api/e/vote", {
+        "token": "tj", "attend": "yes", "bringing": "Salad"}))
+    r = _rsvp(evt, joe)
+    assert r.confirmed_response == "yes" and r.marked_by is None
+    assert r.votes[opt.option_id] == "yes"
+    assert "name='attend'" not in web._flex_token_page(_get("/e/tj"))["body"]
+
+
+# ---- the shared recipient picker ------------------------------------------
+
+def test_recipient_names_are_never_parsed_as_markup(ddb_table, outbox) -> None:
+    """The picker adds names with DOM calls. innerHTML there would run a
+    name containing markup in an admin's browser — on every app type."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    ev = {"requestContext": {"http": {"method": "GET"}}}
+    body = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
+    add = body.split("function addRecipient(uid,name){")[1].split(
+        "picker.onchange")[0]
+    assert "innerHTML" not in add and "createTextNode(name" in add
+
+
+def test_a_blank_email_matches_nobody(ddb_table) -> None:
+    from community_organizer.core.models import User
+    cid, *_ = _seed(ddb_table)
+    db.put_user(User(community_id=cid, email="", name="Guest", channel="none"))
+    assert db.get_user_by_email(cid, "") is None
+    assert db.get_user_by_email(cid, "   ") is None

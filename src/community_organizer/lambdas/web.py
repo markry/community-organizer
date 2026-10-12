@@ -3036,6 +3036,11 @@ def _flex_event_results_page(event: dict, user: User,
                 "<td style='padding:4px 8px'>"
                 f"<input type='hidden' name='{'override' if locked else 'member'}'"
                 f" value='{uid}'" + (" disabled" if locked else "") + ">"
+                # What this row was when the page was built; the save refuses
+                # a row that has since changed.
+                f"<input type='hidden' name='base_{uid}' "
+                f"value='{html.escape(_flex_rsvp_stamp(r))}'"
+                + (" disabled" if locked else "") + ">"
                 f"{html.escape(name_of(uid))}{tag}</td>{cells}"
                 "<td style='padding:4px 8px;text-align:center'>"
                 f"<input type='number' name='size_{uid}' min='1' value='{size}'"
@@ -3070,6 +3075,8 @@ def _flex_event_results_page(event: dict, user: User,
             "<form method='post' action='/api/flex/event/attendance' "
             "id='roster-form'>"
             f"<input type='hidden' name='event' value='{event_id}'>"
+            "<input type='hidden' name='sig' "
+            f"value='{html.escape(_flex_roster_sig(evt, options))}'>"
             "<div style='overflow-x:auto'>"
             "<table style='border-collapse:collapse;text-align:left;"
             "margin:0 auto;font-size:0.95em'>"
@@ -3122,9 +3129,16 @@ def _flex_event_results_page(event: dict, user: User,
             "return false;ss(K+'-ok','1');return true;}"
             "function go(){if(ok()){ss(K+'-y',String(window.scrollY));f.submit();}"
             "else{location.reload();}}"
+            # Only rows the AA touched are sent as changes: each gets a
+            # `dirty` marker, and the server ignores the rest.
             "f.addEventListener('change',function(e){var tr=e.target.closest"
             "('tr');if(!tr)return;clearTimeout(dirty);"
             "tr.style.background='#fffbe6';"
+            "var id=tr.querySelector(\"input[name='member'],"
+            "input[name='override']\");"
+            "if(id&&!tr.querySelector(\"input[name='dirty']\")){"
+            "var d=document.createElement('input');d.type='hidden';"
+            "d.name='dirty';d.value=id.value;tr.appendChild(d);}"
             "if(!multi){go();return;}"
             "var n=0,sel=tr.querySelectorAll('select');"
             "sel.forEach(function(x){if(x.value)n++;});"
@@ -3207,8 +3221,31 @@ def _flex_roster_open(evt: FlexibleEvent, options: list) -> bool:
 
 def _flex_roster_option(evt: FlexibleEvent, options: list):
     """The option a scheduled event's coming / not coming stands for — the one
-    that won. None for an adopted event (it never had options)."""
-    return next((o for o in options if o.iso_date == evt.winning_date), None)
+    that won. None for an adopted event (it never had options). Events closed
+    before the winner's id was recorded are matched by date and time, since a
+    poll may offer two times on one date."""
+    if evt.winning_option_id:
+        won = next((o for o in options
+                    if o.option_id == evt.winning_option_id), None)
+        if won is not None:
+            return won
+    same_date = [o for o in options if o.iso_date == evt.winning_date]
+    return next((o for o in same_date
+                 if (o.start_time or "18:00") == evt.winning_start_time),
+                same_date[0] if same_date else None)
+
+
+def _flex_rsvp_stamp(rsvp: FlexibleRSVP | None) -> str:
+    """Identifies the exact state of one member's reply, so a save can tell
+    whether the row it was shown is still the row that is stored."""
+    return "" if rsvp is None else f"{rsvp.version}.{rsvp.updated_at}"
+
+
+def _flex_roster_sig(evt: FlexibleEvent, options: list) -> str:
+    """Identifies the shape of the replies table: the event's state and its
+    candidate dates. A form built for a different shape must not be saved —
+    its columns mean something else, or are missing."""
+    return evt.state + ":" + ",".join(sorted(o.option_id for o in options))
 
 
 def _flex_roster_answer(evt: FlexibleEvent, rsvp: FlexibleRSVP | None,
@@ -3238,10 +3275,20 @@ def _api_flex_event_save_attendance(event: dict, user: User,
                                     community: Community | None,
                                     app: Application,
                                     membership: Membership | None) -> dict:
-    """Save the hand-marked replies. The form posts every editable row, so
-    only rows the AA actually changed are written. A member's own answer is
-    skipped unless its row was explicitly unlocked (`override`). Sends
-    nothing."""
+    """Save the hand-marked replies. Sends nothing.
+
+    The page may be stale: another tab, a member answering online, a date
+    added, the poll closed. So nothing is taken on trust —
+
+    - the form must have been built for the event's current state and dates
+      (`sig`), else it is refused whole;
+    - only the rows the AA touched are considered (`dirty`), and each must
+      still be the row the page showed (`base_<uid>`), else it is left alone
+      and reported;
+    - every write is conditional on the version read here, so a reply landing
+      mid-save wins rather than being overwritten;
+    - a member's own answer is skipped unless its row was explicitly unlocked
+      (`override`)."""
     if _http_method(event) != "POST":
         return _text(405, "POST required")
     guard = _flex_guard(user, membership, app)
@@ -3254,6 +3301,13 @@ def _api_flex_event_save_attendance(event: dict, user: User,
                if evt else [])
     if evt is None or evt.merged_into or not _flex_roster_open(evt, options):
         return _error_redirect("/", "Replies can't be marked on that event.")
+    results_url = f"/flex/event/results?event={event_id}"
+    if (parsed.get("sig", [""])[0] or "") != _flex_roster_sig(evt, options):
+        return _error_redirect(
+            results_url,
+            "This event changed since that page was loaded, so nothing was "
+            "saved. The page is now up to date — please make your change "
+            "again.")
     polling = evt.state == "poll"
     opt_ids = [o.option_id for o in options]
     win = _flex_roster_option(evt, options)
@@ -3261,11 +3315,25 @@ def _api_flex_event_save_attendance(event: dict, user: User,
     overrides = {u for u in parsed.get("override", []) if u in member_ids}
     users = {u.user_id: u for u in db.list_users(app.community_id)}
     rsvps = {r.user_id: r for r in db.list_flexible_rsvps(app.app_id, event_id)}
-    # Rows this save may touch: editable ones, plus any unlocked on purpose.
-    listed = [u for u in dict.fromkeys(parsed.get("member", []) + sorted(overrides))
-              if u in member_ids
-              and (_flex_rsvp_origin(evt, rsvps.get(u)) != "member"
-                   or u in overrides)]
+    # Rows this save may touch: the ones the AA changed (every posted row when
+    # the browser sent no markers — the no-JavaScript fallback), editable or
+    # unlocked on purpose, and still exactly as the page showed them.
+    dirty = set(parsed.get("dirty", []))
+    conflicts = 0
+    listed = []
+    for u in dict.fromkeys(parsed.get("member", []) + sorted(overrides)):
+        if u not in member_ids or (dirty and u not in dirty):
+            continue
+        if (_flex_rsvp_origin(evt, rsvps.get(u)) == "member"
+                and u not in overrides):
+            # Locked when the page was built, or answered by the member since.
+            conflicts += u in dirty
+            continue
+        if (parsed.get(f"base_{u}", [""])[0] or "") != _flex_rsvp_stamp(
+                rsvps.get(u)):
+            conflicts += 1
+            continue
+        listed.append(u)
 
     def _posted(uid: str) -> dict[str, str]:
         """What the form says for this member: {option_id: vote} while
@@ -3305,25 +3373,34 @@ def _api_flex_event_save_attendance(event: dict, user: User,
         r = rsvps.get(uid)
         if not want:
             if r is not None:
-                db.delete_flexible_rsvp(app.app_id, event_id, uid)
-                changed += 1
+                try:
+                    db.delete_flexible_rsvp(app.app_id, event_id, uid,
+                                            expected_version=r.version)
+                    changed += 1
+                except db.ConcurrencyConflict:
+                    conflicts += 1
             continue
         try:
             given = int((parsed.get(f"size_{uid}", [""])[0] or "").strip())
         except ValueError:
             given = 0
         same = r is not None and _stored(r) == want
+        # The count box shows a stated number and is blank for a defaulted
+        # one, so on a row the AA touched, blank means "use the default".
         if not _going(want):
             size, auto = None, False
         elif given >= 1:
             size, auto = given, False
-        elif same and not r.party_size_auto:
-            size, auto = r.party_size, False       # the count already on file
+        elif same and not r.party_size and not r.party_size_auto:
+            # A member who answered without a count: the box was blank and
+            # still is, so nothing was asked of it.
+            size, auto = r.party_size, False
         else:
             size, auto = coming_hh[_hh_key(users, uid)], True
         if same and r.party_size == size and r.party_size_auto == auto:
             continue
-        if r is None:
+        is_new = r is None
+        if is_new:
             r = FlexibleRSVP(community_id=app.community_id, app_id=app.app_id,
                              event_id=event_id, user_id=uid)
         if polling:
@@ -3340,15 +3417,43 @@ def _api_flex_event_save_attendance(event: dict, user: User,
             r.willing_to_host = False
         r.marked_by, r.marked_at = user.user_id, now
         r.updated_at = now
-        db.put_flexible_rsvp(r)
-        changed += 1
-    log.info("flex roster saved app=%s event=%s changed=%d overrides=%d by=%s",
-             app.app_id, event_id, changed, len(overrides), user.user_id)
-    return _redirect(
-        f"/flex/event/results?event={event_id}&notice="
-        + urllib.parse.quote(
-            f"Saved — {changed} repl" + ("y" if changed == 1 else "ies")
-            + " updated." if changed else "Nothing changed."))
+        try:
+            if is_new:
+                db.put_flexible_rsvp(r, create_only=True)
+            else:
+                db.put_flexible_rsvp(r, expected_version=r.version)
+            changed += 1
+        except db.ConcurrencyConflict:
+            conflicts += 1
+    # Household-mates whose count was a default: keep it in step with who in
+    # the household is coming now. Only the count moves — not whose answer it
+    # is — and a row that changed underneath is simply left for next time.
+    touched_hh = {_hh_key(users, uid) for uid in listed}
+    for uid, r in rsvps.items():
+        k = _hh_key(users, uid)
+        if (uid in listed or k not in touched_hh or not r.party_size_auto
+                or not _going(_stored(r)) or r.party_size == coming_hh.get(k)):
+            continue
+        r.party_size = coming_hh.get(k)
+        try:
+            db.put_flexible_rsvp(r, expected_version=r.version)
+        except db.ConcurrencyConflict:
+            pass
+    log.info("flex roster saved app=%s event=%s changed=%d conflicts=%d "
+             "overrides=%d by=%s", app.app_id, event_id, changed, conflicts,
+             len(overrides), user.user_id)
+    msg = (f"Saved — {changed} repl" + ("y" if changed == 1 else "ies")
+           + " updated." if changed else "Nothing changed.")
+    if conflicts:
+        return _error_redirect(
+            results_url,
+            (f"{changed} saved. " if changed else "")
+            + f"{conflicts} repl" + ("y" if conflicts == 1 else "ies")
+            + " had changed since that page was loaded and "
+            + ("was" if conflicts == 1 else "were")
+            + " left alone — check below and make the change again if it "
+            "still applies.")
+    return _redirect(results_url + "&notice=" + urllib.parse.quote(msg))
 
 
 # ---- AA: send the poll email (mint/reuse tokens + magic links) ------------
@@ -3968,6 +4073,7 @@ def _api_flex_event_close(event: dict, user: User,
     evt.state = "scheduled"
     evt.winning_date = opt.iso_date
     evt.winning_start_time = opt.start_time or "18:00"
+    evt.winning_option_id = opt.option_id
     try:
         db.put_flexible_event(evt, expected_version=evt.version)
     except db.ConcurrencyConflict:
@@ -4257,9 +4363,30 @@ def _flex_token_page(event: dict) -> dict:
                            "&mdash; thank you!</p>")
             elif _flex_host_question_open(evt, 0):
                 hosting = _flex_host_fields_html(evt, rsvp)
+            # Recorded as a maybe (by an AA, after the date was set): let them
+            # settle it themselves.
+            attend_html = ""
+            if rsvp and rsvp.confirmed_response == "maybe":
+                attend_html = (
+                    "<fieldset style='border:1px solid #ddd;border-radius:8px;"
+                    "padding:10px 12px;margin:0 0 14px;max-width:420px;"
+                    "text-align:left'><legend style='font-weight:600;"
+                    "padding:0 6px'>Can you come?</legend>"
+                    "<p style='color:#666;font-size:0.9em;margin:0 0 6px'>"
+                    "We have you down as a maybe.</p>"
+                    + "".join(
+                        "<label style='display:block;margin:3px 0;"
+                        "cursor:pointer'><input type='radio' name='attend' "
+                        f"value='{v}'" + (" checked" if v == "maybe" else "")
+                        + f"> {lbl}</label>"
+                        for v, lbl in (("yes", "Yes, I'm coming"),
+                                       ("maybe", "Still not sure"),
+                                       ("no", "No, I can't make it")))
+                    + "</fieldset>")
             body = (head
                 + "<form method='post' action='/api/e/vote'>"
                 f"<input type='hidden' name='token' value='{html.escape(token)}'>"
+                + attend_html +
                 f"<label>{html.escape(bring_prompt)}</label><br>"
                 f"<input type='text' name='bringing' value='{html.escape(cur_bring)}' "
                 "style='padding:6px;width:100%;max-width:420px'>"
@@ -4422,6 +4549,19 @@ def _api_flex_token_vote(event: dict) -> dict:
             rsvp.confirmed_response = "no"          # all-No == decline
         elif any(v in ("yes", "maybe") for v in votes.values()):
             rsvp.confirmed_response = "yes"
+        stated_attendance = True
+    else:
+        # Scheduled: the form only carries an attendance choice for someone
+        # recorded as a maybe (see _flex_token_page). Saving a dish or a
+        # hosting offer says nothing about whether they are coming.
+        attend = (parsed.get("attend", [""])[0] or "").strip()
+        stated_attendance = attend in ("yes", "maybe", "no")
+        if stated_attendance:
+            rsvp.confirmed_response = attend
+            _won = _flex_roster_option(evt, list(
+                db.list_flexible_poll_options(tok.app_id, tok.event_id)))
+            if _won is not None:
+                rsvp.votes = {**rsvp.votes, _won.option_id: attend}
     ps = (parsed.get("party_size", [""])[0] or "").strip()
     if ps != "":
         try:
@@ -4440,9 +4580,10 @@ def _api_flex_token_vote(event: dict) -> dict:
     if rsvp.confirmed_response == "no":
         rsvp.willing_to_host = False
     new_host_offer = rsvp.willing_to_host and not was_host_volunteer
-    # They've now answered for themselves: that replaces anything an AA had
-    # recorded on their behalf.
-    rsvp.marked_by = rsvp.marked_at = None
+    # Once they have said for themselves whether they are coming, that
+    # replaces anything an AA had recorded on their behalf.
+    if stated_attendance:
+        rsvp.marked_by = rsvp.marked_at = None
     rsvp.updated_at = dt.datetime.now(dt.timezone.utc).isoformat(
         timespec="seconds")
     try:
@@ -4564,6 +4705,12 @@ def _api_flex_token_join(event: dict) -> dict:
         rsvp = FlexibleRSVP(community_id=tok.community_id, app_id=tok.app_id,
                             event_id=tok.event_id, user_id=tok.user_id)
     rsvp.confirmed_response = "yes"
+    # Their No on the chosen date is superseded too — otherwise the roster,
+    # which reads that vote, would go on showing them as not coming.
+    _won = _flex_roster_option(evt, list(
+        db.list_flexible_poll_options(tok.app_id, tok.event_id)))
+    if _won is not None:
+        rsvp.votes = {**rsvp.votes, _won.option_id: "yes"}
     rsvp.marked_by = rsvp.marked_at = None
     rsvp.updated_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     try:
@@ -11839,10 +11986,15 @@ def _send_email_page(event: dict, user: User, community: Community | None,
         "sp.id='u-'+uid;"
         "sp.style.cssText='display:inline-block;margin:2px 8px 2px 0;"
         "padding:2px 8px;background:#f0f0f0;border-radius:12px;font-size:0.9em';"
-        "sp.innerHTML=name+' <input type=\"hidden\" name=\"user_id\" value=\"'+uid+'\">"
-        "<button type=\"button\" onclick=\"this.parentElement.remove()\" "
-        "style=\"font-size:0.8em;cursor:pointer;color:#c33;background:none;"
-        "border:none;padding:0\">x</button>';"
+        # Built with DOM calls, never innerHTML: a member's name is text, and
+        # must not be parsed as markup in an admin's browser.
+        "sp.appendChild(document.createTextNode(name+' '));"
+        "var h=document.createElement('input');h.type='hidden';"
+        "h.name='user_id';h.value=uid;sp.appendChild(h);"
+        "var x=document.createElement('button');x.type='button';"
+        "x.textContent='x';x.style.cssText='font-size:0.8em;cursor:pointer;"
+        "color:#c33;background:none;border:none;padding:0';"
+        "x.onclick=function(){sp.remove();};sp.appendChild(x);"
         "selectedDiv.appendChild(sp);"
         "}"
         "picker.onchange=function(){"

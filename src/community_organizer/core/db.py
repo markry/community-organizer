@@ -437,6 +437,8 @@ def delete_user(community_id: str, user_id: str) -> None:
 
 def get_user_by_email(community_id: str, email: str) -> User | None:
     target = email.strip().lower()
+    if not target:
+        return None        # a member with no email must never match a blank
     for user in list_users(community_id):
         if user.email.strip().lower() == target:
             return user
@@ -2082,9 +2084,16 @@ def delete_flexible_poll_option(app_id: str, event_id: str,
 # ---- FlexibleRSVP --------------------------------------------------------
 
 def put_flexible_rsvp(rsvp: FlexibleRSVP, *,
-                      expected_version: int | None = None) -> None:
+                      expected_version: int | None = None,
+                      create_only: bool = False) -> None:
+    """Persist an RSVP. ``expected_version`` makes it a conditional update
+    (ConcurrencyConflict if the row moved on). ``create_only`` makes it a
+    create that fails with ConcurrencyConflict if ANY row is already there —
+    stricter than ``expected_version=0``, which a version-0 row would pass."""
     from botocore.exceptions import ClientError
-    if expected_version is not None:
+    if create_only:
+        rsvp.version = 1
+    elif expected_version is not None:
         rsvp.version = (expected_version or 0) + 1
     item = dataclasses.asdict(rsvp) | {
         "PK": _app_pk(rsvp.app_id),
@@ -2093,7 +2102,9 @@ def put_flexible_rsvp(rsvp: FlexibleRSVP, *,
         "GSI1SK": f"APP#{rsvp.app_id}#{rsvp.event_id}",
     }
     kwargs = {"Item": item}
-    if expected_version is not None:
+    if create_only:
+        kwargs["ConditionExpression"] = "attribute_not_exists(PK)"
+    elif expected_version is not None:
         kwargs["ConditionExpression"] = (
             "attribute_not_exists(version) OR version = :expected")
         kwargs["ExpressionAttributeValues"] = {":expected": expected_version}
@@ -2117,13 +2128,27 @@ def get_flexible_rsvp(app_id: str, event_id: str,
     return _hydrate(FlexibleRSVP, _strip_keys(item)) if item else None
 
 
-def delete_flexible_rsvp(app_id: str, event_id: str, user_id: str) -> None:
-    """Forget a member's response entirely (an AA un-marking someone on an
-    adopted event) — back to "haven't heard", not a decline."""
-    _table().delete_item(Key={
+def delete_flexible_rsvp(app_id: str, event_id: str, user_id: str, *,
+                         expected_version: int | None = None) -> None:
+    """Forget a member's response entirely (an AA un-marking someone) — back
+    to "haven't heard", not a decline. With ``expected_version`` the delete is
+    conditional: ConcurrencyConflict if the row changed since it was read."""
+    from botocore.exceptions import ClientError
+    kwargs = {"Key": {
         "PK": _app_pk(app_id),
         "SK": _flex_rsvp_sk(event_id, user_id),
-    })
+    }}
+    if expected_version is not None:
+        kwargs["ConditionExpression"] = "version = :expected"
+        kwargs["ExpressionAttributeValues"] = {":expected": expected_version}
+    try:
+        _table().delete_item(**kwargs)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise ConcurrencyConflict(
+                f"flexible_rsvp for {user_id} was modified "
+                f"by someone else") from e
+        raise
 
 
 def list_flexible_rsvps(app_id: str,

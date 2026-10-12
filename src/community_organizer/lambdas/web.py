@@ -10506,8 +10506,18 @@ def _users_page(event: dict, user: User, community: Community | None,
                 f"Name<input name='name' value='{html.escape(u.name)}' required "
                 "style='padding:4px;width:140px'></label>"
                 "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
-                f"Email<input name='email' value='{html.escape(u.email)}' required "
-                "style='padding:4px;width:180px'></label>"
+                # An email address is also how a member signs in, so only a
+                # community-level admin may change it (see _may_change_email).
+                # Everyone else sees it read-only, with the reason.
+                f"Email<input name='email' value='{html.escape(u.email)}' "
+                + ("required " if u.email else "")
+                + ("style='padding:4px;width:180px'>"
+                   if _may_change_email(user, u) else
+                   "readonly title='Only a community admin can change an "
+                   "email address. Ask one for help.' "
+                   "style='padding:4px;width:180px;background:#f3f3f3;"
+                   "color:#666'>")
+                + "</label>"
                 "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
                 f"Phone<input name='phone' value='{html.escape(u.phone or '')}' "
                 "style='padding:4px;width:120px'></label>"
@@ -10776,6 +10786,24 @@ def _api_user_add(event: dict, user: User, community: Community | None,
     return _redirect("/admin/users")
 
 
+def _may_change_email(actor: User, target: User) -> bool:
+    """Whether ``actor`` may change ``target``'s email address.
+
+    A member signs in by email: on a login the app does not recognize, it
+    looks the person up by the verified address and binds that identity to the
+    account (see ``_route``). So whoever can change an account's email can
+    then sign in as that account. An App Admin could do exactly that to a
+    Community Admin and inherit the role.
+
+    Hence: only community-level admins (Community Admin, User Admin) may
+    change an email, and only a Community Admin may change a Community
+    Admin's. App Admins manage everything else about their members.
+    """
+    if actor.community_role == "ca":
+        return True
+    return actor.community_role == "ua" and target.community_role != "ca"
+
+
 def _api_user_edit(event: dict, user: User, community: Community | None,
                    app: Application, membership: Membership | None) -> dict:
     # Admit App Admins of the active app AND community-level CAs/UAs. This
@@ -10812,7 +10840,14 @@ def _api_user_edit(event: dict, user: User, community: Community | None,
     except ValueError:
         expected_version = 0
     target.name = _get_param(event, "name") or target.name
-    target.email = _get_param(event, "email") or target.email
+    new_email = (_get_param(event, "email") or "").strip()
+    if new_email and new_email.lower() != (target.email or "").strip().lower():
+        if not _may_change_email(user, target):
+            return _error_redirect_or_next(event, "/admin/users",
+                "Only a community admin can change an email address, because "
+                "it is also how the member signs in. Please ask a community "
+                "admin for help. Nothing was saved.")
+        target.email = new_email
     # community_role editing lives on /admin/community-users only
     # (per task #168). The per-app /admin/users edit form previously
     # rendered a CA-only community_role select; that's been removed.

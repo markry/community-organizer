@@ -430,9 +430,107 @@ def list_users(community_id: str) -> Iterator[User]:
 
 
 def delete_user(community_id: str, user_id: str) -> None:
-    _table().delete_item(Key={
+    resp = _table().delete_item(Key={
         "PK": _comm_pk(community_id), "SK": _user_sk(user_id),
-    })
+    }, ReturnValues="ALL_OLD")
+    gone = resp.get("Attributes") or {}
+    if gone.get("email"):
+        release_email(community_id, gone["email"], user_id)   # free the address
+
+
+# ---- one account per email address ------------------------------------------
+# A member signs in by email, so two accounts sharing an address is not just
+# untidy: a sign-in, a password reset or a delete aimed at "the account with
+# this address" can land on the wrong person. Uniqueness is held by a
+# reservation row per (community, address) written with a conditional put —
+# a check-then-create on the user list alone lets two simultaneous adds both
+# pass the check.
+
+class EmailInUse(Exception):
+    """Another account in the community already has this email address."""
+
+
+def _user_email_sk(email: str) -> str:
+    # NOT "EMAIL#": that prefix is the outbound-email log in this partition.
+    return f"UEMAIL#{email.strip().lower()}"
+
+
+def reserve_email(community_id: str, email: str, user_id: str) -> None:
+    """Claim ``email`` for ``user_id``. Raises EmailInUse if a different
+    account holds it. A blank address is never reserved (members may have
+    none). Idempotent for the same user.
+
+    Also refuses when an existing account carries the address but has no
+    reservation — accounts created before reservations existed — so this is
+    safe to rely on before every old account has been backfilled.
+    """
+    from botocore.exceptions import ClientError
+    norm = (email or "").strip().lower()
+    if not norm:
+        return
+    for u in list_users(community_id):
+        if u.user_id != user_id and (u.email or "").strip().lower() == norm:
+            raise EmailInUse(norm)
+    key = {"PK": _comm_pk(community_id), "SK": _user_email_sk(norm)}
+    item = key | {"user_id": user_id, "email": norm, "community_id": community_id,
+                  "created_at": dt.datetime.now(dt.timezone.utc).isoformat(
+                      timespec="seconds")}
+    try:
+        _table().put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(SK) OR user_id = :me",
+            ExpressionAttributeValues={":me": user_id})
+        return
+    except ClientError as e:
+        if (e.response.get("Error", {}).get("Code")
+                != "ConditionalCheckFailedException"):
+            raise
+    # Held by someone else. Unless that holder no longer exists or no longer
+    # has the address (a reservation left behind by an interrupted change),
+    # the address is taken.
+    held = _table().get_item(Key=key, ConsistentRead=True).get("Item") or {}
+    holder_id = held.get("user_id")
+    holder = get_user(community_id, holder_id) if holder_id else None
+    if holder is not None and (holder.email or "").strip().lower() == norm:
+        raise EmailInUse(norm)
+    try:
+        _table().put_item(
+            Item=item,
+            ConditionExpression="user_id = :holder",
+            ExpressionAttributeValues={":holder": holder_id})
+    except ClientError as e:
+        if (e.response.get("Error", {}).get("Code")
+                == "ConditionalCheckFailedException"):
+            raise EmailInUse(norm) from e
+        raise
+
+
+def release_email(community_id: str, email: str, user_id: str) -> None:
+    """Give up ``user_id``'s reservation of ``email`` (they changed address
+    or were deleted). A no-op if they do not hold it."""
+    from botocore.exceptions import ClientError
+    norm = (email or "").strip().lower()
+    if not norm:
+        return
+    try:
+        _table().delete_item(
+            Key={"PK": _comm_pk(community_id), "SK": _user_email_sk(norm)},
+            ConditionExpression="user_id = :me",
+            ExpressionAttributeValues={":me": user_id})
+    except ClientError as e:
+        if (e.response.get("Error", {}).get("Code")
+                != "ConditionalCheckFailedException"):
+            raise
+
+
+def list_users_by_email(community_id: str, email: str) -> list[User]:
+    """Every account carrying this address. More than one is a fault the
+    caller must not paper over by taking the first."""
+    target = (email or "").strip().lower()
+    if not target:
+        return []
+    return [u for u in list_users(community_id)
+            if (u.email or "").strip().lower() == target]
 
 
 def get_user_by_email(community_id: str, email: str) -> User | None:

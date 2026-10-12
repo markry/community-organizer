@@ -1143,7 +1143,15 @@ def _route(event: dict, handler):
         trusted = _login_email_trusted(claims)
         if email and trusted:
             community_id = os.environ.get("COMMUNITY_ID", "")
-            user = db.get_user_by_email(community_id, email) if community_id else None
+            # Exactly one account may carry the address. Binding this
+            # identity to "the first match" when there are several would
+            # hand it to whichever record happens to sort first.
+            matches = (db.list_users_by_email(community_id, email)
+                       if community_id else [])
+            if len(matches) > 1:
+                log.error("refusing email-based auto-link: %d accounts share "
+                          "the address (sub=%s)", len(matches), sub)
+            user = matches[0] if len(matches) == 1 else None
             if user and sub:
                 user.cognito_sub = sub
                 db.put_user(user)
@@ -10789,6 +10797,15 @@ def _api_user_add(event: dict, user: User, community: Community | None,
                         publishing.DEFAULT_LEAD_TIMES
                         if app.default_lead_times is None
                         else app.default_lead_times))
+    # Claim the address first: two adds of the same new email arriving
+    # together would otherwise both pass the lookup above and create two
+    # accounts for one person.
+    try:
+        db.reserve_email(user.community_id, email, new_user.user_id)
+    except db.EmailInUse:
+        return _error_redirect("/admin/users",
+            "Someone with that email address was just added. Refresh the "
+            "page and add them from the existing entry.")
     # Auto-provision the Cognito identity so the unified
     # new-user/forgot-password flow works immediately.
     cognito_sub = _create_cognito_user(email, name)
@@ -10883,7 +10900,15 @@ def _api_user_edit(event: dict, user: User, community: Community | None,
                 "Only a community admin can change an email address, because "
                 "it is also how the member signs in. Please ask a community "
                 "admin for help. Nothing was saved.")
-        target.email = new_email
+        try:
+            db.reserve_email(user.community_id, new_email, target.user_id)
+        except db.EmailInUse:
+            return _error_redirect_or_next(event, "/admin/users",
+                "Another person in this community already has that email "
+                "address. Each person needs their own. Nothing was saved.")
+        old_email, target.email = target.email, new_email
+    else:
+        old_email = None
     # community_role editing lives on /admin/community-users only
     # (per task #168). The per-app /admin/users edit form previously
     # rendered a CA-only community_role select; that's been removed.
@@ -10919,6 +10944,9 @@ def _api_user_edit(event: dict, user: User, community: Community | None,
     try:
         db.put_user(target, expected_version=expected_version)
     except db.ConcurrencyConflict:
+        if old_email is not None:
+            # The save did not happen, so neither did the change of address.
+            db.release_email(user.community_id, target.email, target.user_id)
         # Inject conflict marker just before any fragment so the
         # banner shows AND the page scrolls to the row.
         sep = "&" if ("?" in next_url and "#" not in next_url.split("?", 1)[1]) else "?"
@@ -10928,6 +10956,8 @@ def _api_user_edit(event: dict, user: User, community: Community | None,
         redirect = (f"{base}{sep_base}{conflict_q}"
                     + (f"#{frag}" if frag else ""))
         return _redirect(redirect)
+    if old_email:
+        db.release_email(user.community_id, old_email, target.user_id)
     log.info("admin %s edited user %s", user.user_id, uid)
     return _redirect(next_url)
 
@@ -14555,6 +14585,12 @@ def _api_ca_user_add(event: dict, user: User,
             "app memberships from their row.")
     new_user = User(community_id=user.community_id, email=email, name=name,
                     community_role="member", phone=phone, notes=notes)
+    try:
+        db.reserve_email(user.community_id, email, new_user.user_id)
+    except db.EmailInUse:
+        return _error_redirect("/admin/community-users",
+            "Someone with that email address was just added. Refresh the "
+            "page and use the existing entry.")
     cognito_sub = _create_cognito_user(email, name)
     if cognito_sub:
         new_user.cognito_sub = cognito_sub

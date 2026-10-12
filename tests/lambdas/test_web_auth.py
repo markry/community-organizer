@@ -38,6 +38,12 @@ def patch_user_lookup(monkeypatch):
                         lambda *_args, **_kwargs: None)
     monkeypatch.setattr(db, "get_user_by_email",
                         lambda *_args, **_kwargs: state["user_by_email"])
+    # _route asks for every account with the address (it refuses to link
+    # when there is more than one).
+    monkeypatch.setattr(
+        db, "list_users_by_email",
+        lambda *_args, **_kwargs: ([state["user_by_email"]]
+                                   if state["user_by_email"] else []))
 
     def _stub_put_user(user, **kwargs):
         state["put_calls"].append(user)

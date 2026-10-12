@@ -403,3 +403,135 @@ def test_event_link_stops_working_when_the_member_is_removed(world) -> None:
     db.put_membership(Membership(community_id=CID, app_id="club",
                                  user_id=m.user_id))
     assert web._resolve_token("tok") is None
+
+
+# ---- one account per email address -----------------------------------------
+# Follow-up review: nothing stopped two accounts carrying one address, and a
+# sign-in, reset or delete aimed at "the account with this address" could then
+# land on the wrong person.
+
+def test_an_email_cannot_be_changed_to_one_another_account_has(world) -> None:
+    add, _request = world
+    ua = add("useradmin", role="ua")
+    ca = add("boss", role="ca")
+    member = add("usher", apps=("ush",))
+    resp = _edit(ua, member, email="Boss@Example.com")       # any case
+    assert "error=" in resp["headers"]["Location"]
+    assert db.get_user(CID, member.user_id).email == "usher@example.com"
+    assert len(db.list_users_by_email(CID, "boss@example.com")) == 1
+    assert ca.user_id == db.list_users_by_email(CID, "boss@example.com")[0].user_id
+
+
+def test_changing_an_email_frees_the_old_address(world) -> None:
+    add, _request = world
+    ca = add("boss", role="ca")
+    a = add("usher", apps=("ush",))
+    b = add("singer", apps=("choir",))
+    assert "error=" not in _edit(ca, a, email="moved@example.com"
+                                 )["headers"]["Location"]
+    # The address `a` gave up is now free for `b`; the one `a` took is not.
+    assert "error=" not in _edit(ca, b, email="usher@example.com"
+                                 )["headers"]["Location"]
+    c = add("third", apps=("ush",))
+    assert "error=" in _edit(ca, c, email="moved@example.com"
+                             )["headers"]["Location"]
+
+
+def test_a_failed_save_does_not_keep_the_new_address_reserved(world) -> None:
+    add, _request = world
+    ca = add("boss", role="ca")
+    a = add("usher", apps=("ush",))
+    stale = db.get_user(CID, a.user_id)
+    db.put_user(db.get_user(CID, a.user_id), expected_version=stale.version)
+    # `stale` now carries an old version: the save is refused...
+    _edit(ca, stale, email="wanted@example.com")
+    assert db.get_user(CID, a.user_id).email == "usher@example.com"
+    # ...and the address it reached for is still available to someone else.
+    b = add("singer", apps=("choir",))
+    assert "error=" not in _edit(ca, b, email="wanted@example.com"
+                                 )["headers"]["Location"]
+
+
+def _add_member(actor: User, email: str, name: str = "New Person") -> dict:
+    import urllib.parse
+    app = db.get_application(CID, "ush")
+    return web._api_user_add(
+        {"rawPath": "/api/users/add",
+         "requestContext": {"http": {"method": "POST"}},
+         "body": urllib.parse.urlencode({"name": name, "email": email}),
+         "isBase64Encoded": False},
+        actor, db.get_community(CID), app,
+        db.get_membership("ush", actor.user_id))
+
+
+def test_two_simultaneous_adds_of_one_new_email_make_one_account(
+        world, monkeypatch) -> None:
+    """Both requests pass the "is this address new?" lookup before either
+    writes. Only one may create the account."""
+    add, _request = world
+    aa = add("appadmin"); _make_app_admin(aa)
+    monkeypatch.setattr(web, "_create_cognito_user", lambda *_a: None)
+    real = db.get_user_by_email
+    monkeypatch.setattr(db, "get_user_by_email", lambda *_a: None)   # both "new"
+    first = _add_member(aa, "newcomer@example.com")
+    second = _add_member(aa, "Newcomer@example.com")
+    monkeypatch.setattr(db, "get_user_by_email", real)
+    assert "error=" not in first["headers"]["Location"]
+    assert "error=" in second["headers"]["Location"]
+    assert len(db.list_users_by_email(CID, "newcomer@example.com")) == 1
+
+
+def test_deleting_a_user_frees_their_address(world, cognito, monkeypatch) -> None:
+    add, _request = world
+    monkeypatch.setattr(web, "_create_cognito_user", lambda *_a: None)
+    ca = add("boss", role="ca")
+    aa = add("appadmin"); _make_app_admin(aa)
+    gone = add("leaver", apps=("ush",))
+    db.reserve_email(CID, gone.email, gone.user_id)
+    _delete(ca, gone.user_id)
+    assert "error=" not in _add_member(aa, "leaver@example.com"
+                                       )["headers"]["Location"]
+
+
+def test_members_without_an_email_do_not_collide(world) -> None:
+    add, _request = world
+    for name in ("guest one", "guest two"):
+        u = User(community_id=CID, email="", name=name, channel="none")
+        db.reserve_email(CID, u.email, u.user_id)            # a no-op
+        db.put_user(u)
+    assert db.list_users_by_email(CID, "") == []
+
+
+def test_a_reservation_left_by_an_interrupted_change_does_not_block(
+        world) -> None:
+    """The holder of a reservation no longer has that address (the change
+    that made it never finished): the address can be claimed again."""
+    add, _request = world
+    ca = add("boss", role="ca")
+    a = add("usher", apps=("ush",))
+    b = add("singer", apps=("choir",))
+    db.reserve_email(CID, "orphan@example.com", a.user_id)   # a never took it
+    assert "error=" not in _edit(ca, b, email="orphan@example.com"
+                                 )["headers"]["Location"]
+
+
+def test_sign_in_is_not_linked_when_two_accounts_share_the_address(
+        world) -> None:
+    """Accounts that already share an address (created before this rule):
+    a new identity for it must not be bound to whichever sorts first."""
+    add, request = world
+    for name in ("twin-a", "twin-b"):
+        db.put_user(User(community_id=CID, email="shared@example.com",
+                         name=name, cognito_sub=None))
+    import community_organizer.auth as auth_mod
+    orig = auth_mod.verify_id_token
+    auth_mod.verify_id_token = lambda _t: {
+        "sub": "sub-new", "email": "shared@example.com", "email_verified": True}
+    try:
+        resp, calls = request(User(community_id=CID, email="x", name="x",
+                                   cognito_sub="sub-new"))
+    finally:
+        auth_mod.verify_id_token = orig
+    assert resp["statusCode"] == 403 and calls == []
+    assert all(u.cognito_sub is None
+               for u in db.list_users_by_email(CID, "shared@example.com"))

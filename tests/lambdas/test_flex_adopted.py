@@ -689,9 +689,11 @@ def test_send_email_is_always_about_one_event(ddb_table, outbox) -> None:
     switcher at the top, and the quick-picks are for that event alone — so
     they never need to say which event they mean."""
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
-    _adopt(cid, app, aa, aa_mem, title="Winter Dinner", date0="2026-12-12")
+    import datetime as dt
+    ahead = lambda days: (dt.date.today() + dt.timedelta(days=days)).isoformat()
+    _adopt(cid, app, aa, aa_mem, title="Winter Dinner", date0=ahead(60))
     winter = _the_event()
-    _adopt(cid, app, aa, aa_mem)                       # Autumn, 2026-11-14
+    _adopt(cid, app, aa, aa_mem, date0=ahead(30))      # Autumn: the sooner one
     autumn = next(e for e in db.list_flexible_events("a1")
                   if e.event_id != winter.event_id)
     _mark(cid, app, aa, aa_mem, autumn, {bob.user_id: "yes"})
@@ -711,3 +713,29 @@ def test_send_email_is_always_about_one_event(ddb_table, outbox) -> None:
     body = page()
     assert f"<option value='{winter.event_id}' selected>Winter Dinner" in body
     assert "+ coming (2)</button>" in body and "coming to" not in body
+
+
+def test_send_email_opens_on_the_next_upcoming_event(ddb_table, outbox) -> None:
+    """An event stays live for a while after its date. Opened from the menu,
+    the page should be about the next one coming up, not last week's — and
+    fall back to the most recent past one only when nothing is ahead."""
+    import datetime as dt
+    today = dt.date.today()
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    for title, days in (("Long Ago", -30), ("Last Week", -7), ("Next Month", 30)):
+        _adopt(cid, app, aa, aa_mem, title=title,
+               date0=(today + dt.timedelta(days=days)).isoformat())
+    ev = {"requestContext": {"http": {"method": "GET"}}}
+
+    def about() -> str:
+        body = web._send_email_page(ev, aa, db.get_community(cid), app,
+                                    aa_mem)["body"]
+        return body.split("' selected>")[1].split("</option>")[0]
+
+    assert about() == "Next Month"
+    nxt = next(e for e in db.list_flexible_events("a1") if e.title == "Next Month")
+    db.delete_flexible_event("a1", nxt.event_id)
+    assert about() == "Last Week"
+    # A poll with no date yet counts as ahead of anything already past.
+    _mk_event(cid)
+    assert about() == "August Book Club"

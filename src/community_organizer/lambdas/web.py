@@ -11838,10 +11838,21 @@ def _send_email_page(event: dict, user: User, community: Community | None,
         _live.sort(key=lambda e: (e.winning_date or "9999", e.created_at))
         _want = (_get_param(event, "event") or "").strip()
         # The page is always about ONE event when the app has any: the one
-        # asked for, else the soonest. With several, the heading offers a
-        # switcher (below), so the quick-picks never need to name an event.
+        # asked for, else the next one coming up. An event stays live for a
+        # while after its date, so "earliest" alone would keep opening on
+        # last week's dinner; prefer today-or-later, then a poll with no date
+        # yet, and only then the most recent past event. With several, the
+        # heading offers a switcher (below), so the quick-picks never need to
+        # name an event.
+        _today = dt.datetime.now(ZoneInfo(
+            app.default_timezone
+            or (community.default_timezone if community else None)
+            or "America/New_York")).date().isoformat()
+        _upcoming = [e for e in _live
+                     if not e.winning_date or e.winning_date >= _today]
         ctx_evt = (next((e for e in _live if e.event_id == _want), None)
-                   or (_live[0] if _live else None))
+                   or (_upcoming[0] if _upcoming
+                       else _live[-1] if _live else None))
         select_default = bool(ctx_evt and (ctx_evt.adopted
                                            or ctx_evt.state == "poll"))
     # Quick-picks for the event the page is about: "the people coming" —

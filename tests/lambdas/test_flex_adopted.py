@@ -157,8 +157,8 @@ def test_marking_an_adopted_event(ddb_table, outbox) -> None:
     # Bob + Sue share a household: both marked, no count given -> 2 expected.
     assert _rsvp(evt, bob).party_size == 2
     body = _results(cid, app, aa, aa_mem, evt)
-    assert "<b>Expected headcount:</b> 2 " in body
-    assert "<b>Declined:</b> 1" in body
+    assert "Expecting 2 people" in body
+    assert "Coming 2</b>" in body and "Not coming 1</b>" in body
     assert outbox == []
 
 
@@ -170,7 +170,7 @@ def test_a_given_count_overrides_the_household_default(ddb_table, outbox) -> Non
           {bob.user_id: "yes", sue.user_id: "yes", joe.user_id: "yes"},
           sizes={bob.user_id: 4})
     body = _results(cid, app, aa, aa_mem, evt)
-    assert "<b>Expected headcount:</b> 5 " in body          # 4 + Joe
+    assert "Expecting 5 people" in body                     # 4 + Joe
     assert f"name='size_{bob.user_id}' min='1' value='4'" in body
     # A defaulted count is shown blank, so it keeps tracking who is marked.
     assert f"name='size_{joe.user_id}' min='1' value=''" in body
@@ -182,10 +182,10 @@ def test_default_count_follows_later_changes(ddb_table, outbox) -> None:
     evt = _the_event()
     _mark(cid, app, aa, aa_mem, evt,
           {bob.user_id: "yes", sue.user_id: "", joe.user_id: ""})
-    assert "<b>Expected headcount:</b> 1 " in _results(cid, app, aa, aa_mem, evt)
+    assert "Expecting 1 person<" in _results(cid, app, aa, aa_mem, evt)
     _mark(cid, app, aa, aa_mem, evt,
           {bob.user_id: "yes", sue.user_id: "yes", joe.user_id: ""})
-    assert "<b>Expected headcount:</b> 2 " in _results(cid, app, aa, aa_mem, evt)
+    assert "Expecting 2 people" in _results(cid, app, aa, aa_mem, evt)
 
 
 def test_blank_forgets_the_reply(ddb_table, outbox) -> None:
@@ -393,7 +393,7 @@ def test_home_lists_an_adopted_event_as_scheduled(ddb_table, outbox) -> None:
                               app=app, membership=aa_mem,
                               org_name="Book Club")["body"]
     assert "Scheduled" in body and "Autumn Dinner" in body
-    assert "3 attending" in body and "Open polls" not in body
+    assert "1 coming (3 people)" in body and "Open polls" not in body
 
 
 def test_maybe_on_a_scheduled_event(ddb_table, outbox) -> None:
@@ -407,7 +407,8 @@ def test_maybe_on_a_scheduled_event(ddb_table, outbox) -> None:
     assert _rsvp(evt, joe).confirmed_response == "maybe"
     assert _rsvp(evt, joe).party_size == 1
     body = _results(cid, app, aa, aa_mem, evt)
-    assert "<b>Expected headcount:</b> 2 " in body and "<b>Maybe:</b> 1" in body
+    assert "Coming 1</b>" in body and "Maybe 1</b>" in body
+    assert "Expecting 1 person, up to 2 if the maybe comes" in body
     assert f"<option value='maybe' selected>" in body
     ev = {"requestContext": {"http": {"method": "GET"}}}
     page = web._send_email_page(ev, aa, db.get_community(cid), app, aa_mem)["body"]
@@ -582,7 +583,7 @@ def test_a_household_default_count_drops_when_one_of_them_drops_out(
     _mark(cid, app, aa, aa_mem, evt, {bob.user_id: "yes", sue.user_id: "yes"})
     _mark(cid, app, aa, aa_mem, evt, {sue.user_id: "no"})    # only Sue touched
     assert _rsvp(evt, bob).party_size == 1
-    assert "<b>Expected headcount:</b> 1 " in _results(cid, app, aa, aa_mem, evt)
+    assert "Expecting 1 person<" in _results(cid, app, aa, aa_mem, evt)
 
 
 # ---- which option won, and what the member says afterwards -----------------
@@ -891,3 +892,40 @@ def test_without_javascript_a_members_new_answer_is_reported_not_ignored(
                  page=old_page, dirty=[])
     assert _rsvp(evt, joe).votes == {opt.option_id: "yes"}
     assert "error=" in resp["headers"]["Location"]
+
+
+# ---- the summary at the top of the event page ------------------------------
+
+def test_summary_counts_members_by_reply_and_people_by_household(
+        ddb_table, outbox) -> None:
+    """Four members: a couple both coming (one of them bringing two guests),
+    one maybe, and the organizer unanswered."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    _mark(cid, app, aa, aa_mem, evt,
+          {bob.user_id: "yes", sue.user_id: "yes", joe.user_id: "maybe"},
+          sizes={bob.user_id: 4})
+    body = _results(cid, app, aa, aa_mem, evt)
+    for part in ("Coming 2</b>", "Maybe 1</b>", "Not coming 0</b>",
+                 "No answer 1</a>"):
+        assert part in body
+    assert "Expecting 4 people, up to 5 if the maybe comes" in body
+    assert "id='no-answer'" in body and "Expected headcount" not in body
+    # It is the first thing after the date banner, above the table.
+    assert body.index("Coming 2</b>") < body.index("id='roster-form'")
+
+
+def test_summary_on_a_one_date_invitation_and_not_on_a_several_date_poll(
+        ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, o1 = _mk_event(cid)
+    _mark(cid, app, aa, aa_mem, evt, {joe.user_id: {o1.option_id: "yes"},
+                                      bob.user_id: {o1.option_id: "no"}})
+    body = _results(cid, app, aa, aa_mem, evt)
+    assert "Coming 1</b>" in body and "Not coming 1</b>" in body
+    assert "No answer 2</a>" in body
+    o2 = _add_option(cid, evt, "2026-08-22")
+    body = _results(cid, app, aa, aa_mem, evt)
+    assert "<b>Answered 2 of 4</b>" in body
+    assert "Coming 1</b>" not in body and "Expected headcount" in body

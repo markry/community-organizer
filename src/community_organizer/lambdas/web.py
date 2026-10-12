@@ -2301,7 +2301,15 @@ def _flexible_home(*, event: dict, user: User, community: Community | None,
             line = f"<b>{html.escape(e.title)}</b> &middot; {html.escape(when)}"
             if e.location:
                 line += f" &middot; {html.escape(e.location)}"
-            line += f" &middot; {n_attending(e.event_id)} attending"
+            _s = _flex_reply_summary(
+                e, list(db.list_flexible_poll_options(app.app_id, e.event_id)),
+                [m.user_id for m in memberships],
+                list(db.list_flexible_rsvps(app.app_id, e.event_id)), users)
+            line += (f" &middot; {_s['yes']} coming"
+                     + (f" ({_s['people']} people)"
+                        if _s["people"] != _s["yes"] else "")
+                     + (f" &middot; {_s['maybe']} maybe" if _s["maybe"] else "")
+                     + (f" &middot; {_s['no']} not coming" if _s["no"] else ""))
             if is_admin and e.host_user_id and e.host_user_id in users:
                 h = users[e.host_user_id]
                 line += f" &middot; host: {html.escape(h.name or h.email)}"
@@ -2977,6 +2985,22 @@ def _flex_event_results_page(event: dict, user: User,
             + (f"<ul style='padding-left:18px'>{host_rows}</ul>"
                if host_rows else ""))
 
+    # Where things stand, first thing on the page. With one date to be coming
+    # to: members by reply, and the number of people that means. On a poll
+    # with several dates there is no single "coming", so just how many have
+    # answered.
+    summary = _flex_reply_summary(evt, options, [m.user_id for m in members],
+                                  rsvps, users)
+    if summary is not None:
+        summary_html = _flex_summary_html(summary, len(opted_out_ids))
+    elif evt.state == "poll" and options:
+        _member_ids = {m.user_id for m in members}
+        _answered = sum(1 for r in rsvps if r.user_id in _member_ids)
+        summary_html = ("<p style='font-size:1.08em;margin:12px 0'>"
+                        f"<b>Answered {_answered} of {len(members)}</b></p>")
+    else:
+        summary_html = ""
+
     # Replies table. Answers also arrive by text, by phone and in person, so
     # the AA can record them here — one column per candidate date while the
     # poll is open, a single coming / not coming once the date is set. People
@@ -3061,10 +3085,10 @@ def _flex_event_results_page(event: dict, user: User,
                 + (" disabled" if locked else "")
                 + " style='padding:3px;width:56px;text-align:center'></td></tr>"))
 
-        def _section(label: str, rows: list[tuple]) -> str:
+        def _section(label: str, rows: list[tuple], anchor: str = "") -> str:
             if not rows:
                 return ""
-            return (f"<tr><td colspan='{len(_cols) + 2}' style='padding:10px 8px "
+            return (f"<tr{anchor}><td colspan='{len(_cols) + 2}' style='padding:10px 8px "
                     "4px;font-weight:600;color:#555;border-top:1px solid #ddd'>"
                     f"{label} ({len(rows)})</td></tr>"
                     + "".join(h for _, _, h in sorted(rows, key=lambda t: t[:2])))
@@ -3104,7 +3128,8 @@ def _flex_event_results_page(event: dict, user: User,
             + _section("Member direct feedback", groups["member"])
             + _note_row
             + _section("Admin-created status", groups["aa"])
-            + _section("Haven't answered", groups["none"])
+            + _section("Haven't answered", groups["none"],
+                       anchor=" id='no-answer'")
             + "</tbody></table></div>"
             # Every change saves itself (script below), so there is no Save
             # button to press — only a fallback for a browser without
@@ -3172,6 +3197,7 @@ def _flex_event_results_page(event: dict, user: User,
         f"<p style='color:#666;margin-top:-6px'>{html.escape(app.name)}</p>"
         + _flash_banner_html(event)
         + state_banner
+        + summary_html
         + (msg_html if evt.state == "poll"
            else (f"<p>{html.escape(evt.description)}</p>" if evt.description else ""))
         + (send_html if evt.state == "poll" else "")
@@ -3201,14 +3227,17 @@ def _flex_event_results_page(event: dict, user: User,
             "<button type='submit' style='padding:5px 12px;cursor:pointer'>"
             "+ Add date</button></form>")
            if evt.state == "poll" else "")
-        + f"<p style='margin-top:14px'><b>Expected headcount:</b> "
-          f"{total_headcount} "
-          "<span style='color:#888;font-size:0.9em'>(household-deduped)</span>"
-          + (f" &middot; <b>Maybe:</b> {maybe_ct}" if maybe_ct else "")
-          + (f" &middot; <b>Declined:</b> {len(declined)}" if declined else "")
-          + (f" &middot; <b>Opted out of the group:</b> {len(opted_out_ids)}"
-             if opted_out_ids else "")
-        + "</p>"
+        # With one date to be coming to, the summary at the top says all of
+        # this; the old line stays only for a poll with several dates.
+        + ("" if summary is not None else
+           f"<p style='margin-top:14px'><b>Expected headcount:</b> "
+           f"{total_headcount} "
+           "<span style='color:#888;font-size:0.9em'>(household-deduped)</span>"
+           + (f" &middot; <b>Maybe:</b> {maybe_ct}" if maybe_ct else "")
+           + (f" &middot; <b>Declined:</b> {len(declined)}" if declined else "")
+           + (f" &middot; <b>Opted out of the group:</b> {len(opted_out_ids)}"
+              if opted_out_ids else "")
+           + "</p>")
         + ("<h2 style='font-size:1.05em;margin-top:14px'>Bringing</h2>"
            f"<ul>{bringing_rows}</ul>" if bringing_rows else "")
         + ("" if evt.adopted else roster_html)
@@ -3286,6 +3315,74 @@ def _flex_rsvp_origin(evt: FlexibleEvent, rsvp: FlexibleRSVP | None) -> str:
     if rsvp is None:
         return "none"
     return "aa" if (rsvp.marked_by or evt.adopted) else "member"
+
+
+def _flex_reply_summary(evt: FlexibleEvent, options: list, member_ids: list,
+                        rsvps: list, users: dict) -> dict | None:
+    """Where an event stands, for the line at the top of its page: how many
+    MEMBERS are coming / maybe / not coming / unanswered, and how many PEOPLE
+    that means once households and guests are counted.
+
+    ``people`` is the firm number (definite yeses); ``people_max`` adds the
+    maybes. Each household counts once, at the largest number any of its
+    members gave; someone who gave no number counts as one.
+
+    None while there is no single date to be coming to (a poll with several
+    candidate dates): the per-date tallies say more there.
+    """
+    if evt.state == "scheduled":
+        opt = _flex_roster_option(evt, options)
+
+        def answer(r: FlexibleRSVP) -> str | None:
+            return _flex_roster_answer(evt, r, opt)
+    elif evt.state == "poll" and len(options) == 1:
+        only = options[0].option_id
+
+        def answer(r: FlexibleRSVP) -> str | None:
+            vote = r.votes.get(only)
+            if r.confirmed_response == "no" or vote == "no":
+                return "no"
+            return vote if vote in ("yes", "maybe") else None
+    else:
+        return None
+    by_user = {r.user_id: r for r in rsvps}
+    out = {"yes": 0, "maybe": 0, "no": 0, "none": 0}
+    firm: dict[str, int] = {}
+    upto: dict[str, int] = {}
+    for uid in member_ids:
+        r = by_user.get(uid)
+        a = answer(r) if r is not None else None
+        out[a or "none"] += 1
+        if a in ("yes", "maybe"):
+            k = _hh_key(users, uid)
+            n = r.party_size or 1
+            upto[k] = max(upto.get(k, 0), n)
+            if a == "yes":
+                firm[k] = max(firm.get(k, 0), n)
+    out["people"] = sum(firm.values())
+    out["people_max"] = sum(upto.values())
+    return out
+
+
+def _flex_summary_html(summary: dict, opted_out: int = 0) -> str:
+    """The two-line status at the top of an event's page."""
+    def people(n: int) -> str:
+        return f"{n} " + ("person" if n == 1 else "people")
+    expecting = f"Expecting {people(summary['people'])}"
+    if summary["people_max"] > summary["people"]:
+        expecting += (f", up to {summary['people_max']} if the "
+                      + ("maybe comes" if summary["maybe"] == 1
+                         else "maybes come"))
+    return (
+        "<p style='font-size:1.08em;margin:12px 0 2px'>"
+        f"<b style='color:#2a7'>Coming {summary['yes']}</b> &middot; "
+        f"<b style='color:#b8860b'>Maybe {summary['maybe']}</b> &middot; "
+        f"<b style='color:#c33'>Not coming {summary['no']}</b> &middot; "
+        f"<a href='#no-answer' style='color:#888'>No answer "
+        f"{summary['none']}</a></p>"
+        f"<p style='color:#555;margin:0 0 12px'>{expecting}"
+        + (f" &middot; {opted_out} opted out of the group" if opted_out else "")
+        + "</p>")
 
 
 def _api_flex_event_save_attendance(event: dict, user: User,

@@ -186,7 +186,7 @@ def test_atomic_signup_under_capacity_succeeds(ddb_table) -> None:
     assert asg.user_id == "u1"
     # Verify the counter is now 1.
     fresh = next(db.list_slots(slot.app_id, slot.yyyy_mm))
-    assert fresh.assignment_count == 1
+    assert db.get_slot_count(slot.app_id, slot.yyyy_mm, slot.slot_id) == 1
     # Verify the assignment row exists.
     assigns = list(db.list_assignments_for_slot(
         slot.app_id, slot.yyyy_mm, slot.slot_id))
@@ -205,7 +205,7 @@ def test_atomic_signup_at_capacity_raises(ddb_table) -> None:
         db.atomic_signup_assignment(slot, user_id="u3", community_id="c1")
 
     fresh = next(db.list_slots(slot.app_id, slot.yyyy_mm))
-    assert fresh.assignment_count == 2     # NOT bumped past max
+    assert db.get_slot_count(slot.app_id, slot.yyyy_mm, slot.slot_id) == 2     # NOT bumped past max
     assigns = list(db.list_assignments_for_slot(
         slot.app_id, slot.yyyy_mm, slot.slot_id))
     assert len(assigns) == 2               # u3 NOT written
@@ -220,7 +220,7 @@ def test_atomic_signup_with_uncapped_slot_never_raises(ddb_table) -> None:
         db.atomic_signup_assignment(
             slot, user_id=f"u{i}", community_id="c1")
     fresh = next(db.list_slots(slot.app_id, slot.yyyy_mm))
-    assert fresh.assignment_count == 25
+    assert db.get_slot_count(slot.app_id, slot.yyyy_mm, slot.slot_id) == 25
     assigns = list(db.list_assignments_for_slot(
         slot.app_id, slot.yyyy_mm, slot.slot_id))
     assert len(assigns) == 25
@@ -236,7 +236,7 @@ def test_delete_assignment_decrements_counter(ddb_table) -> None:
     db.delete_assignment(slot.app_id, slot.yyyy_mm, slot.slot_id, "u1")
 
     fresh = next(db.list_slots(slot.app_id, slot.yyyy_mm))
-    assert fresh.assignment_count == 1
+    assert db.get_slot_count(slot.app_id, slot.yyyy_mm, slot.slot_id) == 1
     # New signup should now succeed where it previously raised.
     db.atomic_signup_assignment(slot, user_id="u3", community_id="c1")
 
@@ -348,7 +348,7 @@ def test_atomic_signup_idempotent_on_duplicate(ddb_table) -> None:
         db.atomic_signup_assignment(slot, user_id="u1", community_id="c1")
 
     fresh = next(db.list_slots(slot.app_id, slot.yyyy_mm))
-    assert fresh.assignment_count == 1     # not 2
+    assert db.get_slot_count(slot.app_id, slot.yyyy_mm, slot.slot_id) == 1     # not 2
 
 
 # ---- CRUD round-trip ------------------------------------------------------

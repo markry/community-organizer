@@ -794,7 +794,8 @@ def _reminder_id(slot_id: str, user_id: str, lead: int) -> str:
 
 
 def _reminders_for(community: Community, app: Application, yyyy_mm: str,
-                   slot: Slot, user: User) -> list[Notification]:
+                   slot: Slot, user: User, *,
+                   include_past: bool = False) -> list[Notification]:
     """The reminders one member is owed for one slot, as of now: one per lead
     time whose moment has not passed. Empty when they get none — reminders
     off, undeliverable, the slot cancelled or its template opted out being
@@ -810,7 +811,7 @@ def _reminders_for(community: Community, app: Application, yyyy_mm: str,
     for lead in effective_lead_times(user):
         send_at_utc = (arrival - dt.timedelta(minutes=lead)).astimezone(
             dt.timezone.utc)
-        if send_at_utc <= now:
+        if send_at_utc <= now and not include_past:
             continue
         out.append(Notification(
             community_id=community.community_id,
@@ -821,53 +822,114 @@ def _reminders_for(community: Community, app: Application, yyyy_mm: str,
             send_at=send_at_utc.isoformat(timespec="seconds"),
             lead_minutes=lead,
             notification_id=_reminder_id(slot.slot_id, user.user_id, lead),
+            event_at=arrival_time_utc(community, app, slot).isoformat(
+                timespec="seconds"),
         ))
     return out
 
 
-def _gets_reminders(app: Application, slot: Slot | None,
-                    user: User | None) -> bool:
-    """Whether this member is sent reminders for this slot at all."""
-    if not slot or slot.cancelled:
-        return False
-    if not user or user.email_undeliverable or user.channel == "none":
-        return False
-    tpl = next((t for t in db.list_templates(app.app_id)
-                if t.template_id == slot.template_id), None)
-    return tpl is None or tpl.auto_reminders
+def arrival_time_utc(community: Community, app: Application,
+                     slot: Slot) -> dt.datetime:
+    """When a member is due at a slot, in UTC: its start, less the arrival
+    offset, in the app's time zone. This is the moment after which a reminder
+    is pointless. Computed from the slot itself — adding the lead time back
+    onto a reminder's send time is an hour out across a clock change."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(app.default_timezone or community.default_timezone)
+    h, m = (int(x) for x in slot.start_time.split(":"))
+    y, mo, d = (int(x) for x in slot.local_date.split("-"))
+    return (dt.datetime(y, mo, d, h, m, tzinfo=tz) - dt.timedelta(
+        minutes=slot.arrival_offset_minutes)).astimezone(dt.timezone.utc)
 
 
-def queue_reminders_for_assignment(community: Community, app: Application,
-                                   yyyy_mm: str, slot: Slot,
-                                   user: User) -> int:
-    """Queue reminders for ONE assignment made after its month was published
-    (a late sign-up, a place taken over, an admin adding someone). Publishing
-    only queues reminders for the assignments that exist at that moment, so
-    without this anyone joining afterwards was never reminded.
+def reconcile_reminders(community: Community, app: Application,
+                        yyyy_mm: str) -> dict:
+    """Make a published month's queued reminders match its assignments, as
+    they stand right now. Returns counts of what it did.
 
-    Safe to call more than once for the same assignment: the ids are fixed,
-    so a repeat rewrites the same rows. Returns how many were queued."""
-    if not _gets_reminders(app, slot, user):
-        return 0
-    ntfs = _reminders_for(community, app, yyyy_mm, slot, user)
-    if ntfs:
-        db.put_notifications(ntfs)
-    return len(ntfs)
+    Level-triggered on purpose. It does not need to have seen any particular
+    change happen — a late sign-up, a release, a swap, an admin edit, a
+    member changing their reminder settings, a slot moved to another time —
+    only the current state. So it is safe to run on every assignment change
+    AND on a timer, and a change whose notification was lost or failed is
+    simply picked up by the next run.
 
+    For each (slot, member, lead time):
 
-def cancel_reminders_for_assignment(app_id: str, yyyy_mm: str, slot_id: str,
-                                    user_id: str) -> int:
-    """Cancel the still-pending reminders for an assignment that has gone
-    (released, traded away, removed). The notifier also re-checks at send
-    time, so this is tidiness plus one guarantee: if the member takes the
-    slot again, the reminders queued then are not shadowed by stale ones."""
-    n = 0
-    for ntf in db.list_notifications_for_slot_user(app_id, slot_id, user_id):
-        if ntf.state == "pending" and ntf.yyyy_mm == yyyy_mm:
-            ntf.state = "cancelled"
-            db.put_notification(ntf)
-            n += 1
-    return n
+      * owed and nothing live or already delivered -> queue it;
+      * no longer owed (assignment gone, reminders turned off, slot
+        cancelled) -> cancel what is still pending;
+      * more than one live row -> keep one, cancel the pending extras.
+
+    It never touches a row a run has claimed, and never re-queues a reminder
+    that has already been delivered or given up on. Rows queued before
+    reminder ids became deterministic are recognized by what they are for,
+    not by their id, so they are neither duplicated nor disturbed.
+    """
+    slots = {s.slot_id: s for s in db.list_slots(app.app_id, yyyy_mm)}
+    users = {u.user_id: u for u in db.list_users(community.community_id)}
+    templates = {t.template_id: t for t in db.list_templates(app.app_id)}
+
+    # `entitled`: every reminder this month's assignments call for, including
+    # ones whose moment has passed. `owed`: the subset still in the future,
+    # which is all that can be newly queued. The difference matters: a
+    # reminder that has just come due and is waiting for the poll (or being
+    # retried) is no longer "owed" but must NOT be cancelled.
+    entitled: set[tuple] = set()
+    owed: dict[tuple, Notification] = {}
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    for a in db.list_assignments_for_month(app.app_id, yyyy_mm):
+        slot = slots.get(a.slot_id)
+        user = users.get(a.user_id)
+        if not slot or slot.cancelled:
+            continue
+        tpl = templates.get(slot.template_id)
+        if tpl is not None and not tpl.auto_reminders:
+            continue
+        if not user or user.email_undeliverable or user.channel == "none":
+            continue
+        for ntf in _reminders_for(community, app, yyyy_mm, slot, user,
+                                  include_past=True):
+            key = (ntf.slot_id, ntf.user_id, ntf.lead_minutes)
+            entitled.add(key)
+            if ntf.send_at > now_iso:
+                owed[key] = ntf
+
+    existing: dict[tuple, list[Notification]] = {}
+    for ntf in db.list_notifications_for_month(app.app_id, yyyy_mm):
+        if ntf.source != "slot":
+            continue
+        existing.setdefault(
+            (ntf.slot_id, ntf.user_id, ntf.lead_minutes), []).append(ntf)
+
+    queued = cancelled = 0
+    for key, rows in existing.items():
+        want = owed.get(key)
+        claimed = [r for r in rows if r.state == "in_flight"]
+        pending = [r for r in rows if r.state == "pending"]
+        settled = [r for r in rows if r.state in ("sent", "failed")]
+        if key not in entitled:
+            surplus = pending                 # assignment gone / reminders off
+        elif want is None:
+            surplus = []                      # due or overdue: the poll's job
+        elif claimed or settled:
+            surplus = pending                 # being sent, or already dealt with
+        else:
+            keep = next((r for r in pending if r.send_at == want.send_at), None)
+            surplus = [r for r in pending if r is not keep]
+            if keep is None:
+                pending = []                  # wrong time (slot moved): requeue
+        for r in surplus:
+            cancelled += db.cancel_pending_notification(r)
+        if want is not None and (claimed or settled
+                                 or any(r not in surplus for r in pending)):
+            del owed[key]
+    for ntf in owed.values():
+        # A row cancelled earlier under this same key (released, then taken
+        # again) is brought back rather than left shadowing the new one.
+        queued += (db.create_notification(ntf)
+                   or db.revive_cancelled_notification(ntf))
+    return {"queued": queued, "cancelled": cancelled}
 
 
 def _materialize_reminders(community: Community, app: Application,

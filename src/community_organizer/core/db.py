@@ -63,6 +63,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import os
+import uuid
 from decimal import Decimal
 from typing import Any, Iterator
 
@@ -738,7 +739,11 @@ def get_membership(app_id: str, user_id: str) -> Membership | None:
 
 
 def delete_membership(app_id: str, user_id: str) -> None:
+    """End a membership — by whichever screen or path — and with it every
+    event link the member holds for the app. Doing the revoke here, not in
+    each caller, is what keeps a later re-add from reviving old links."""
     _table().delete_item(Key={"PK": _app_pk(app_id), "SK": _member_sk(user_id)})
+    revoke_event_tokens_for_user(app_id, user_id)
 
 
 def list_memberships_for_app(app_id: str) -> Iterator[Membership]:
@@ -1707,40 +1712,27 @@ def put_notifications(ntfs: list[Notification]) -> None:
             batch.put_item(Item=item)
 
 
-def claim_notification(notification_id: str, app_id: str, send_at: str) -> bool:
-    """Atomically transition a Notification from ``pending`` -> ``in_flight``.
+def claim_notification_row(notification_id: str, app_id: str,
+                           send_at: str) -> Notification | None:
+    """Atomically move a Notification ``pending`` -> ``in_flight`` and return
+    it AS STORED, stamped with a fresh ``claim_id``. None if the claim lost
+    (already claimed, sent or cancelled).
 
-    The notifier Lambda calls this BEFORE sending a reminder email.
-    If the conditional fails (state isn't ``pending`` anymore — already
-    claimed by a concurrent invocation, or already sent / cancelled),
-    return False and the caller skips this notification.
+    The caller must work from the returned row, not from whatever copy led it
+    here: a listing can be a poll out of date, and that copy would not show
+    a channel an earlier attempt already delivered. The ``claim_id`` is what
+    ``settle_notification`` checks, so only the run holding this claim can
+    record its outcome.
 
-    Why: without the claim, a Lambda timeout in the middle of a batch
-    causes the next minute's invocation to re-send already-delivered
-    reminders. The claim is the idempotency token — at most one
-    invocation can successfully transition pending -> in_flight.
-
-    Also updates GSI1PK so the row moves out of the ``STATE#pending``
-    partition, hiding it from subsequent ``list_pending_notifications``
-    queries.
-
-    Returns:
-        True if we won the claim (state was pending, now in_flight).
-        False if the conditional failed — someone else got it, or the
-        row was already past pending.
-
-    See security fix D13. Limitation: a Lambda that crashes between
-    claim and send leaves the row stuck in ``in_flight``. Manual
-    recovery (admin tool) is the current escape; a future watchdog
-    that re-claims old in_flight rows would automate this.
+    At most one caller wins a given pending row (security fix D13).
     """
     from botocore.exceptions import ClientError
     try:
-        _table().update_item(
+        resp = _table().update_item(
             Key={"PK": _app_pk(app_id),
                  "SK": _ntf_sk(send_at, notification_id)},
             UpdateExpression=("SET #s = :inflight, GSI1PK = :gsi, "
-                              "claimed_at = :now"),
+                              "claimed_at = :now, claim_id = :cid"),
             ConditionExpression="#s = :expected",
             ExpressionAttributeNames={"#s": "state"},
             ExpressionAttributeValues={
@@ -1749,6 +1741,48 @@ def claim_notification(notification_id: str, app_id: str, send_at: str) -> bool:
                 ":gsi": "STATE#in_flight",
                 ":now": dt.datetime.now(dt.timezone.utc).isoformat(
                     timespec="seconds"),
+                ":cid": uuid.uuid4().hex,
+            },
+            ReturnValues="ALL_NEW",
+        )
+    except ClientError as e:
+        if (e.response.get("Error", {}).get("Code")
+                == "ConditionalCheckFailedException"):
+            return None
+        raise
+    return _hydrate(Notification, _strip_keys(resp["Attributes"]))
+
+
+def claim_notification(notification_id: str, app_id: str, send_at: str) -> bool:
+    """True if this call won the claim. Prefer ``claim_notification_row``,
+    which also hands back the current row."""
+    return claim_notification_row(notification_id, app_id, send_at) is not None
+
+
+def settle_notification(ntf: Notification) -> bool:
+    """Record the outcome of a claimed notification: write ``ntf``'s state and
+    delivery progress, but ONLY if the stored row is still in_flight under
+    this same claim. Returns False (and changes nothing) otherwise — the
+    claim was recovered and taken by another run, or the row was cancelled.
+    """
+    from botocore.exceptions import ClientError
+    try:
+        _table().update_item(
+            Key={"PK": _app_pk(ntf.app_id),
+                 "SK": _ntf_sk(ntf.send_at, ntf.notification_id)},
+            UpdateExpression=(
+                "SET #s = :state, GSI1PK = :gsi, attempts = :attempts, "
+                "email_done = :ed, sms_done = :sd, email_id = :eid, "
+                "sent_at = :sent, event_at = :ev "
+                "REMOVE claim_id, claimed_at"),
+            ConditionExpression="#s = :inflight AND claim_id = :cid",
+            ExpressionAttributeNames={"#s": "state"},
+            ExpressionAttributeValues={
+                ":state": ntf.state, ":gsi": f"STATE#{ntf.state}",
+                ":attempts": ntf.attempts or 0, ":ed": bool(ntf.email_done),
+                ":sd": bool(ntf.sms_done), ":eid": ntf.email_id,
+                ":sent": ntf.sent_at, ":ev": ntf.event_at,
+                ":inflight": "in_flight", ":cid": ntf.claim_id,
             },
         )
         return True
@@ -1757,6 +1791,88 @@ def claim_notification(notification_id: str, app_id: str, send_at: str) -> bool:
                 == "ConditionalCheckFailedException"):
             return False
         raise
+
+
+def cancel_pending_notification(ntf: Notification) -> bool:
+    """Cancel a notification only if it is still ``pending``. One that a run
+    has claimed, or that has already gone, is left exactly as it is."""
+    from botocore.exceptions import ClientError
+    try:
+        _table().update_item(
+            Key={"PK": _app_pk(ntf.app_id),
+                 "SK": _ntf_sk(ntf.send_at, ntf.notification_id)},
+            UpdateExpression="SET #s = :cancelled, GSI1PK = :gsi",
+            ConditionExpression="#s = :pending",
+            ExpressionAttributeNames={"#s": "state"},
+            ExpressionAttributeValues={
+                ":cancelled": "cancelled", ":gsi": "STATE#cancelled",
+                ":pending": "pending"},
+        )
+        return True
+    except ClientError as e:
+        if (e.response.get("Error", {}).get("Code")
+                == "ConditionalCheckFailedException"):
+            return False
+        raise
+
+
+def create_notification(ntf: Notification) -> bool:
+    """Queue a notification only if no row exists under its key. Never
+    overwrites — a row already there may have been sent or be mid-send."""
+    from botocore.exceptions import ClientError
+    item = dataclasses.asdict(ntf) | {
+        "PK": _app_pk(ntf.app_id),
+        "SK": _ntf_sk(ntf.send_at, ntf.notification_id),
+        "GSI1PK": f"STATE#{ntf.state}",
+        "GSI1SK": ntf.send_at,
+    }
+    try:
+        _table().put_item(Item=item,
+                          ConditionExpression="attribute_not_exists(SK)")
+        return True
+    except ClientError as e:
+        if (e.response.get("Error", {}).get("Code")
+                == "ConditionalCheckFailedException"):
+            return False
+        raise
+
+
+def revive_cancelled_notification(ntf: Notification) -> bool:
+    """Put a CANCELLED notification back to pending with a clean slate. Only
+    a cancelled row: one that was sent, failed or is mid-send is left alone."""
+    from botocore.exceptions import ClientError
+    try:
+        _table().update_item(
+            Key={"PK": _app_pk(ntf.app_id),
+                 "SK": _ntf_sk(ntf.send_at, ntf.notification_id)},
+            UpdateExpression=(
+                "SET #s = :pending, GSI1PK = :gsi, attempts = :zero, "
+                "email_done = :no, sms_done = :no, event_at = :ev "
+                "REMOVE claim_id, claimed_at"),
+            ConditionExpression="#s = :cancelled",
+            ExpressionAttributeNames={"#s": "state"},
+            ExpressionAttributeValues={
+                ":pending": "pending", ":gsi": "STATE#pending",
+                ":cancelled": "cancelled", ":zero": 0, ":no": False,
+                ":ev": ntf.event_at},
+        )
+        return True
+    except ClientError as e:
+        if (e.response.get("Error", {}).get("Code")
+                == "ConditionalCheckFailedException"):
+            return False
+        raise
+
+
+def list_notifications_for_month(app_id: str,
+                                 yyyy_mm: str) -> Iterator[Notification]:
+    """Every notification queued for one month of one app, any state."""
+    for item in _paginate_query(
+        KeyConditionExpression=Key("PK").eq(_app_pk(app_id))
+        & Key("SK").begins_with("NTF#"),
+        FilterExpression=Attr("yyyy_mm").eq(yyyy_mm),
+    ):
+        yield _hydrate(Notification, _strip_keys(item))
 
 
 def list_notifications_for_slot_user(app_id: str, slot_id: str,
@@ -1790,14 +1906,17 @@ def release_stale_claim(ntf: Notification) -> bool:
         _table().update_item(
             Key={"PK": _app_pk(ntf.app_id),
                  "SK": _ntf_sk(ntf.send_at, ntf.notification_id)},
-            UpdateExpression="SET #s = :pending, GSI1PK = :gsi",
+            # Dropping claim_id is what fences the dead run out: should it
+            # turn out to be alive after all, its settle no longer matches.
+            UpdateExpression=("SET #s = :pending, GSI1PK = :gsi "
+                              "REMOVE claim_id, claimed_at"),
             ConditionExpression=("#s = :inflight AND "
-                                 "(attribute_not_exists(claimed_at) "
-                                 "OR claimed_at = :claimed)"),
+                                 "(attribute_not_exists(claim_id) "
+                                 "OR claim_id = :cid)"),
             ExpressionAttributeNames={"#s": "state"},
             ExpressionAttributeValues={
                 ":pending": "pending", ":inflight": "in_flight",
-                ":gsi": "STATE#pending", ":claimed": ntf.claimed_at,
+                ":gsi": "STATE#pending", ":cid": ntf.claim_id,
             },
         )
         return True

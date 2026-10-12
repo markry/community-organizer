@@ -535,3 +535,25 @@ def test_sign_in_is_not_linked_when_two_accounts_share_the_address(
     assert resp["statusCode"] == 403 and calls == []
     assert all(u.cognito_sub is None
                for u in db.list_users_by_email(CID, "shared@example.com"))
+
+
+def test_every_way_of_ending_a_membership_revokes_the_links(world) -> None:
+    """The revoke lives in db.delete_membership, so the membership toggle and
+    the community-admin removal cannot forget it: adding the member back
+    must not bring an old link back to life."""
+    import datetime as dt
+    from community_organizer.core.models import EventToken
+    add, _request = world
+    db.put_application(Application(community_id=CID, name="Club",
+                                   app_type="flexible_event", app_id="club"))
+    m = add("guest", apps=("club",))
+    db.put_event_token(EventToken(
+        community_id=CID, app_id="club", event_id="e1", user_id=m.user_id,
+        token="tok2",
+        expires_at=dt.datetime(2099, 1, 1, tzinfo=dt.timezone.utc).isoformat()))
+    assert web._resolve_token("tok2") is not None
+    db.delete_membership("club", m.user_id)        # what every path calls
+    assert web._resolve_token("tok2") is None
+    db.put_membership(Membership(community_id=CID, app_id="club",
+                                 user_id=m.user_id))
+    assert web._resolve_token("tok2") is None

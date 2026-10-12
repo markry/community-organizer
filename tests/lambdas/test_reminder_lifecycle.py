@@ -54,6 +54,9 @@ def world(ddb_table, monkeypatch):
     """A coverage app with one slot three days out, in a published month."""
     monkeypatch.setattr(notifier, "COMMUNITY_ID", CID, raising=False)
     monkeypatch.setattr(notifier, "_get_sms", lambda: None)
+    # The periodic sweep runs on wall-clock minutes; keep it out of tests
+    # that are not about it.
+    monkeypatch.setattr(notifier, "_RECONCILE_EVERY_MIN", 61)
     community = Community(community_id=CID, name="Parish",
                           default_timezone="UTC")
     db.put_community(community)
@@ -114,7 +117,7 @@ def _reminders(slot: Slot, user_id: str) -> list[Notification]:
                   key=lambda n: n.lead_minutes)
 
 
-def _due(slot: Slot, user_id: str, lead: int = 60) -> Notification:
+def _due(slot: Slot, user_id: str, lead: int = 120) -> Notification:
     """A reminder for `user_id` that came due a minute ago."""
     ntf = Notification(
         community_id=CID, app_id=APP, user_id=user_id, slot_id=slot.slot_id,
@@ -188,9 +191,15 @@ def test_nothing_is_sent_once_the_event_has_started(world, monkeypatch) -> None:
     monkeypatch.setattr(notifier, "_get_provider", lambda: mail)
     ntf = Notification(
         community_id=CID, app_id=APP, user_id="ann", slot_id=slot.slot_id,
-        yyyy_mm=slot.yyyy_mm, lead_minutes=60,
-        send_at=_utc(hours=-2).isoformat(timespec="seconds"))
+        yyyy_mm=slot.yyyy_mm, lead_minutes=120,
+        send_at=_utc(hours=-2).isoformat(timespec="seconds"),
+        event_at=_utc(hours=-1).isoformat(timespec="seconds"))
     db.put_notification(ntf)
+    # The slot itself is what says when the event is: move it into the past.
+    past = _utc(hours=-1)
+    slot.local_date = past.strftime("%Y-%m-%d")
+    slot.start_time = past.strftime("%H:%M")
+    db.put_slot(slot)
     assert notifier._handle_scheduled()["sent"] == 0
     assert mail.calls == [] and _stored(ntf).state == "cancelled"
 
@@ -393,3 +402,240 @@ def test_settings_page_shows_reminders_off_as_off(world) -> None:
                               db.get_membership(APP, "quiet"))["body"]
     boxes = body.split("name='lead'")[1:]
     assert boxes and not any(" checked" in b.split(">")[0] for b in boxes)
+
+
+# ---- second review round ----------------------------------------------------
+
+def test_overlapping_polls_do_not_resend_a_delivered_channel(
+        world, monkeypatch) -> None:
+    """Two polls both list the same pending reminder. The first delivers the
+    email but not the text, and puts it back to pending. The second then
+    claims it — holding a listing from before any of that. It must work from
+    the stored row, which says the email has gone."""
+    _c, _a, slot, member = world
+    u = member("ann", channel="both"); u.phone = "+15555550100"
+    db.put_user(u); _assign(slot, "ann")
+    mail = _Mail()
+    texts = []
+    monkeypatch.setattr(notifier, "_get_provider", lambda: mail)
+    monkeypatch.setattr(notifier, "_channels_for", lambda _u: (True, True))
+    monkeypatch.setattr(notifier, "_send_sms_reminder",
+                        lambda *a, **k: (texts.append(1), False)[1])
+    ntf = _due(slot, "ann")
+    stale_listing = list(db.list_pending_notifications(
+        up_to=_utc().isoformat(timespec="seconds")))
+    assert notifier._handle_scheduled()["sent"] == 0         # poll A
+    assert len(mail.calls) == 1 and _stored(ntf).email_done
+    # Poll B, working from the listing it took before A ran.
+    monkeypatch.setattr(db, "list_pending_notifications",
+                        lambda **_k: iter(stale_listing))
+    notifier._handle_scheduled()
+    assert len(mail.calls) == 1                              # not emailed again
+    assert len(texts) == 2                                   # text was retried
+
+
+def test_a_run_that_lost_its_claim_cannot_overwrite_the_new_owner(
+        world, monkeypatch) -> None:
+    _c, _a, slot, member = world
+    member("ann"); _assign(slot, "ann")
+    ntf = _due(slot, "ann")
+    mine = db.claim_notification_row(ntf.notification_id, APP, ntf.send_at)
+    # The claim is recovered as abandoned and taken by another run, which
+    # sends the reminder.
+    assert db.release_stale_claim(mine)
+    theirs = db.claim_notification_row(ntf.notification_id, APP, ntf.send_at)
+    theirs.state, theirs.email_done = "sent", True
+    assert db.settle_notification(theirs)
+    # The first run wakes up and tries to record its own, older view.
+    mine.state = "pending"
+    assert db.settle_notification(mine) is False
+    assert _stored(ntf).state == "sent" and _stored(ntf).email_done
+
+
+def test_a_retry_does_not_undo_a_cancellation(world, monkeypatch) -> None:
+    """Cancelled while a run holds it: the run's 'put it back to pending'
+    must not bring it back."""
+    _c, _a, slot, member = world
+    member("ann"); _assign(slot, "ann")
+    ntf = _due(slot, "ann")
+    claimed = db.claim_notification_row(ntf.notification_id, APP, ntf.send_at)
+    db._table().update_item(
+        Key={"PK": db._app_pk(APP),
+             "SK": db._ntf_sk(ntf.send_at, ntf.notification_id)},
+        UpdateExpression="SET #s = :c, GSI1PK = :g REMOVE claim_id",
+        ExpressionAttributeNames={"#s": "state"},
+        ExpressionAttributeValues={":c": "cancelled", ":g": "STATE#cancelled"})
+    notifier._retry_or_give_up(claimed)
+    assert _stored(ntf).state == "cancelled"
+
+
+def test_only_an_accepted_send_counts_as_delivered(world, monkeypatch) -> None:
+    """The provider refuses the recipient outright. That is not a delivery,
+    and retrying will not change it."""
+    _c, _a, slot, member = world
+    member("ann"); _assign(slot, "ann")
+
+    class _Refuses(_Mail):
+        def send(self, **kw):
+            row = super().send(**kw)
+            row.outcome = "rejected_allowlist"
+            return row
+    mail = _Refuses()
+    monkeypatch.setattr(notifier, "_get_provider", lambda: mail)
+    ntf = _due(slot, "ann")
+    assert notifier._handle_scheduled()["sent"] == 0
+    after = _stored(ntf)
+    assert after.state == "failed" and not after.email_done
+    assert notifier._handle_scheduled()["polled"] == 0       # not retried
+
+
+def test_the_sweep_queues_what_a_failed_stream_record_missed(
+        world, monkeypatch) -> None:
+    """Queueing reminders for a late sign-up hits a storage error. Nothing
+    may be lost: the periodic sweep finds the assignment and queues them."""
+    community, app, slot, member = world
+    monkeypatch.setattr(notifier, "_get_provider", lambda: _Mail())
+    member("ann")
+    a = _assign(slot, "ann")
+    real = publishing.reconcile_reminders
+    monkeypatch.setattr(publishing, "reconcile_reminders",
+                        lambda *_a, **_k: (_ for _ in ()).throw(
+                            RuntimeError("store unavailable")))
+    notifier._process(_stream("INSERT", a))                  # swallowed
+    assert _reminders(slot, "ann") == []
+    monkeypatch.setattr(publishing, "reconcile_reminders", real)
+    out = notifier._reconcile_published_months(_utc())
+    assert out["queued"] == 2 and len(_reminders(slot, "ann")) == 2
+
+
+def test_the_sweep_runs_from_the_poll_on_its_minute(world, monkeypatch) -> None:
+    _c, _a, slot, member = world
+    monkeypatch.setattr(notifier, "_get_provider", lambda: _Mail())
+    member("ann"); _assign(slot, "ann")
+    monkeypatch.setattr(notifier, "_RECONCILE_EVERY_MIN", 1)   # every minute
+    assert notifier._handle_scheduled()["reconciled"]["queued"] == 2
+
+
+def test_reminders_queued_before_ids_were_fixed_are_not_duplicated(
+        world, monkeypatch) -> None:
+    """A month published before this change has reminders under random ids.
+    Reconciling must recognize them for what they are, not add a second set."""
+    community, app, slot, member = world
+    member("ann"); _assign(slot, "ann")
+    fresh = publishing._reminders_for(community, app, slot.yyyy_mm, slot,
+                                      db.get_user(CID, "ann"))
+    for n in fresh:
+        n.notification_id = f"legacy-{n.lead_minutes}"      # old-style id
+        db.put_notification(n)
+    out = publishing.reconcile_reminders(community, app, slot.yyyy_mm)
+    assert out == {"queued": 0, "cancelled": 0}
+    got = _reminders(slot, "ann")
+    assert len(got) == 2 and all(n.notification_id.startswith("legacy-")
+                                 for n in got)
+
+
+def test_reconcile_leaves_a_reminder_that_has_just_come_due(
+        world, monkeypatch) -> None:
+    """Due a minute ago and waiting for the poll (or mid-retry): it is no
+    longer something to queue, but it must not be cancelled either."""
+    community, app, slot, member = world
+    member("ann"); _assign(slot, "ann")
+    # Put the slot 1h59m away, so its two-hours-before reminder came due a
+    # minute ago.
+    start = _utc(minutes=119).replace(second=0, microsecond=0)
+    soon = db.find_slot_in_month(APP, slot.yyyy_mm, slot.slot_id)
+    db._table().delete_item(Key={
+        "PK": db._app_month_pk(APP, slot.yyyy_mm),
+        "SK": db._slot_sk(soon.local_date, soon.slot_id)})
+    soon.local_date = soon.concrete_date = start.strftime("%Y-%m-%d")
+    soon.start_time = start.strftime("%H:%M")
+    soon.yyyy_mm = slot.yyyy_mm
+    db.put_slot(soon)
+    due = Notification(
+        community_id=CID, app_id=APP, user_id="ann", slot_id=slot.slot_id,
+        yyyy_mm=slot.yyyy_mm, lead_minutes=120,
+        send_at=(start - dt.timedelta(minutes=120)).isoformat(timespec="seconds"))
+    db.put_notification(due)
+    publishing.reconcile_reminders(community, app, slot.yyyy_mm)
+    assert _stored(due).state == "pending"
+
+
+def test_reconcile_does_not_requeue_what_was_already_sent(world) -> None:
+    community, app, slot, member = world
+    member("ann"); _assign(slot, "ann")
+    publishing.reconcile_reminders(community, app, slot.yyyy_mm)
+    for n in _reminders(slot, "ann"):
+        n.state = "sent"
+        db.put_notification(n)
+    assert publishing.reconcile_reminders(community, app, slot.yyyy_mm) == {
+        "queued": 0, "cancelled": 0}
+    assert {n.state for n in _reminders(slot, "ann")} == {"sent"}
+
+
+def test_turning_reminders_off_cancels_what_was_queued(world, monkeypatch) -> None:
+    community, app, slot, member = world
+    monkeypatch.setattr(notifier, "_get_provider", lambda: _Mail())
+    u = member("ann"); _assign(slot, "ann")
+    publishing.reconcile_reminders(community, app, slot.yyyy_mm)
+    assert len(_reminders(slot, "ann")) == 2
+    u.lead_times_minutes = [120]                             # drops the day-before
+    db.put_user(u)
+    publishing.reconcile_reminders(community, app, slot.yyyy_mm)
+    by_lead = {n.lead_minutes: n.state for n in _reminders(slot, "ann")}
+    assert by_lead == {120: "pending", 1440: "cancelled"}
+
+
+def test_a_reminder_the_member_has_since_turned_off_is_not_sent(
+        world, monkeypatch) -> None:
+    """Checked at send time too, for the gap before the next sweep."""
+    _c, _a, slot, member = world
+    u = member("ann"); _assign(slot, "ann")
+    mail = _Mail()
+    monkeypatch.setattr(notifier, "_get_provider", lambda: mail)
+    ntf = _due(slot, "ann", lead=120)
+    u.lead_times_minutes = []
+    db.put_user(u)
+    assert notifier._handle_scheduled()["sent"] == 0
+    assert mail.calls == [] and _stored(ntf).state == "cancelled"
+
+
+def test_moving_a_slot_moves_its_reminders(world) -> None:
+    community, app, slot, member = world
+    member("ann"); _assign(slot, "ann")
+    publishing.reconcile_reminders(community, app, slot.yyyy_mm)
+    before = {n.lead_minutes: n.send_at for n in _reminders(slot, "ann")}
+    h = (int(slot.start_time[:2]) + 1) % 24                  # an hour later
+    moved = db.find_slot_in_month(APP, slot.yyyy_mm, slot.slot_id)
+    moved.start_time = f"{h:02d}:{slot.start_time[3:]}"
+    db.put_slot(moved)
+    out = publishing.reconcile_reminders(community, app, slot.yyyy_mm)
+    assert out == {"queued": 2, "cancelled": 2}
+    live = {n.lead_minutes: n.send_at for n in _reminders(slot, "ann")
+            if n.state == "pending"}
+    assert set(live) == {120, 1440} and all(live[k] != before[k] for k in live)
+
+
+def test_event_time_is_right_across_a_clock_change(ddb_table) -> None:
+    """08:00 New York on the morning the clocks go back. A day-before
+    reminder is sent 25 real hours earlier, so adding 24 hours back onto its
+    send time lands an hour before the event actually starts."""
+    community = Community(community_id=CID, name="P",
+                          default_timezone="America/New_York")
+    app = Application(community_id=CID, name="Ushers", app_type="coverage",
+                      app_id=APP, default_timezone="America/New_York")
+    slot = Slot(community_id=CID, app_id=APP, yyyy_mm="2030-11",
+                template_id="t1", name="Usher", day_of_week=6,
+                start_time="08:00", arrival_offset_minutes=0,
+                duration_minutes=60, required_volunteers=1, min_volunteers=1,
+                concrete_date="2030-11-03", local_date="2030-11-03",
+                slot_id="s9")
+    u = User(community_id=CID, email="a@example.com", name="a", user_id="a")
+    (day_before,) = [n for n in publishing._reminders_for(
+        community, app, "2030-11", slot, u) if n.lead_minutes == 1440]
+    assert day_before.event_at == "2030-11-03T13:00:00+00:00"
+    assert notifier._event_time(day_before).isoformat() == \
+        "2030-11-03T13:00:00+00:00"
+    # The old arithmetic, for contrast: an hour early.
+    naive = (dt.datetime.fromisoformat(day_before.send_at)
+             + dt.timedelta(minutes=1440))
+    assert naive.isoformat() == "2030-11-03T12:00:00+00:00"

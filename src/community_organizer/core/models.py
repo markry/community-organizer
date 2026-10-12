@@ -451,6 +451,15 @@ class Notification:
     email_done: bool = False
     sms_done: bool = False
     claimed_at: str | None = None
+    # Identifies ONE claim. A run records an outcome only while the row still
+    # carries the id it was given when it claimed — so a run working from an
+    # out-of-date copy, or one whose claim was recovered, cannot overwrite
+    # what a later run did.
+    claim_id: str | None = None
+    # When the event itself begins (arrival time, UTC). Nothing is sent after
+    # it. Stored rather than derived from send_at + lead, which is an hour
+    # out across a daylight-saving change.
+    event_at: str | None = None
 
 
 @dataclass

@@ -11097,10 +11097,8 @@ def _api_user_remove_from_app(event: dict, user: User, community: Community | No
     if uid == user.user_id:
         return _error_redirect_or_next(event, "/admin/users",
             "You cannot remove yourself from the app. Ask another admin.")
+    # Ending the membership also revokes their event links (db.delete_membership).
     db.delete_membership(app.app_id, uid)
-    # Their event links die with the membership (the resolver also checks
-    # membership; revoking as well means a later re-add does not revive them).
-    db.revoke_event_tokens_for_user(app.app_id, uid)
     for a in db.list_assignments_for_user(uid):
         if a.app_id == app.app_id:
             db.delete_assignment(a.app_id, a.yyyy_mm, a.slot_id, a.user_id)

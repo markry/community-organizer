@@ -168,10 +168,29 @@ def _utcnow() -> dt.datetime:
 
 
 def _event_time(ntf: Notification) -> dt.datetime:
-    """When the thing being reminded about happens: reminders are queued at
-    (arrival time - lead), so it is send_at + lead."""
+    """When the thing being reminded about begins. Taken from ``event_at``
+    (set when the reminder was queued, and refreshed from the slot at send
+    time). Only rows queued before that field existed fall back to send_at +
+    lead, which is right except across a daylight-saving change."""
+    if ntf.event_at:
+        return dt.datetime.fromisoformat(ntf.event_at)
     return (dt.datetime.fromisoformat(ntf.send_at)
             + dt.timedelta(minutes=ntf.lead_minutes))
+
+
+def _settle(ntf: Notification) -> bool:
+    """Record ``ntf``'s outcome. A row claimed by a poll is written only if
+    that claim still stands (see db.settle_notification); if it does not,
+    another run has taken the reminder over and this one's view is dropped.
+    A Notification handed in without a claim (direct calls) is just saved."""
+    if not ntf.claim_id:
+        db.put_notification(ntf)
+        return True
+    if db.settle_notification(ntf):
+        return True
+    log.warning("reminder %s: claim no longer ours; outcome %s not recorded",
+                ntf.notification_id, ntf.state)
+    return False
 
 
 def _retry_deadline(ntf: Notification) -> dt.datetime:
@@ -200,19 +219,23 @@ def _handle_scheduled() -> dict:
     log.info("found %d pending notifications", len(pending))
     sent = 0
     skipped = 0
-    for ntf in pending:
+    for listed in pending:
         # Atomic claim: pending -> in_flight. If another invocation
         # already grabbed this row (or the row moved on for any
         # reason), skip — at most one send per notification
         # (security fix D13).
-        if not db.claim_notification(ntf.notification_id, ntf.app_id, ntf.send_at):
+        # Work from the row the claim returns, never the listed copy: the
+        # listing can be a poll old, and would not show a channel that an
+        # earlier attempt has already delivered.
+        ntf = db.claim_notification_row(
+            listed.notification_id, listed.app_id, listed.send_at)
+        if ntf is None:
             log.info("notification %s already claimed; skipping",
-                     ntf.notification_id)
+                     listed.notification_id)
             skipped += 1
             continue
         # We own the row now. _send_reminder settles it: sent, cancelled,
         # failed, or back to pending for the next poll to retry.
-        ntf.state = "in_flight"
         try:
             if _send_reminder(ntf):
                 sent += 1
@@ -224,8 +247,57 @@ def _handle_scheduled() -> dict:
             except Exception:
                 log.exception("could not settle reminder %s",
                               ntf.notification_id)
+    reconciled = None
+    if now_dt.minute % _RECONCILE_EVERY_MIN == 0:
+        try:
+            reconciled = _reconcile_published_months(now_dt)
+        except Exception:
+            log.exception("reminder reconcile sweep failed")
     return {"ok": True, "polled": len(pending), "sent": sent,
-            "skipped": skipped, "recovered": recovered}
+            "skipped": skipped, "recovered": recovered,
+            "reconciled": reconciled}
+
+
+# Every this-many minutes the poll also re-derives each published month's
+# reminder queue from its assignments (publishing.reconcile_reminders). The
+# stream handler does the same the moment an assignment changes; the sweep is
+# what makes that reliable — a stream record that failed, was dropped or
+# never came is caught here instead of leaving someone unreminded.
+_RECONCILE_EVERY_MIN = 10
+
+
+def _reconcile_published_months(now_dt: dt.datetime) -> dict:
+    """Reconcile reminders for every published month that is not yet over."""
+    this_month = now_dt.strftime("%Y-%m")
+    totals = {"months": 0, "queued": 0, "cancelled": 0}
+    community = db.get_community(COMMUNITY_ID) if COMMUNITY_ID else None
+    if community is None:
+        return totals
+    for app in db.list_applications(COMMUNITY_ID):
+        if app.app_type in ("standing_event", "flexible_event"):
+            continue                    # no slot reminders
+        for sch in db.list_schedules(app.app_id):
+            if sch.state != "published" or sch.yyyy_mm < this_month:
+                continue
+            out = publishing.reconcile_reminders(community, app, sch.yyyy_mm)
+            totals["months"] += 1
+            totals["queued"] += out["queued"]
+            totals["cancelled"] += out["cancelled"]
+    if totals["queued"] or totals["cancelled"]:
+        log.info("reminder reconcile: %s", totals)
+    return totals
+
+
+def _too_late(ntf: Notification) -> bool:
+    """True (and the reminder is closed) if what it is about has begun: a
+    long outage, or retries that ran out the clock. Sending now is noise."""
+    if _utcnow() < _event_time(ntf):
+        return False
+    ntf.state = "failed" if (ntf.attempts or 0) else "cancelled"
+    _settle(ntf)
+    log.warning("reminder %s dropped: event already started",
+                ntf.notification_id)
+    return True
 
 
 def _retry_or_give_up(ntf: Notification) -> None:
@@ -233,8 +305,7 @@ def _retry_or_give_up(ntf: Notification) -> None:
     ntf.attempts = (ntf.attempts or 0) + 1
     if _utcnow() < _retry_deadline(ntf):
         ntf.state = "pending"              # next poll retries what is left
-        ntf.claimed_at = None
-        db.put_notification(ntf)
+        _settle(ntf)
         log.warning("reminder %s not fully sent (attempt %d); will retry",
                     ntf.notification_id, ntf.attempts)
         return
@@ -247,7 +318,7 @@ def _retry_or_give_up(ntf: Notification) -> None:
         ntf.state = "failed"
         log.error("reminder %s FAILED after %d attempt(s); giving up",
                   ntf.notification_id, ntf.attempts)
-    db.put_notification(ntf)
+    _settle(ntf)
 
 
 def _deliver(ntf: Notification, user: User, want_email: bool, want_sms: bool,
@@ -258,14 +329,22 @@ def _deliver(ntf: Notification, user: User, want_email: bool, want_sms: bool,
     ``send_email()`` returns the provider's EmailLog; ``send_sms()`` returns
     whether the text was accepted. A channel that has already gone out is
     never sent again on a retry. The email provider reports a failed send as
-    an EmailLog with outcome "error" rather than raising, so the outcome is
-    what counts — not merely getting a log back.
+    an EmailLog with an outcome rather than raising, so the outcome is what
+    counts — not merely getting a log back. Only "accepted" is a delivery.
+    "error" is transient and retried; anything else (the provider refused
+    the recipient outright) will not improve with retrying, so that channel
+    is closed without being counted as delivered.
     """
+    refused = []
+
     def _email() -> None:
         row = send_email()
-        if row is not None and getattr(row, "outcome", None) != "error":
+        outcome = getattr(row, "outcome", None) if row is not None else None
+        if outcome == "accepted":
             ntf.email_done = True
             ntf.email_id = row.email_id
+        elif outcome is not None and outcome != "error":
+            refused.append(outcome)
 
     if want_email and not ntf.email_done:
         _email()
@@ -281,8 +360,20 @@ def _deliver(ntf: Notification, user: User, want_email: bool, want_sms: bool,
         ntf.attempts = (ntf.attempts or 0) + 1
         ntf.state = "sent"
         ntf.sent_at = _utcnow().isoformat(timespec="seconds")
-        db.put_notification(ntf)
+        _settle(ntf)
         return True
+    if refused and not (want_sms and not ntf.sms_done):
+        # Email was the only thing still owed and the provider will not take
+        # it. Retrying cannot help.
+        ntf.attempts = (ntf.attempts or 0) + 1
+        ntf.state = "sent" if ntf.sms_done else "failed"
+        if ntf.state == "sent":
+            ntf.sent_at = _utcnow().isoformat(timespec="seconds")
+        else:
+            log.error("reminder %s FAILED: email refused (%s)",
+                      ntf.notification_id, refused[0])
+        _settle(ntf)
+        return ntf.state == "sent"
     _retry_or_give_up(ntf)
     return ntf.state == "sent"
 
@@ -292,27 +383,29 @@ def _send_reminder(ntf: Notification) -> bool:
     user = db.get_user(community_id, ntf.user_id)
     if not user or user.channel == "none":
         ntf.state = "cancelled"
-        db.put_notification(ntf)
+        _settle(ntf)
         return False
     want_email, want_sms = _channels_for(user)
     if not want_email and not want_sms:
         ntf.state = "cancelled"
-        db.put_notification(ntf)
-        return False
-    if _utcnow() >= _event_time(ntf):
-        # Due before now, but the event itself has started (a long outage, or
-        # retries that ran out the clock). Too late to be of use.
-        ntf.state = "failed" if (ntf.attempts or 0) else "cancelled"
-        db.put_notification(ntf)
-        log.warning("reminder %s dropped: event already started",
-                    ntf.notification_id)
+        _settle(ntf)
         return False
     if ntf.source == "occurrence":
+        if _too_late(ntf):
+            return False
         return _send_occurrence_reminder(ntf, user, community_id)
     slot = db.find_slot_in_month(ntf.app_id, ntf.yyyy_mm, ntf.slot_id)
     if not slot or slot.cancelled:
         ntf.state = "cancelled"
-        db.put_notification(ntf)
+        _settle(ntf)
+        return False
+    # The member's settings as they are NOW decide: someone who has since
+    # turned this reminder off must not get one queued before they did.
+    if ntf.lead_minutes not in publishing.effective_lead_times(user):
+        ntf.state = "cancelled"
+        _settle(ntf)
+        log.info("reminder %s cancelled: member no longer wants a %d-minute "
+                 "reminder", ntf.notification_id, ntf.lead_minutes)
         return False
     # The user must still HOLD this slot. Release/trade/admin-removal all
     # delete the Assignment row but don't proactively cancel this pending
@@ -321,12 +414,23 @@ def _send_reminder(ntf: Notification) -> bool:
     if not any(a.user_id == ntf.user_id for a in
                db.list_assignments_for_slot(ntf.app_id, ntf.yyyy_mm, slot.slot_id)):
         ntf.state = "cancelled"
-        db.put_notification(ntf)
+        _settle(ntf)
         log.info("reminder %s cancelled: user %s no longer assigned to slot %s",
                  ntf.notification_id, ntf.user_id, slot.slot_id)
         return False
     community = db.get_community(community_id)
     app = next((a for a in db.list_applications(community_id) if a.app_id == ntf.app_id), None)
+    # The slot as it stands now says when the member is due — not the time
+    # it had when the reminder was queued.
+    if community is not None and app is not None:
+        try:
+            ntf.event_at = publishing.arrival_time_utc(
+                community, app, slot).isoformat(timespec="seconds")
+        except Exception:
+            log.exception("could not compute arrival time for slot %s",
+                          slot.slot_id)
+    if _too_late(ntf):
+        return False
     org_name = app.name if app else (community.name if community else community_id)
     event_type = app.event_noun if app else "event"
     co_names = _co_names_for_slot(community_id, ntf.app_id, ntf.yyyy_mm,
@@ -368,7 +472,7 @@ def _send_occurrence_reminder(ntf: Notification, user: User,
     occ = db.get_standing_occurrence(ntf.app_id, iso_date, ntf.slot_id)
     if occ is None or occ.state == "cancelled":
         ntf.state = "cancelled"
-        db.put_notification(ntf)
+        _settle(ntf)
         return False
     series = db.get_standing_series_for_app(ntf.app_id)
     community = db.get_community(community_id)
@@ -568,27 +672,21 @@ def _process(rec: dict) -> bool:
                  event_name, app_id, yyyy_mm)
         return False
 
-    # Keep the reminder queue in step with the assignment. Publishing queued
+    # Keep the reminder queue in step with the assignments. Publishing queued
     # reminders only for the assignments that existed then; every later
-    # change arrives here, whichever screen or admin action made it.
-    if event_name == "REMOVE":
+    # change arrives here, whichever screen or admin action made it. The
+    # reconcile works from the month's current state, so it does not matter
+    # which change this was, or whether records arrive late or twice — and
+    # if this attempt fails, the poll's periodic sweep does it instead.
+    if event_name in ("INSERT", "REMOVE"):
         try:
-            n = publishing.cancel_reminders_for_assignment(
-                app_id, yyyy_mm, slot_id, user_id)
-            if n:
-                log.info("cancelled %d pending reminder(s) for released "
-                         "slot=%s user=%s", n, slot_id, user_id)
-        except Exception:
-            log.exception("could not cancel reminders slot=%s user=%s",
-                          slot_id, user_id)
-        return False
-    if event_name == "INSERT":
-        try:
-            _queue_reminders(community_id, app_id, yyyy_mm, slot_id, user_id)
+            _reconcile_month(community_id, app_id, yyyy_mm)
         except Exception:
             # Never let a reminder problem stop the sign-up emails below.
-            log.exception("could not queue reminders slot=%s user=%s",
-                          slot_id, user_id)
+            log.exception("could not reconcile reminders %s/%s",
+                          app_id, yyyy_mm)
+    if event_name == "REMOVE":
+        return False
 
     user = db.get_user(community_id, user_id)
     if user is None or user.email_undeliverable or not user.email or user.channel == "none":
@@ -714,21 +812,15 @@ def _process(rec: dict) -> bool:
     return True
 
 
-def _queue_reminders(community_id: str, app_id: str, yyyy_mm: str,
-                     slot_id: str, user_id: str) -> None:
-    """Queue reminders for an assignment created in an already-published
-    month. Idempotent, so a redelivered stream record adds nothing."""
+def _reconcile_month(community_id: str, app_id: str, yyyy_mm: str) -> None:
     community = db.get_community(community_id)
     app = next((a for a in db.list_applications(community_id)
                 if a.app_id == app_id), None)
-    slot = db.find_slot_in_month(app_id, yyyy_mm, slot_id)
-    user = db.get_user(community_id, user_id)
-    if community is None or app is None or slot is None or user is None:
+    if community is None or app is None:
         return
-    n = publishing.queue_reminders_for_assignment(
-        community, app, yyyy_mm, slot, user)
-    log.info("queued %d reminder(s) for late assignment slot=%s user=%s",
-             n, slot_id, user_id)
+    out = publishing.reconcile_reminders(community, app, yyyy_mm)
+    if out["queued"] or out["cancelled"]:
+        log.info("reminders reconciled for %s/%s: %s", app_id, yyyy_mm, out)
 
 
 def _deserialize(image: dict) -> dict:

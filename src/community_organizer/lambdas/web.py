@@ -654,7 +654,7 @@ _ADMIN_NAV = [
     ("Members", "members", "/admin/users"),
     ("Cohorts", "cohorts", "/admin/cohorts"),
     ("Send Email", "send-email", "/admin/send-email"),
-    ("Emails", "emails", "/admin/emails"),
+    ("Email activity", "emails", "/admin/emails"),
     ("Templates", "templates", "/admin/templates"),
     ("Settings", "settings", "/admin/settings"),
     # The former standalone "Share" tab (slug + card art + shareable link)

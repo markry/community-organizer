@@ -1218,11 +1218,17 @@ def _route(event: dict, handler):
         # only belongs to one — the fallback used to pick the first
         # community app, which would be the wrong app for the user).
         # Bootstrap fallback to any community app exists so CAs with
-        # zero memberships can still reach the app screens.
+        # zero memberships can still reach the app screens. It is for
+        # CAs/UAs ONLY: a plain member who belongs to no app (never added,
+        # or removed from their last one) must not be handed some other
+        # app — every member page and signup would then run for them with
+        # no membership at all.
         if visible_apps:
             app = visible_apps[0]
-        else:
+        elif user.community_role in ("ca", "ua"):
             app = next(iter(all_apps), None)
+        elif all_apps:
+            return _html(403, _no_membership(user, community))
     if app is None:
         return _html(403, _no_application(user, community))
 
@@ -6827,6 +6833,22 @@ def _unprovisioned(email: str) -> str:
     )
 
 
+def _no_membership(user: User, community: Community | None) -> str:
+    """Shown to a signed-in member who belongs to none of the community's
+    apps — never added to one, or removed from their last."""
+    org_name = community.name if community else user.community_id
+    return _page(
+        f"<h1>{html.escape(org_name)}</h1>"
+        f"<p>Hello, {html.escape(user.name)}.</p>"
+        "<p>You're signed in, but you aren't currently a member of any group "
+        "here.</p>"
+        "<p style='color:#888;font-size:0.9em'>If you think that's a mistake, "
+        "ask the person who organizes your group to add you.</p>"
+        "<p><a href=\"/auth/logout\">Sign out</a></p>",
+        title=org_name,
+    )
+
+
 def _no_application(user: User, community: Community | None) -> str:
     # `app` is not in scope here (the whole point of this page is that
     # no Application is provisioned). The original copy referenced
@@ -10854,7 +10876,13 @@ def _api_user_delete(event: dict, user: User, community: Community | None,
             "/admin/community-users",
             "You cannot delete yourself. Ask another admin.")
     target = db.get_user(user.community_id, uid)
-    if target and target.cognito_sub and USER_POOL_ID:
+    if target is None:
+        # Not a user of THIS community. Memberships and assignments are keyed
+        # by user id alone, so carrying on would delete another community's
+        # rows for anyone whose id the caller happens to hold.
+        return _error_redirect_or_next(event,
+            "/admin/community-users", "User not found.")
+    if target.cognito_sub and USER_POOL_ID:
         try:
             _get_cognito().admin_delete_user(
                 UserPoolId=USER_POOL_ID, Username=target.email)

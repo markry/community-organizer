@@ -642,12 +642,24 @@ def test_a_member_can_settle_an_organizers_maybe(ddb_table, outbox) -> None:
     r = _rsvp(evt, joe)
     assert r.confirmed_response == "maybe" and r.marked_by == aa.user_id
     assert r.bringing == "Salad"
-    # Saying yes is theirs.
+    # "Still not sure" is their own answer, and sends nothing.
+    outbox.clear()
     web._api_flex_token_vote(_post("/api/e/vote", {
+        "token": "tj", "attend": "maybe", "bringing": "Salad"}))
+    assert _rsvp(evt, joe).marked_by is None
+    assert not [m for m in outbox if m.get("ics_content")]
+    # Saying yes is theirs too, and earns the calendar invite — once.
+    resp = web._api_flex_token_vote(_post("/api/e/vote", {
         "token": "tj", "attend": "yes", "bringing": "Salad"}))
     r = _rsvp(evt, joe)
     assert r.confirmed_response == "yes" and r.marked_by is None
     assert r.votes[opt.option_id] == "yes"
+    invites = [m for m in outbox if m.get("ics_content")]
+    assert [m["to_addr"] for m in invites] == ["joe@example.com"]
+    assert "sent you the calendar invite" in resp["body"]
+    web._api_flex_token_vote(_post("/api/e/vote", {
+        "token": "tj", "bringing": "Bread"}))               # just the dish
+    assert len([m for m in outbox if m.get("ics_content")]) == 1
     assert "name='attend'" not in web._flex_token_page(_get("/e/tj"))["body"]
 
 

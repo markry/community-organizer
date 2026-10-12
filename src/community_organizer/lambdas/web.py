@@ -4550,12 +4550,16 @@ def _api_flex_token_vote(event: dict) -> dict:
         elif any(v in ("yes", "maybe") for v in votes.values()):
             rsvp.confirmed_response = "yes"
         stated_attendance = True
+        confirmed_now = False
     else:
         # Scheduled: the form only carries an attendance choice for someone
         # recorded as a maybe (see _flex_token_page). Saving a dish or a
         # hosting offer says nothing about whether they are coming.
         attend = (parsed.get("attend", [""])[0] or "").strip()
         stated_attendance = attend in ("yes", "maybe", "no")
+        # Settling a maybe as yes earns the calendar invite, the same as
+        # rejoining after a no does.
+        confirmed_now = attend == "yes" and rsvp.confirmed_response != "yes"
         if stated_attendance:
             rsvp.confirmed_response = attend
             _won = _flex_roster_option(evt, list(
@@ -4592,6 +4596,9 @@ def _api_flex_token_vote(event: dict) -> dict:
         return _flex_terminal_page(
             "Your response collided with another update — open your link "
             "again and re-save.")
+    if confirmed_now:
+        _flex_send_confirmed_invite(
+            tok, evt, db.get_user(tok.community_id, tok.user_id), rsvp)
     if evt.notify_on_response:
         member = db.get_user(tok.community_id, tok.user_id)
         app = next((a for a in db.list_applications(tok.community_id)
@@ -4609,6 +4616,9 @@ def _api_flex_token_vote(event: dict) -> dict:
                           tok.app_id, tok.event_id)}
             for oid, v in rsvp.votes.items():
                 lines.append(f"  {labels.get(oid, oid)}: {v.capitalize()}")
+        elif stated_attendance:
+            lines.append("  Coming: " + {"yes": "yes", "maybe": "still a maybe",
+                                         "no": "no"}[rsvp.confirmed_response])
         if rsvp.party_size is not None:
             lines.append(f"  Headcount: {rsvp.party_size}")
         if rsvp.bringing:
@@ -4652,6 +4662,10 @@ def _api_flex_token_vote(event: dict) -> dict:
         return _flex_terminal_page(
             "Got it — you won't get further emails about this event. Open "
             "your link again any time if you change your mind.")
+    if confirmed_now:
+        return _flex_terminal_page(
+            "Wonderful — you're in! We've sent you the calendar invite. Open "
+            "this link again any time to update what you're bringing.")
     return _flex_terminal_page(
         "Thanks! Your response is saved. Open your link again any time to "
         "update it.")
@@ -4717,6 +4731,34 @@ def _api_flex_token_join(event: dict) -> dict:
         db.put_flexible_rsvp(rsvp, expected_version=rsvp.version)
     except db.ConcurrencyConflict:
         return _flex_terminal_page("Please open your link again and retry.")
+    org_name, loc, date_label = _flex_send_confirmed_invite(tok, evt, user, rsvp)
+    # Always tell the AA(s): the event is already scheduled, so they're
+    # likely no longer watching the results page when a No-voter rejoins.
+    who = (user.name or user.email) if user else tok.user_id
+    _notify_app_admins(
+        community_id=tok.community_id, app_id=tok.app_id, org_name=org_name,
+        subject=f"{org_name}: {who} can now make {evt.title}",
+        body_text=(f"Hi {{aa_name}},\n\n{who} had said they couldn't make "
+                   f"{evt.title}, but has changed their mind and is now "
+                   f"coming on {date_label}"
+                   + (f" at {loc}" if loc else "") + ".\n\n"
+                   "They've been sent the calendar invite. Your headcount has "
+                   "gone up by one.\n\n-- Community Organizer\n"),
+        kind="event_response_notice", related_user_id=tok.user_id)
+    return _flex_terminal_page(
+        "Wonderful — you're in! We've sent you the calendar invite. Open this "
+        "link again any time to say what you're bringing.")
+
+
+def _flex_send_confirmed_invite(tok: EventToken, evt: FlexibleEvent,
+                                user: User | None,
+                                rsvp: FlexibleRSVP) -> tuple:
+    """Email a member the calendar invite for a scheduled event they have
+    just confirmed for themselves (rejoining after a No, or settling a Maybe).
+    Best-effort: a send failure is logged, never raised. Returns
+    (org_name, location, date_label) for the caller's own messages. A member
+    who already holds the invite gets the same calendar entry updated, not a
+    second one — the UID is per (event, user)."""
     community = db.get_community(tok.community_id)
     app = next((a for a in db.list_applications(tok.community_id)
                 if a.app_id == tok.app_id), None)
@@ -4729,7 +4771,8 @@ def _api_flex_token_join(event: dict) -> dict:
     date_label = (_fmt_iso_date(evt.winning_date or "")
                   + (f" {_fmt_time(evt.winning_start_time)}"
                      if evt.winning_start_time else ""))
-    if user and user.email and not user.email_undeliverable:
+    if (user and user.email and not user.email_undeliverable
+            and evt.winning_start_time):
         try:
             ics = ical.make_flexible_event_ics(
                 event_id=tok.event_id, iso_date=evt.winning_date,
@@ -4751,24 +4794,9 @@ def _api_flex_token_join(event: dict) -> dict:
                 related_user_id=user.user_id, related_app_id=tok.app_id,
                 ics_content=ics)
         except Exception:
-            log.exception("join .ics send failed app=%s user=%s",
+            log.exception("confirm .ics send failed app=%s user=%s",
                           tok.app_id, tok.user_id)
-    # Always tell the AA(s): the event is already scheduled, so they're
-    # likely no longer watching the results page when a No-voter rejoins.
-    who = (user.name or user.email) if user else tok.user_id
-    _notify_app_admins(
-        community_id=tok.community_id, app_id=tok.app_id, org_name=org_name,
-        subject=f"{org_name}: {who} can now make {evt.title}",
-        body_text=(f"Hi {{aa_name}},\n\n{who} had said they couldn't make "
-                   f"{evt.title}, but has changed their mind and is now "
-                   f"coming on {date_label}"
-                   + (f" at {loc}" if loc else "") + ".\n\n"
-                   "They've been sent the calendar invite. Your headcount has "
-                   "gone up by one.\n\n-- Community Organizer\n"),
-        kind="event_response_notice", related_user_id=tok.user_id)
-    return _flex_terminal_page(
-        "Wonderful — you're in! We've sent you the calendar invite. Open this "
-        "link again any time to say what you're bringing.")
+    return org_name, loc, date_label
 
 
 _WEEKDAY_HEADER = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")

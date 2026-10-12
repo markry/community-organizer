@@ -1182,25 +1182,105 @@ def put_assignment(asg: Assignment, *,
     from botocore.exceptions import ClientError
     if expected_version is not None:
         asg.version = (expected_version or 0) + 1
+    pk = _app_month_pk(asg.app_id, asg.yyyy_mm)
     item = dataclasses.asdict(asg) | {
-        "PK": _app_month_pk(asg.app_id, asg.yyyy_mm),
+        "PK": pk,
         "SK": _asgn_sk(asg.slot_id, asg.user_id),
         "GSI1PK": f"UASGN#{asg.user_id}",
         "GSI1SK": asg.local_date,
     }
-    kwargs = {"Item": item}
+    # ALL_OLD tells us whether this created the row or rewrote it: only a
+    # creation adds a person to the slot.
+    kwargs = {"Item": item, "ReturnValues": "ALL_OLD"}
     if expected_version is not None:
         kwargs["ConditionExpression"] = (
             "attribute_not_exists(version) OR version = :expected")
         kwargs["ExpressionAttributeValues"] = {":expected": expected_version}
     try:
-        _table().put_item(**kwargs)
+        resp = _table().put_item(**kwargs)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
             raise ConcurrencyConflict(
                 f"assignment {asg.assignment_id} was modified "
                 f"by someone else") from e
         raise
+    if not resp.get("Attributes"):
+        _bump_assignment_count(asg.app_id, asg.yyyy_mm, asg.slot_id, +1)
+
+
+def _bump_assignment_count(app_id: str, yyyy_mm: str, slot_id: str,
+                           delta: int) -> None:
+    """Best-effort ±1 on a slot's ``assignment_count`` for the paths that
+    are not the atomic self-signup (admin assign, release, swap, cleanup).
+
+    Best-effort on purpose: the caller's change has already happened and
+    must not fail because the tally could not be updated (the slot may be
+    gone). The tally is not trusted on its own anyway —
+    ``atomic_signup_assignment`` reconciles it against the real rows before
+    every capacity check — so this only keeps it close in between."""
+    slot_sk = _find_slot_sk(app_id, yyyy_mm, slot_id)
+    if slot_sk is None:
+        return
+    kwargs: dict[str, Any] = {
+        "Key": {"PK": _app_month_pk(app_id, yyyy_mm), "SK": slot_sk},
+        "UpdateExpression": "ADD assignment_count :d",
+        "ExpressionAttributeValues": {":d": delta},
+    }
+    if delta < 0:
+        kwargs["ConditionExpression"] = "assignment_count > :zero"
+        kwargs["ExpressionAttributeValues"][":zero"] = 0
+    try:
+        _table().update_item(**kwargs)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def reconcile_assignment_count(app_id: str, yyyy_mm: str, local_date: str,
+                               slot_id: str) -> int:
+    """Make a slot's ``assignment_count`` equal the number of assignment rows
+    it actually has, and return that number.
+
+    The tally drifts: it was introduced after slots existed, several write
+    paths never maintained it, and a whole-slot save writes back whatever
+    stale value the caller was holding. A capacity check against a drifted
+    tally lets a full slot be over-filled. So the check does not trust it —
+    it calls this first.
+
+    Safe against a concurrent atomic signup: the stored tally is read BEFORE
+    the rows are counted, and the write is conditional on the tally still
+    being what was read. If a signup lands in between, its increment changes
+    the tally, the condition fails, and nothing is overwritten."""
+    from botocore.exceptions import ClientError
+    pk = _app_month_pk(app_id, yyyy_mm)
+    slot_sk = _slot_sk(local_date, slot_id)
+    got = _table().get_item(Key={"PK": pk, "SK": slot_sk}, ConsistentRead=True,
+                            ProjectionExpression="assignment_count")
+    if "Item" not in got:
+        return 0
+    stored = got["Item"].get("assignment_count")
+    actual = sum(1 for _ in _paginate_query(
+        KeyConditionExpression=Key("PK").eq(pk)
+        & Key("SK").begins_with(f"ASGN#{slot_id}#"),
+        ProjectionExpression="SK", ConsistentRead=True))
+    if stored is not None and int(stored) == actual:
+        return actual
+    kwargs: dict[str, Any] = {
+        "Key": {"PK": pk, "SK": slot_sk},
+        "UpdateExpression": "SET assignment_count = :actual",
+        "ExpressionAttributeValues": {":actual": actual},
+    }
+    if stored is None:
+        kwargs["ConditionExpression"] = "attribute_not_exists(assignment_count)"
+    else:
+        kwargs["ConditionExpression"] = "assignment_count = :stored"
+        kwargs["ExpressionAttributeValues"][":stored"] = stored
+    try:
+        _table().update_item(**kwargs)
+    except ClientError as e:
+        if (e.response.get("Error", {}).get("Code")
+                != "ConditionalCheckFailedException"):
+            raise
+    return actual
 
 
 def confirm_assignment(app_id: str, yyyy_mm: str, slot_id: str,
@@ -1245,25 +1325,13 @@ def delete_assignment(app_id: str, yyyy_mm: str, slot_id: str, user_id: str) -> 
     already deleted).
     """
     pk = _app_month_pk(app_id, yyyy_mm)
-    table = _table()
-    table.delete_item(Key={"PK": pk, "SK": _asgn_sk(slot_id, user_id)})
-    # Decrement the slot's counter so future signup capacity checks
-    # remain accurate. We have to know the slot's SK (which includes
-    # the local_date) to find it — look it up first.
-    slot = _find_slot_sk(app_id, yyyy_mm, slot_id)
-    if slot is None:
-        return
-    try:
-        table.update_item(
-            Key={"PK": pk, "SK": slot},
-            UpdateExpression="ADD assignment_count :neg",
-            ConditionExpression="assignment_count > :zero",
-            ExpressionAttributeValues={":neg": -1, ":zero": 0},
-        )
-    except Exception:  # noqa: BLE001
-        # Conditional failure (count was 0 or attr missing) is the
-        # expected case during the lazy-init window — just swallow.
-        pass
+    # ALL_OLD: decrement only if this call actually removed a row. Two
+    # releases of the same assignment racing each other would otherwise both
+    # decrement, leaving the tally one short and the slot over-fillable.
+    resp = _table().delete_item(Key={"PK": pk, "SK": _asgn_sk(slot_id, user_id)},
+                                ReturnValues="ALL_OLD")
+    if resp.get("Attributes"):
+        _bump_assignment_count(app_id, yyyy_mm, slot_id, -1)
 
 
 def _find_slot_sk(app_id: str, yyyy_mm: str, slot_id: str) -> str | None:
@@ -1332,6 +1400,11 @@ def atomic_signup_assignment(
     else:
         max_cap = slot.max_volunteers
     pk = _app_month_pk(slot.app_id, slot.yyyy_mm)
+    # The capacity condition below reads the slot's tally, so make the tally
+    # true first — see reconcile_assignment_count for why it cannot be
+    # trusted as stored.
+    reconcile_assignment_count(slot.app_id, slot.yyyy_mm, slot.local_date,
+                               slot.slot_id)
     # Self-signup is implicitly confirmed — the member explicitly
     # asked for the slot. See #217 (assignment confirmation status).
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")

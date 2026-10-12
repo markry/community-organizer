@@ -4225,6 +4225,12 @@ def _resolve_token(token: str) -> EventToken | None:
             return None
     except (ValueError, TypeError):
         pass
+    # A link stands in for a signed-in member, so it is only good while that
+    # person is still a member of the app. These routes bypass _route, so
+    # this is the one place that check can live: without it someone removed
+    # from the group could go on answering with a link sent to them earlier.
+    if db.get_membership(tok.app_id, tok.user_id) is None:
+        return None
     tok.event_id = db.resolve_merged_event(tok.app_id, tok.event_id)
     return tok
 
@@ -10815,6 +10821,25 @@ def _may_change_email(actor: User, target: User) -> bool:
     return actor.community_role == "ua" and target.community_role != "ca"
 
 
+def _may_act_on_identity(actor: User, target: User) -> bool:
+    """Whether ``actor`` may reset or delete ``target``'s sign-in identity.
+
+    Being an admin of an app someone belongs to is not authority over their
+    account: an App Admin can add any existing user to their app by email,
+    so "is a member of my app" must not reach a Community Admin's password.
+    Nobody acts on an identity above their own level:
+
+      - a Community Admin may act on anyone;
+      - a User Admin on anyone except a Community Admin;
+      - an App Admin only on plain members.
+    """
+    if actor.community_role == "ca":
+        return True
+    if actor.community_role == "ua":
+        return target.community_role != "ca"
+    return target.community_role == "member"
+
+
 def _api_user_edit(event: dict, user: User, community: Community | None,
                    app: Application, membership: Membership | None) -> dict:
     # Admit App Admins of the active app AND community-level CAs/UAs. This
@@ -10930,6 +10955,10 @@ def _api_user_delete(event: dict, user: User, community: Community | None,
         # rows for anyone whose id the caller happens to hold.
         return _error_redirect_or_next(event,
             "/admin/community-users", "User not found.")
+    if not _may_act_on_identity(user, target):
+        return _error_redirect_or_next(event,
+            "/admin/community-users",
+            "Only a community admin can delete a community admin.")
     if target.cognito_sub and USER_POOL_ID:
         try:
             _get_cognito().admin_delete_user(
@@ -10985,6 +11014,10 @@ def _api_user_reset_access(event: dict, user: User, community: Community | None,
             return _error_redirect_or_next(event, "/admin/users",
                 "App admins can only reset access for members of "
                 "their own app.")
+    if not _may_act_on_identity(user, target):
+        return _error_redirect_or_next(event, "/admin/users",
+            "You can't reset access for an administrator of the community. "
+            "Please ask a community admin for help.")
     if not target.cognito_sub:
         return _error_redirect_or_next(event, "/admin/users",
             "User has no login identity to reset.")
@@ -11035,6 +11068,9 @@ def _api_user_remove_from_app(event: dict, user: User, community: Community | No
         return _error_redirect_or_next(event, "/admin/users",
             "You cannot remove yourself from the app. Ask another admin.")
     db.delete_membership(app.app_id, uid)
+    # Their event links die with the membership (the resolver also checks
+    # membership; revoking as well means a later re-add does not revive them).
+    db.revoke_event_tokens_for_user(app.app_id, uid)
     for a in db.list_assignments_for_user(uid):
         if a.app_id == app.app_id:
             db.delete_assignment(a.app_id, a.yyyy_mm, a.slot_id, a.user_id)

@@ -279,3 +279,127 @@ def test_members_page_shows_the_email_read_only_to_an_app_admin(world) -> None:
 
     assert all("readonly" in i for i in email_inputs(aa)) and email_inputs(aa)
     assert not any("readonly" in i for i in email_inputs(ca))
+
+
+# ---- resetting or deleting a sign-in identity ------------------------------
+# Follow-up review: an App Admin can add any existing user to their app by
+# email, so "is a member of my app" must not reach an administrator's login.
+
+class _Cognito:
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        return lambda **kw: self.calls.append((name, kw.get("Username")))
+
+
+def _reset(actor: User, target: User) -> dict:
+    app = db.get_application(CID, "ush")
+    return web._api_user_reset_access(
+        {"rawPath": "/api/users/reset-access",
+         "requestContext": {"http": {"method": "POST"}},
+         "queryStringParameters": {"user_id": target.user_id}},
+        actor, db.get_community(CID), app,
+        db.get_membership("ush", actor.user_id))
+
+
+@pytest.fixture
+def cognito(monkeypatch):
+    fake = _Cognito()
+    monkeypatch.setattr(web, "_get_cognito", lambda: fake)
+    return fake
+
+
+def test_app_admin_cannot_reset_a_community_admin_they_added_to_their_app(
+        world, cognito) -> None:
+    add, _request = world
+    aa = add("appadmin"); _make_app_admin(aa)
+    ca = add("boss", role="ca")
+    # The App Admin pulls the Community Admin into their app...
+    db.put_membership(Membership(community_id=CID, app_id="ush",
+                                 user_id=ca.user_id))
+    # ...which must not give them the Community Admin's password.
+    resp = _reset(aa, ca)
+    assert "error=" in resp["headers"]["Location"] and cognito.calls == []
+
+
+def test_app_admin_can_still_reset_an_ordinary_member(world, cognito) -> None:
+    add, _request = world
+    aa = add("appadmin"); _make_app_admin(aa)
+    member = add("usher", apps=("ush",))
+    resp = _reset(aa, member)
+    assert "error=" not in resp["headers"]["Location"]
+    assert [c[0] for c in cognito.calls] == [
+        "admin_set_user_password", "admin_user_global_sign_out"]
+
+
+def test_user_admin_cannot_reset_or_delete_a_community_admin(
+        world, cognito) -> None:
+    add, _request = world
+    ua = add("useradmin", role="ua")
+    ca = add("boss", role="ca", apps=("ush",))
+    assert "error=" in _reset(ua, ca)["headers"]["Location"]
+    assert "error=" in _delete(ua, ca.user_id)["headers"]["Location"]
+    assert cognito.calls == [] and db.get_user(CID, ca.user_id) is not None
+    assert db.get_membership("ush", ca.user_id) is not None
+
+
+def test_user_admin_can_delete_a_member_and_community_admin_can_delete_anyone(
+        world, cognito) -> None:
+    add, _request = world
+    ua = add("useradmin", role="ua")
+    ca = add("boss", role="ca")
+    other_ca = add("deputy", role="ca")
+    member = add("usher", apps=("ush",))
+    assert "error=" not in _delete(ua, member.user_id)["headers"]["Location"]
+    assert "error=" not in _delete(ca, other_ca.user_id)["headers"]["Location"]
+    assert db.get_user(CID, member.user_id) is None
+    assert db.get_user(CID, other_ca.user_id) is None
+
+
+# ---- an event link is only as good as the membership behind it -------------
+
+def test_event_link_stops_working_when_the_member_is_removed(world) -> None:
+    import datetime as dt
+    from community_organizer.core.models import (
+        EventToken, FlexibleEvent, FlexiblePollOption,
+    )
+    add, _request = world
+    db.put_application(Application(community_id=CID, name="Club",
+                                   app_type="flexible_event", app_id="club"))
+    aa = add("organizer")
+    db.put_membership(Membership(community_id=CID, app_id="club",
+                                 user_id=aa.user_id, app_role="aa"))
+    m = add("guest", apps=("club",))
+    evt = FlexibleEvent(community_id=CID, app_id="club", title="Dinner")
+    db.put_flexible_event(evt)
+    opt = FlexiblePollOption(community_id=CID, app_id="club",
+                             event_id=evt.event_id, iso_date="2030-01-01")
+    db.put_flexible_poll_option(opt)
+    db.put_event_token(EventToken(
+        community_id=CID, app_id="club", event_id=evt.event_id,
+        user_id=m.user_id, token="tok",
+        expires_at=dt.datetime(2099, 1, 1, tzinfo=dt.timezone.utc).isoformat()))
+    assert web._resolve_token("tok") is not None
+
+    app = db.get_application(CID, "club")
+    web._api_user_remove_from_app(
+        {"rawPath": "/api/users/remove",
+         "requestContext": {"http": {"method": "POST"}},
+         "queryStringParameters": {"user_id": m.user_id}},
+        aa, db.get_community(CID), app, db.get_membership("club", aa.user_id))
+
+    assert web._resolve_token("tok") is None
+    import urllib.parse
+    resp = web._api_flex_token_vote({
+        "rawPath": "/api/e/vote",
+        "requestContext": {"http": {"method": "POST"}},
+        "body": urllib.parse.urlencode(
+            {"token": "tok", f"vote_{opt.option_id}": "yes"}),
+        "isBase64Encoded": False})
+    assert "no longer valid" in resp["body"]
+    assert db.get_flexible_rsvp("club", evt.event_id, m.user_id) is None
+    # Adding them back does not revive the old link: it was revoked.
+    db.put_membership(Membership(community_id=CID, app_id="club",
+                                 user_id=m.user_id))
+    assert web._resolve_token("tok") is None

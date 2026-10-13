@@ -102,6 +102,42 @@ def test_router_resolves_home_and_a_prefixes(ddb_table, monkeypatch):
         assert "Summer Book Club" in r["body"], prefix
 
 
+def test_app_id_link_is_the_same_public_page_for_a_visitor(ddb_table, monkeypatch):
+    """The address in a member's browser bar (/?app_id=...) is what gets
+    copied and sent. Logged out -- and to a link-preview crawler -- it is the
+    same page, with the same card, as /home/<slug>."""
+    cid, app, _ = _seed()
+    monkeypatch.setattr(web, "COMMUNITY_ID", cid)
+    by_id = web.lambda_handler(
+        {"rawPath": "/", "rawQueryString": f"app_id={app.app_id}",
+         "queryStringParameters": {"app_id": app.app_id}}, None)
+    by_slug = web.lambda_handler({"rawPath": f"/home/{app.public_slug}"}, None)
+    assert by_id["statusCode"] == 200
+    assert by_id["body"] == by_slug["body"]
+    b = by_id["body"]
+    assert "property='og:title' content='Summer Book Club'" in b
+    assert f"https://{web.DOMAIN_NAME}/og/bookclub.png" in b
+    assert (f"property='og:url' content='https://{web.DOMAIN_NAME}/home/"
+            f"{app.public_slug}'") in b
+    assert "Sign in to Summer Book Club" in b
+
+
+def test_app_id_link_unchanged_for_sessions_and_unknown_apps(ddb_table, monkeypatch):
+    cid, app, _ = _seed()
+    monkeypatch.setattr(web, "COMMUNITY_ID", cid)
+    # No such app, or no app named: the ordinary sign-in redirect.
+    for qs in ("app_id=nope", ""):
+        r = web.lambda_handler(
+            {"rawPath": "/", "rawQueryString": qs,
+             "queryStringParameters": dict([qs.split("=")]) if qs else {}}, None)
+        assert r["statusCode"] == 302 and r["headers"]["Location"].startswith("/login")
+    # A visitor with a session cookie (even one needing renewal) is not shown
+    # the public page; the signed-in route answers.
+    assert web._app_front_door_for_visitor(
+        {"rawPath": "/", "queryStringParameters": {"app_id": app.app_id},
+         "cookies": [f"{web.auth.REFRESH_COOKIE}=x"]}) is None
+
+
 def test_landing_member_deep_links_in(ddb_table, monkeypatch):
     cid, app, u = _seed()
     monkeypatch.setattr(web, "COMMUNITY_ID", cid)

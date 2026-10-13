@@ -893,6 +893,13 @@ def _dispatch(event: dict, context) -> dict:  # noqa: ARG001
     if path == "/api/e/join":
         return _api_flex_token_join(event)
     if path == "/":
+        # The address a member sees in the browser (/?app_id=...) is the one
+        # they copy and send. To someone not signed in -- and to whatever
+        # builds the link preview -- it is the app's public front door, the
+        # same page as /home/<slug>, not a bare redirect to the sign-in.
+        public = _app_front_door_for_visitor(event)
+        if public is not None:
+            return public
         return _route(event, _home)
     m = _SCHEDULE_PATH.match(path)
     if m:
@@ -14995,7 +15002,7 @@ def _api_app_delete(event: dict, user: User,
 
 def _page(body: str, *, narrow: bool = True, title: str = "Community Organizer",
           og_title: str | None = None, og_description: str | None = None,
-          og_image: str | None = None) -> str:
+          og_image: str | None = None, og_url: str | None = None) -> str:
     width = "480px" if narrow else "960px"
     spinner = (
         "<div id='loading' style='display:none;position:fixed;top:0;left:0;"
@@ -15122,6 +15129,7 @@ def _page(body: str, *, narrow: bool = True, title: str = "Community Organizer",
     # unauthenticated, and DOMAIN_NAME is per-stack so each one points at itself.
     _t = html.escape(og_title or title)
     _og_img = og_image or f"https://{DOMAIN_NAME}/og-image.png"
+    _og_url = html.escape(og_url or f"https://{DOMAIN_NAME}/", quote=True)
     _og_desc = html.escape(og_description or (
         "Sign-ups, schedules, and reminders for parish ministries "
         "and small groups."))
@@ -15133,7 +15141,7 @@ def _page(body: str, *, narrow: bool = True, title: str = "Community Organizer",
         f"<meta property='og:image' content='{_og_img}'>"
         "<meta property='og:image:width' content='1200'>"
         "<meta property='og:image:height' content='630'>"
-        f"<meta property='og:url' content='https://{DOMAIN_NAME}/'>"
+        f"<meta property='og:url' content='{_og_url}'>"
         "<meta name='twitter:card' content='summary_large_image'>"
         f"<meta name='twitter:title' content='{_t}'>"
         f"<meta name='twitter:description' content='{_og_desc}'>"
@@ -15216,6 +15224,23 @@ def _maybe_current_user(event: dict) -> User | None:
         sub, community_id=os.environ.get("COMMUNITY_ID") or None)
 
 
+def _app_front_door_for_visitor(event: dict) -> dict | None:
+    """The public front door for ``/?app_id=<id>`` when the visitor carries
+    no sign-in at all; None otherwise (a signed-in visitor, one whose session
+    can still be renewed, no app named, or no such app), which leaves the
+    normal signed-in route to answer."""
+    app_id = _get_param(event, "app_id")
+    if not app_id or not COMMUNITY_ID:
+        return None
+    cookies = auth.parse_cookies(event)
+    if cookies.get(auth.ID_COOKIE) or cookies.get(auth.REFRESH_COOKIE):
+        return None
+    app = db.get_application(COMMUNITY_ID, app_id)
+    if app is None or not app.active:
+        return None
+    return _app_front_door(event, app)
+
+
 def _app_landing(event: dict, slug: str) -> dict:
     """Public front door for one app at /home/<slug> (alias: /a/<slug>).
 
@@ -15229,6 +15254,11 @@ def _app_landing(event: dict, slug: str) -> dict:
         return _html(404, _page(
             "<h1>Page not found</h1><p>This link doesn't match any group. "
             "<a href='/'>Go to the home page</a>.</p>", title="Not found"))
+    return _app_front_door(event, app)
+
+
+def _app_front_door(event: dict, app: Application) -> dict:
+    """One app's public page, however it was reached (see _app_landing)."""
     deep = f"/?app_id={app.app_id}"
     user = _maybe_current_user(event)
     if user is not None and (user.community_role in ("ca", "ua")
@@ -15254,9 +15284,13 @@ def _app_landing(event: dict, slug: str) -> dict:
         + "<p style='margin-top:36px;color:#aaa;font-size:0.85em'>"
         "Powered by Community Organizer</p>"
     )
+    # One address for the preview whichever link was shared, so both links
+    # produce the same card.
+    own_url = (f"https://{DOMAIN_NAME}/home/{app.public_slug}"
+               if app.public_slug else f"https://{DOMAIN_NAME}{deep}")
     return _html(200, _page(body, title=app.name, og_title=app.name,
                             og_description=app.description or None,
-                            og_image=og_img))
+                            og_image=og_img, og_url=own_url))
 
 
 # ---- AA: the Share page (slug + public description + card art) ------------

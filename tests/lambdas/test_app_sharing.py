@@ -385,3 +385,17 @@ def test_upload_art_accepts_png(ddb_table, monkeypatch):
                                     db.get_membership("bookclub", u.user_id))
     assert r["statusCode"] == 302
     assert db.get_application(cid, "bookclub").og_art_content_type == "image/png"
+
+
+# ---- site icon ------------------------------------------------------------
+
+def test_site_icon_is_served_and_linked(ddb_table, monkeypatch):
+    import base64
+    for path in ("/favicon.ico", "/favicon.png", "/apple-touch-icon.png"):
+        r = web.lambda_handler({"rawPath": path}, None)
+        assert r["statusCode"] == 200, path
+        assert r["headers"]["Content-Type"] == "image/png"
+        assert base64.b64decode(r["body"])[:8] == b"\x89PNG\r\n\x1a\n"
+    page = web._page("<p>x</p>")
+    assert "<link rel='icon' type='image/png' href='/favicon.png'>" in page
+    assert "<link rel='apple-touch-icon' href='/apple-touch-icon.png'>" in page

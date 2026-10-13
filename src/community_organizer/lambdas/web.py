@@ -298,6 +298,24 @@ try:
 except Exception:  # pragma: no cover - image always packaged, but never 500
     _OG_IMAGE_B64 = ""
 
+
+def _packaged_png_b64(name: str) -> str:
+    try:
+        with open(os.path.join(os.path.dirname(__file__), name), "rb") as f:
+            return base64.b64encode(f.read()).decode()
+    except Exception:  # pragma: no cover - packaged with the module
+        return ""
+
+
+# The site's icon: the browser tab (64px) and the home-screen / compact
+# link-preview icon (180px). Same mark as the generic card.
+_ICONS_B64 = {
+    "/favicon.ico": _packaged_png_b64("favicon.png"),
+    "/favicon.png": _packaged_png_b64("favicon.png"),
+    "/apple-touch-icon.png": _packaged_png_b64("apple_touch_icon.png"),
+    "/apple-touch-icon-precomposed.png": _packaged_png_b64("apple_touch_icon.png"),
+}
+
 COMMUNITY_ID = os.environ.get("COMMUNITY_ID", "")
 # S3 bucket holding per-app custom social-card art (one object per app_id).
 OG_ART_BUCKET = os.environ.get("OG_ART_BUCKET", "")
@@ -826,6 +844,14 @@ def _dispatch(event: dict, context) -> dict:  # noqa: ARG001
         return _api_rum(event)
     if path == "/og-image.png":
         return _og_image_response()
+    if path in _ICONS_B64:
+        # PNG bytes at /favicon.ico too: every browser accepts that.
+        if not _ICONS_B64[path]:
+            return _text(404, "not found")
+        return {"statusCode": 200,
+                "headers": {"Content-Type": "image/png",
+                            "Cache-Control": "public, max-age=604800"},
+                "body": _ICONS_B64[path], "isBase64Encoded": True}
     # Per-app social-card art (public; one object per app in S3, generic
     # fallback). Path-based so it's unambiguous and crawler-friendly.
     if path.startswith("/og/") and path.endswith(".png"):
@@ -15165,6 +15191,8 @@ def _page(body: str, *, narrow: bool = True, title: str = "Community Organizer",
         f"<meta name='twitter:description' content='{_og_desc}'>"
         + (f"<meta name='twitter:image' content='{_og_img}'>" if _og_img else "")
         +         "<meta name='theme-color' content='#2aa877'>"
+        "<link rel='icon' type='image/png' href='/favicon.png'>"
+        "<link rel='apple-touch-icon' href='/apple-touch-icon.png'>"
     )
     return (
         "<!doctype html><html><head>"

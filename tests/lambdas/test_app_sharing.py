@@ -138,6 +138,28 @@ def test_app_id_link_unchanged_for_sessions_and_unknown_apps(ddb_table, monkeypa
          "cookies": [f"{web.auth.REFRESH_COOKIE}=x"]}) is None
 
 
+def test_card_art_is_shown_on_the_front_door_and_the_sign_in(ddb_table, monkeypatch):
+    """The picture a link preview shows is on the page itself too: the public
+    front door, and the sign-in page when it leads into that app. An app with
+    no art of its own shows no picture."""
+    cid, app, _ = _seed()
+    monkeypatch.setattr(web, "COMMUNITY_ID", cid)
+    img = "<img src='/og/bookclub.png'"
+    login = {"rawPath": "/login",
+             "queryStringParameters": {"next": "/?app_id=bookclub"}}
+    assert img not in web._app_landing({}, app.public_slug)["body"]
+    assert img not in web._login_page(login)["body"]
+    app.og_art_content_type = "image/png"
+    db.put_application(app)
+    assert img in web._app_landing({}, app.public_slug)["body"]
+    b = web._login_page(login)["body"]
+    assert img in b and "<h1 style='margin-bottom:8px'>Summer Book Club</h1>" in b
+    assert "property='og:title' content='Summer Book Club'" in b
+    # A sign-in that is not headed for an app is as before.
+    plain = web._login_page({"rawPath": "/login"})["body"]
+    assert "<img src='/og/" not in plain and "Summer Book Club</h1>" not in plain
+
+
 def test_landing_member_deep_links_in(ddb_table, monkeypatch):
     cid, app, u = _seed()
     monkeypatch.setattr(web, "COMMUNITY_ID", cid)

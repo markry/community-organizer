@@ -13423,8 +13423,13 @@ def _login_page(event: dict) -> dict:
         banner = (f"<p style='color:#2a7;margin-bottom:16px'>"
                   f"{html.escape(msg)}</p>")
     next_escaped = html.escape(next_url)
+    # Signing in on the way to one particular app: say so, with its picture,
+    # and give the page that app's preview card.
+    dest = _app_named_by_next(next_url)
+    heading = dest.name if dest else org_name
     body = (
-        f"<h1 style='margin-bottom:8px'>{html.escape(org_name)}</h1>"
+        _app_card_art_html(dest)
+        + f"<h1 style='margin-bottom:8px'>{html.escape(heading)}</h1>"
         "<p style='color:#888;margin-bottom:32px'>Sign in to continue</p>"
         + banner
         + "<div style='display:flex;flex-direction:column;gap:12px;"
@@ -13476,6 +13481,13 @@ def _login_page(event: dict) -> dict:
         "style='font-size:0.9em;color:#888'>New user or forgot your password?</a></p>"
         "</form>"
     )
+    if dest is not None:
+        return _html(200, _page(
+            body, title=dest.name, og_title=dest.name,
+            og_description=dest.description or None,
+            og_image=f"https://{DOMAIN_NAME}/og/{dest.app_id}.png",
+            og_url=(f"https://{DOMAIN_NAME}/home/{dest.public_slug}"
+                    if dest.public_slug else None)))
     return _html(200, _page(body, title=org_name))
 
 
@@ -15224,6 +15236,33 @@ def _maybe_current_user(event: dict) -> User | None:
         sub, community_id=os.environ.get("COMMUNITY_ID") or None)
 
 
+def _app_card_art_html(app: Application | None) -> str:
+    """The app's own card art, shown ON the page: the picture a link preview
+    shows is the one the person who follows the link should see too. Empty
+    for an app with no art of its own (the generic card is not repeated)."""
+    if app is None or not app.og_art_content_type:
+        return ""
+    return (f"<img src='/og/{app.app_id}.png' alt='' width='1200' height='630' "
+            "style='display:block;width:100%;height:auto;border-radius:8px;"
+            "margin:0 auto 20px'>")
+
+
+def _app_named_by_next(next_url: str) -> Application | None:
+    """The app a sign-in will land in, when the return address names one
+    (/?app_id=<id>). None otherwise."""
+    if not COMMUNITY_ID or not next_url:
+        return None
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlsplit(next_url).query)
+    except ValueError:
+        return None
+    app_id = (qs.get("app_id") or [""])[0]
+    if not app_id:
+        return None
+    app = db.get_application(COMMUNITY_ID, app_id)
+    return app if app is not None and app.active else None
+
+
 def _app_front_door_for_visitor(event: dict) -> dict | None:
     """The public front door for ``/?app_id=<id>`` when the visitor carries
     no sign-in at all; None otherwise (a signed-in visitor, one whose session
@@ -15278,7 +15317,8 @@ def _app_front_door(event: dict, app: Application) -> dict:
                "color:#fff;border-radius:6px;text-decoration:none;"
                f"font-size:1.05em'>Sign in to {name}</a></p>")
     body = (
-        f"<h1 style='margin-bottom:6px'>{name}</h1>"
+        _app_card_art_html(app)
+        + f"<h1 style='margin-bottom:6px'>{name}</h1>"
         + (f"<p style='color:#555;font-size:1.05em'>{desc}</p>" if desc else "")
         + cta
         + "<p style='margin-top:36px;color:#aaa;font-size:0.85em'>"

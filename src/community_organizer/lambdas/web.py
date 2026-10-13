@@ -13485,7 +13485,7 @@ def _login_page(event: dict) -> dict:
         return _html(200, _page(
             body, title=dest.name, og_title=dest.name,
             og_description=dest.description or None,
-            og_image=f"https://{DOMAIN_NAME}/og/{dest.app_id}.png",
+            og_image=_app_og_image_url(dest),
             og_url=(f"https://{DOMAIN_NAME}/home/{dest.public_slug}"
                     if dest.public_slug else None)))
     return _html(200, _page(body, title=org_name))
@@ -15140,7 +15140,11 @@ def _page(body: str, *, narrow: bool = True, title: str = "Community Organizer",
     # for now. og:image must be absolute + public — /og-image.png is served
     # unauthenticated, and DOMAIN_NAME is per-stack so each one points at itself.
     _t = html.escape(og_title or title)
-    _og_img = og_image or f"https://{DOMAIN_NAME}/og-image.png"
+    # og_image="" means NO picture (an app page whose app has no art of its
+    # own: the generic card would brand it as something it is not). None means
+    # the generic one, for pages that are about the site rather than one app.
+    _og_img = (f"https://{DOMAIN_NAME}/og-image.png" if og_image is None
+               else og_image)
     _og_url = html.escape(og_url or f"https://{DOMAIN_NAME}/", quote=True)
     _og_desc = html.escape(og_description or (
         "Sign-ups, schedules, and reminders for parish ministries "
@@ -15150,15 +15154,17 @@ def _page(body: str, *, narrow: bool = True, title: str = "Community Organizer",
         "<meta property='og:site_name' content='Community Organizer'>"
         f"<meta property='og:title' content='{_t}'>"
         f"<meta property='og:description' content='{_og_desc}'>"
-        f"<meta property='og:image' content='{_og_img}'>"
-        "<meta property='og:image:width' content='1200'>"
-        "<meta property='og:image:height' content='630'>"
-        f"<meta property='og:url' content='{_og_url}'>"
-        "<meta name='twitter:card' content='summary_large_image'>"
-        f"<meta name='twitter:title' content='{_t}'>"
+        + (f"<meta property='og:image' content='{_og_img}'>"
+           "<meta property='og:image:width' content='1200'>"
+           "<meta property='og:image:height' content='630'>"
+           if _og_img else "")
+        + f"<meta property='og:url' content='{_og_url}'>"
+        + ("<meta name='twitter:card' content='summary_large_image'>"
+           if _og_img else "<meta name='twitter:card' content='summary'>")
+        + f"<meta name='twitter:title' content='{_t}'>"
         f"<meta name='twitter:description' content='{_og_desc}'>"
-        f"<meta name='twitter:image' content='{_og_img}'>"
-        "<meta name='theme-color' content='#2aa877'>"
+        + (f"<meta name='twitter:image' content='{_og_img}'>" if _og_img else "")
+        +         "<meta name='theme-color' content='#2aa877'>"
     )
     return (
         "<!doctype html><html><head>"
@@ -15247,6 +15253,13 @@ def _app_card_art_html(app: Application | None) -> str:
             "margin:0 auto 20px'>")
 
 
+def _app_og_image_url(app: Application) -> str:
+    """The preview picture for an app's pages: its own art, or "" (none)."""
+    if not app.og_art_content_type:
+        return ""
+    return f"https://{DOMAIN_NAME}/og/{app.app_id}.png"
+
+
 def _app_named_by_next(next_url: str) -> Application | None:
     """The app a sign-in will land in, when the return address names one
     (/?app_id=<id>). None otherwise."""
@@ -15306,7 +15319,7 @@ def _app_front_door(event: dict, app: Application) -> dict:
 
     name = html.escape(app.name)
     desc = html.escape(app.description) if app.description else ""
-    og_img = f"https://{DOMAIN_NAME}/og/{app.app_id}.png"
+    og_img = _app_og_image_url(app)
     if user is not None:
         cta = ("<p style='color:#a80;margin-top:20px'>You're signed in but not "
                f"a member of {name}. <a href='/'>Go to your home page</a>.</p>")

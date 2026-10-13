@@ -84,8 +84,11 @@ def test_landing_public_card_for_logged_out(ddb_table, monkeypatch):
     assert "Summer Book Club" in b
     assert "Sign in to Summer Book Club" in b
     assert f"/login?next=" in b and "app_id%3Dbookclub" in b  # deep-link through login
-    # per-app OG tags
-    assert f"https://{web.DOMAIN_NAME}/og/bookclub.png" in b
+    # per-app OG tags; no art of its own, so no picture at all (not the
+    # generic one) and the small card
+    assert "og:image" not in b and "twitter:image" not in b
+    assert "og-image.png" not in b
+    assert "name='twitter:card' content='summary'" in b
     assert "property='og:title' content='Summer Book Club'" in b
     assert "A friendly summer read." in b                 # og:description
 
@@ -116,7 +119,6 @@ def test_app_id_link_is_the_same_public_page_for_a_visitor(ddb_table, monkeypatc
     assert by_id["body"] == by_slug["body"]
     b = by_id["body"]
     assert "property='og:title' content='Summer Book Club'" in b
-    assert f"https://{web.DOMAIN_NAME}/og/bookclub.png" in b
     assert (f"property='og:url' content='https://{web.DOMAIN_NAME}/home/"
             f"{app.public_slug}'") in b
     assert "Sign in to Summer Book Club" in b
@@ -154,9 +156,14 @@ def test_card_art_is_shown_on_the_front_door_and_the_sign_in(ddb_table, monkeypa
     assert img in web._app_landing({}, app.public_slug)["body"]
     b = web._login_page(login)["body"]
     assert img in b and "<h1 style='margin-bottom:8px'>Summer Book Club</h1>" in b
+    for page in (b, web._app_landing({}, app.public_slug)["body"]):
+        assert (f"property='og:image' content='https://{web.DOMAIN_NAME}"
+                "/og/bookclub.png'") in page
+        assert "content='summary_large_image'" in page
     assert "property='og:title' content='Summer Book Club'" in b
     # A sign-in that is not headed for an app is as before.
     plain = web._login_page({"rawPath": "/login"})["body"]
+    assert "og-image.png" in plain                  # the site's own card stays
     assert "<img src='/og/" not in plain and "Summer Book Club</h1>" not in plain
 
 

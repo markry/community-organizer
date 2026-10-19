@@ -5956,10 +5956,10 @@ def _inactive_memberships(app: Application) -> dict[str, Membership]:
 
 
 def _inactive_label(m: Membership) -> str:
-    """'inactive' or 'inactive until Sun, November 15' for pick lists
+    """'inactive' or 'inactive, back on Sun, November 15' for pick lists
     and messages."""
     if m.inactive_until:
-        return f"inactive until {_pretty_date(m.inactive_until)}"
+        return f"inactive, back on {_pretty_date(m.inactive_until)}"
     return "inactive"
 
 
@@ -8182,7 +8182,7 @@ def _open_slots_page(event: dict, user: User, community: Community | None,
             "<div style='margin:12px 0;padding:10px 14px;border-radius:4px;"
             "border:1px solid #e3c27a;background:#fffaf0;color:#555'>"
             "You're taking a break "
-            + (f"until {html.escape(_pretty_date(membership.inactive_until))}"
+            + (f"(back on {html.escape(_pretty_date(membership.inactive_until))})"
                if membership.inactive_until else "until further notice")
             + ", so you can't sign up for slots. "
             "<a href='/my-availability' style='color:#2a7'>"
@@ -8309,7 +8309,7 @@ def _pause_section_html(app: Application, membership: Membership | None,
     box = ("margin:16px 0 8px;padding:16px;border-radius:4px;"
            "border:1px solid {b};background:{bg}")
     if membership.inactive_on(today):
-        until = (f"until {html.escape(_pretty_date(membership.inactive_until))}"
+        until = (f"back on {html.escape(_pretty_date(membership.inactive_until))}"
                  if membership.inactive_until else "until further notice")
         return (
             f"<div style='{box.format(b='#e3c27a', bg='#fffaf0')}'>"
@@ -8444,7 +8444,7 @@ def _api_membership_inactive(event: dict, user: User,
              if a.app_id == app.app_id
              and (not until or a.local_date < until)]
     msg = (f"{who} marked inactive"
-           + (f" until {_pretty_date(until)}." if until
+           + (f", back on {_pretty_date(until)}." if until
               else " until further notice."))
     if still:
         n = len(still)
@@ -8468,7 +8468,7 @@ def _notify_admins_of_inactive_change(member: User, community: Community,
     if paused:
         subject = (f"{app.name} -- {member.name} paused their scheduling")
         line = (f"{member.name} has stepped out of the rotation "
-                + (f"until {_pretty_date(until)}." if until
+                + (f"and will be back on {_pretty_date(until)}." if until
                    else "until further notice."))
     else:
         subject = f"{app.name} -- {member.name} is back in the rotation"
@@ -10937,11 +10937,11 @@ def _users_page(event: dict, user: User, community: Community | None,
     def _status_note(m: Membership | None) -> str:
         if m is None or m.user_id not in inactive_ids:
             return ""
-        until = (f"until {_pretty_date(m.inactive_until)}"
+        until = (f"back on {_pretty_date(m.inactive_until)}"
                  if m.inactive_until else "until further notice")
         note = f" &middot; {html.escape(m.inactive_note)}" if m.inactive_note else ""
         return ("<div style='font-size:0.8em;color:#a80;margin-top:2px;"
-                f"white-space:normal'>Inactive {until}{note}</div>")
+                f"white-space:normal'>Inactive, {until}{note}</div>")
 
     rows = ""
     for idx, u in enumerate(all_users):

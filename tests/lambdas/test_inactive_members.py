@@ -162,7 +162,7 @@ def test_admin_marks_a_member_inactive_without_notifying_admins(world) -> None:
     resp = _pause(w, w["admin"], {"action": "pause",
                                   "user_id": w["member"].user_id,
                                   "until": "2030-06-10", "note": "travel"})
-    assert "Member is marked inactive until" in _location(resp)
+    assert "Member is marked inactive, back on" in _location(resp)
     m = _mem(w, w["member"])
     assert (m.inactive_until, m.inactive_note) == ("2030-06-10", "travel")
     assert w["outbox"].sent == []
@@ -232,7 +232,7 @@ def test_pick_list_greys_out_inactive_members(world) -> None:
                                inactive=True, until="2030-06-10")
     by_date = web._collect_blocked_by_date(w["app"], [w["slot"]])
     assert by_date["2030-06-02"] == {
-        w["member"].user_id: "inactive until Mon, June 10"}
+        w["member"].user_id: "inactive, back on Mon, June 10"}
 
 
 def test_schedule_email_skips_a_month_they_are_out(world) -> None:
@@ -295,7 +295,7 @@ def test_members_page_shows_status_and_count(world) -> None:
     page = web._users_page(_get("/admin/users"), w["admin"], w["community"],
                            w["app"], _mem(w, w["admin"]))["body"]
     assert "1 active &middot; 1 inactive" in page
-    assert "Inactive until further notice &middot; travel" in page
+    assert "Inactive, until further notice &middot; travel" in page
     assert "reactivate" in page
 
 

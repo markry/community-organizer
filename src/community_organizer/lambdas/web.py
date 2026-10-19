@@ -690,6 +690,9 @@ _ADMIN_NAV = [
 # per-occurrence RSVP) rather than the coverage UX (slots / schedules /
 # cohorts / templates).
 EVENT_APP_TYPES = ("standing_event", "flexible_event")
+# Rotation apps: members are assigned to slots, so a member can step
+# out of the rotation for a while (Membership.inactive_*).
+SCHEDULING_APP_TYPES = ("coverage", "recurring_commitments")
 
 # Coverage-only surfaces. When an EVENT_APP_TYPES app lands on one of these
 # (a stale link, a guessed URL, a bookmarked deep link), _route bounces it
@@ -981,6 +984,8 @@ def _dispatch(event: dict, context) -> dict:  # noqa: ARG001
         return _route(event, _api_blocked_date_add)
     if path == "/api/blocked-dates/delete":
         return _route(event, _api_blocked_date_delete)
+    if path == "/api/membership/inactive":
+        return _route(event, _api_membership_inactive)
     if path == "/api/schedules/create":
         return _route(event, _api_schedule_create)
     if path == "/api/schedules/publish":
@@ -5301,7 +5306,7 @@ def _recurring_home(user: User, community: Community | None,
                       db.list_memberships_for_app(app.app_id)}
         app_member_users = [u for u in users_by_id.values()
                             if u.user_id in member_ids]
-    blocked_by_date = (_collect_blocked_by_date(app.app_id, slots)
+    blocked_by_date = (_collect_blocked_by_date(app, slots)
                        if is_admin else None)
     cohort_members_by_template = (
         _collect_cohort_members_by_template(list(cohorts.values()))
@@ -5393,7 +5398,7 @@ def _render_recurring_grid(*, slots: list[Slot],
                            my_cohort_ids: set[str],
                            is_admin: bool = False,
                            app_members: list[User] | None = None,
-                           blocked_by_date: dict[str, set[str]] | None = None,
+                           blocked_by_date: dict[str, dict[str, str]] | None = None,
                            cohort_members_by_template: dict[str, set[str]] | None = None) -> str:
     """Render the slot grid for a recurring app.
 
@@ -5556,7 +5561,7 @@ def _render_recurring_grid(*, slots: list[Slot],
                 key=lambda u: u.name.lower(),
             )
             if available:
-                blocked = (blocked_by_date or {}).get(slot.local_date, set())
+                blocked = (blocked_by_date or {}).get(slot.local_date, {})
                 cohort_for_slot = (cohort_members_by_template or {}).get(
                     slot.template_id) or set()
                 cohort_active = [u for u in available
@@ -5585,7 +5590,8 @@ def _render_recurring_grid(*, slots: list[Slot],
                     parts.append(
                         f"<option value='{u.user_id}' disabled "
                         f"style='color:#aaa;font-style:italic'>"
-                        f"{html.escape(u.name)} (blocked)</option>")
+                        f"{html.escape(u.name)} "
+                        f"({html.escape(blocked[u.user_id])})</option>")
                 opts = "".join(parts)
                 actions.append(
                     "<form method='post' "
@@ -5713,7 +5719,7 @@ def _schedules_all_page(event: dict, user: User, community: Community | None,
         asgns_by_slot: dict[str, list[Assignment]] = {}
         for a in db.list_assignments_for_month(app.app_id, sch.yyyy_mm):
             asgns_by_slot.setdefault(a.slot_id, []).append(a)
-        blocked_by_date = _collect_blocked_by_date(app.app_id, slots)
+        blocked_by_date = _collect_blocked_by_date(app, slots)
         body += (
             f"<h3 style='margin-top:24px;color:#555'>"
             f"<a href='/schedules/{sch.yyyy_mm}' style='color:#2a7'>"
@@ -5778,7 +5784,7 @@ def _schedule_drilldown(user: User, community: Community | None,
         f"<span style='color:{_STATE_COLORS.get(sch.state, '#888')}'>"
         f"({html.escape(_state_label(sch.state))})</span></p>"
     )
-    blocked_by_date = _collect_blocked_by_date(app.app_id, slots)
+    blocked_by_date = _collect_blocked_by_date(app, slots)
     body += _drilldown_table(slots, asgns_by_slot, users_by_id,
                              yyyy_mm=yyyy_mm, member_ids=members,
                              cohorts=all_cohorts,
@@ -5939,17 +5945,66 @@ def _pretty_date(iso_date: str) -> str:
     return f"{_DAY_LABEL[date.weekday()]}, {_MONTH_LABEL[mo]} {d}"
 
 
-def _collect_blocked_by_date(app_id: str,
-                             slots: list[Slot]) -> dict[str, set[str]]:
-    """Look up blocked users for every distinct slot date in one place.
+def _inactive_memberships(app: Application) -> dict[str, Membership]:
+    """Members of a scheduling app who are marked inactive (whatever
+    their end date). Always empty for event apps, which have no
+    rotation to step out of."""
+    if app.app_type not in SCHEDULING_APP_TYPES:
+        return {}
+    return {m.user_id: m for m in db.list_memberships_for_app(app.app_id)
+            if m.inactive_since}
+
+
+def _inactive_label(m: Membership) -> str:
+    """'inactive' or 'inactive until Sun, November 15' for pick lists
+    and messages."""
+    if m.inactive_until:
+        return f"inactive until {_pretty_date(m.inactive_until)}"
+    return "inactive"
+
+
+def _unavailable_on(app: Application, local_date: str) -> dict[str, str]:
+    """{user_id: reason} for members who can't be scheduled on
+    local_date: a date they blocked, or being inactive."""
+    out = {uid: "blocked"
+           for uid in db.list_blocked_users_on_date(app.app_id, local_date)}
+    for uid, m in _inactive_memberships(app).items():
+        if m.inactive_on(local_date):
+            out[uid] = _inactive_label(m)
+    return out
+
+
+def _inactive_refusal(app: Application, membership: Membership | None,
+                      local_date: str) -> str | None:
+    """The message to show a member who tries to take on a slot on
+    local_date while inactive, or None if they may."""
+    if (app.app_type in SCHEDULING_APP_TYPES and membership is not None
+            and membership.inactive_on(local_date)):
+        return (f"You're marked {_inactive_label(membership)}, so you "
+                "can't take on new slots. To start again, choose "
+                "\u201cI'm back\u201d on My Availability.")
+    return None
+
+
+def _collect_blocked_by_date(app: Application,
+                             slots: list[Slot]) -> dict[str, dict[str, str]]:
+    """Look up unavailable members for every distinct slot date in one place.
 
     One round-trip per distinct date — usually a handful per month, so
-    cheaper than per-(slot, member) checks at render time. Returns an
-    empty dict when slots is empty.
+    cheaper than per-(slot, member) checks at render time. Each date maps
+    {user_id: reason}, where reason is "blocked" (the member blocked the
+    date) or an "inactive ..." label. Returns an empty dict when slots is
+    empty.
     """
-    out: dict[str, set[str]] = {}
+    out: dict[str, dict[str, str]] = {}
+    inactive = _inactive_memberships(app)
     for date in {s.local_date for s in slots}:
-        out[date] = db.list_blocked_users_on_date(app_id, date)
+        day = {uid: "blocked"
+               for uid in db.list_blocked_users_on_date(app.app_id, date)}
+        for uid, m in inactive.items():
+            if m.inactive_on(date):
+                day[uid] = _inactive_label(m)
+        out[date] = day
     return out
 
 
@@ -6008,7 +6063,7 @@ def _drilldown_table(slots: list[Slot],
                      yyyy_mm: str = "",
                      member_ids: set[str] | None = None,
                      cohorts: list | None = None,
-                     blocked_by_date: dict[str, set[str]] | None = None,
+                     blocked_by_date: dict[str, dict[str, str]] | None = None,
                      cohort_members_by_template: dict[str, set[str]] | None = None,
                      is_draft: bool = False) -> str:
     if not slots:
@@ -6109,7 +6164,7 @@ def _drilldown_table(slots: list[Slot],
                 key=lambda x: x[1],
             )
             if available_all:
-                blocked = (blocked_by_date or {}).get(s.local_date, set())
+                blocked = (blocked_by_date or {}).get(s.local_date, {})
                 cohort_for_slot = (cohort_members_by_template or {}).get(
                     s.template_id) or set()
                 cohort_active = [(uid, n) for uid, n in available_all
@@ -6134,7 +6189,8 @@ def _drilldown_table(slots: list[Slot],
                     parts.append(
                         f"<option value='{uid}' disabled "
                         f"style='color:#aaa;font-style:italic'>"
-                        f"{html.escape(name)} (blocked)</option>")
+                        f"{html.escape(name)} "
+                        f"({html.escape(blocked[uid])})</option>")
                 opts = "".join(parts)
                 available = available_all  # preserve original variable for the `if available:` guard below
                 # bulk-add shortcuts make sense only
@@ -7537,6 +7593,7 @@ def _notify_cohort_of_opening(releaser: User, community: Community,
     # Split cohort members into "already in slot" vs "available to cover"
     in_slot_targets: list[User] = []
     available_targets: list[User] = []
+    inactive = _inactive_memberships(app)
     for cm in cmems:
         target = users_by_id.get(cm.user_id)
         if not target or target.user_id == releaser.user_id:
@@ -7545,7 +7602,10 @@ def _notify_cohort_of_opening(releaser: User, community: Community,
             continue
         if target.user_id in assigned_ids:
             in_slot_targets.append(target)
-        else:
+        elif not (target.user_id in inactive
+                  and inactive[target.user_id].inactive_on(slot.local_date)):
+            # Inactive members aren't asked to cover. (Members who merely
+            # blocked the date still hear about it, as before.)
             available_targets.append(target)
 
     def _coverage_body(intro: str) -> str:
@@ -7726,6 +7786,9 @@ def _signup_assignment(event: dict, user: User, community: Community | None,
     sch = db.get_schedule(app.app_id, yyyy_mm)
     if not _schedule_visible(sch):
         return _error_redirect("/", "Schedule is not visible.")
+    refusal = _inactive_refusal(app, membership, slot.local_date)
+    if refusal:
+        return _error_redirect("/your-schedule", refusal)
     # Atomic signup: increment the slot's assignment_count AND write
     # the Assignment row in a single DDB TransactWriteItems. The
     # previous read-then-write pattern raced; two members clicking
@@ -7898,6 +7961,9 @@ def _api_cover_released(event: dict, user: User,
         return _error_redirect("/", "Slot not found.")
     if not community:
         return _error_redirect("/", "Community not found.")
+    refusal = _inactive_refusal(app, membership, slot.local_date)
+    if refusal:
+        return _error_redirect("/your-schedule", refusal)
 
     def _assign(target: User) -> bool:
         """Idempotent assignment. Returns True if we wrote a new row."""
@@ -8058,7 +8124,8 @@ def _open_slots_page(event: dict, user: User, community: Community | None,
                 )
             else:
                 name_parts.append(_confirm_name_html(vol.name, a))
-        if not full and not user_assigned:
+        if (not full and not user_assigned
+                and not _inactive_refusal(app, membership, s.local_date)):
             name_parts.append(
                 f"<form method='post' action='/api/assignments/signup"
                 f"?slot_id={s.slot_id}&month={s.yyyy_mm}' "
@@ -8109,6 +8176,17 @@ def _open_slots_page(event: dict, user: User, community: Community | None,
         "<a href='/my-availability' style='color:#2a7'>"
         "Set days I'm unavailable &rarr;</a></p>"
     )
+    if (app.app_type in SCHEDULING_APP_TYPES and membership is not None
+            and membership.inactive_on(today)):
+        availability_link = (
+            "<div style='margin:12px 0;padding:10px 14px;border-radius:4px;"
+            "border:1px solid #e3c27a;background:#fffaf0;color:#555'>"
+            "You're taking a break "
+            + (f"until {html.escape(_pretty_date(membership.inactive_until))}"
+               if membership.inactive_until else "until further notice")
+            + ", so you can't sign up for slots. "
+            "<a href='/my-availability' style='color:#2a7'>"
+            "Change this on My Availability &rarr;</a></div>")
     body = (
         f"<h1>{html.escape(org_name)}</h1>"
         + _flash_banner_html(event)
@@ -8205,6 +8283,7 @@ def _my_availability_page(event: dict, user: User,
         f"<h1>{html.escape(org_name)}</h1>"
         "<h2 style='font-size:1.1em;color:#444'>My availability</h2>"
         + _flash_banner_html(event)
+        + _pause_section_html(app, membership, today)
         + intro
         + "<h3 style='font-size:1em;color:#555;margin-top:24px'>"
         "Upcoming blocked dates</h3>"
@@ -8218,6 +8297,53 @@ def _my_availability_page(event: dict, user: User,
                 "<a href='/'>Back to Home</a></p>")
     )
     return _html(200, _page(body, title=org_name))
+
+
+def _pause_section_html(app: Application, membership: Membership | None,
+                        today: str) -> str:
+    """My Availability box for stepping out of the rotation: a "Pause my
+    scheduling" form while active, or the status and an "I'm back" button
+    while inactive. Empty for event apps and non-members."""
+    if app.app_type not in SCHEDULING_APP_TYPES or membership is None:
+        return ""
+    box = ("margin:16px 0 8px;padding:16px;border-radius:4px;"
+           "border:1px solid {b};background:{bg}")
+    if membership.inactive_on(today):
+        until = (f"until {html.escape(_pretty_date(membership.inactive_until))}"
+                 if membership.inactive_until else "until further notice")
+        return (
+            f"<div style='{box.format(b='#e3c27a', bg='#fffaf0')}'>"
+            "<b style='color:#a80'>You're taking a break</b> "
+            f"<span style='color:#555'>({until}).</span>"
+            "<p style='color:#555;margin:6px 0 10px;line-height:1.5'>"
+            "You won't be put on the schedule, asked to cover openings, "
+            "or sent the schedule for months you're out.</p>"
+            "<form method='post' action='/api/membership/inactive' "
+            "style='display:inline'>"
+            "<input type='hidden' name='action' value='resume'>"
+            "<button type='submit' style='padding:6px 16px;cursor:pointer;"
+            "font-size:1em'>I'm back &mdash; schedule me again</button>"
+            "</form></div>")
+    return (
+        "<details style='" + box.format(b="#eee", bg="#f8f8f8") + "'>"
+        "<summary style='cursor:pointer;font-weight:600;color:#444'>"
+        "Taking a break? Pause my scheduling</summary>"
+        "<p style='color:#555;margin:10px 0;line-height:1.5'>"
+        "While paused you won't be put on the schedule or asked to cover "
+        "openings. Slots you already have stay yours: withdraw or trade "
+        "them on <a href='/your-schedule' style='color:#2a7'>My Schedule"
+        "</a> if you can't make them.</p>"
+        "<form method='post' action='/api/membership/inactive'>"
+        "<input type='hidden' name='action' value='pause'>"
+        "<label style='display:block;color:#444;margin-bottom:8px'>"
+        "Back on (optional): "
+        f"<input type='date' name='until' min='{today}' "
+        "style='padding:6px;font-size:1em'></label>"
+        "<button type='submit' style='padding:6px 16px;cursor:pointer;"
+        "font-size:1em'>Pause my scheduling</button>"
+        "<span style='color:#888;font-size:0.9em;margin-left:8px'>"
+        "Leave the date blank for &ldquo;until further notice&rdquo;."
+        "</span></form></details>")
 
 
 def _api_blocked_date_add(event: dict, user: User,
@@ -8252,6 +8378,120 @@ def _api_blocked_date_add(event: dict, user: User,
     log.info("user %s blocked %s in app %s",
              user.user_id, local_date, app.app_id)
     return _redirect("/my-availability")
+
+
+def _api_membership_inactive(event: dict, user: User,
+                             community: Community | None,
+                             app: Application,
+                             membership: Membership | None) -> dict:
+    """Step a member out of a scheduling app's rotation, or back in.
+
+    A member acts on themselves (from My Availability); an admin may act
+    on any member of the app (from Members), named by ``user_id``.
+    ``action`` is "pause" (mark inactive, optional ``until`` date and
+    ``note``) or "resume". Existing assignments are left alone; the
+    member is told how many are still on their schedule.
+    """
+    method = (event.get("requestContext", {}).get("http", {}).get("method")
+              or event.get("httpMethod") or "GET").upper()
+    if method != "POST":
+        return _text(405, "POST required")
+    target_id = (_get_param(event, "user_id") or user.user_id).strip()
+    is_self = target_id == user.user_id
+    back = "/my-availability" if is_self else "/admin/users"
+    if not is_self and not _is_admin(user, membership):
+        return _text(403, "admins only")
+    if app.app_type not in SCHEDULING_APP_TYPES:
+        return _error_redirect_or_next(event, back,
+            "This kind of group has no rotation to step out of.")
+    target_mem = db.get_membership(app.app_id, target_id)
+    target = db.get_user(user.community_id, target_id)
+    if target_mem is None or target is None:
+        return _error_redirect_or_next(event, back,
+            "Not a member of this group.")
+    action = (_get_param(event, "action") or "").strip()
+    tz_name = (user.preferred_tz or
+               (community.default_timezone if community else "America/New_York"))
+    today = dt.datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    who = "You are" if is_self else f"{target.name} is"
+    if action == "resume":
+        db.set_membership_inactive(app.app_id, target_id, inactive=False)
+        log.info("user %s reactivated %s in app %s",
+                 user.user_id, target_id, app.app_id)
+        if is_self and community is not None:
+            _notify_admins_of_inactive_change(target, community, app,
+                                              paused=False)
+        return _notice_redirect_or_next(event, back, f"{who} active again.")
+    if action != "pause":
+        return _error_redirect_or_next(event, back, "Unknown action.")
+    until = (_get_param(event, "until") or "").strip() or None
+    if until and not _ISO_DATE_RE.match(until):
+        return _error_redirect_or_next(event, back,
+            "Invalid date — use the date picker.")
+    if until and until <= today:
+        return _error_redirect_or_next(event, back,
+            "Pick a return date after today, or leave it blank.")
+    note = (_get_param(event, "note") or "").strip()[:80] or None
+    db.set_membership_inactive(app.app_id, target_id, inactive=True,
+                               until=until, note=note)
+    log.info("user %s marked %s inactive in app %s until %s",
+             user.user_id, target_id, app.app_id, until or "-")
+    if is_self and community is not None:
+        _notify_admins_of_inactive_change(target, community, app,
+                                          paused=True, until=until)
+    still = [a for a in db.list_assignments_for_user(target_id,
+                                                     since_date=today)
+             if a.app_id == app.app_id
+             and (not until or a.local_date < until)]
+    msg = (f"{who} marked inactive"
+           + (f" until {_pretty_date(until)}." if until
+              else " until further notice."))
+    if still:
+        n = len(still)
+        msg += (f" {'You' if is_self else 'They'} still have {n} upcoming "
+                f"slot{'s' if n != 1 else ''} in that time"
+                + (": withdraw or trade on My Schedule if you can't "
+                   "cover them." if is_self else "."))
+    return _notice_redirect_or_next(event, back, msg)
+
+
+def _notify_admins_of_inactive_change(member: User, community: Community,
+                                      app: Application, *, paused: bool,
+                                      until: str | None = None) -> None:
+    """Tell the app's admins when a member steps out of (or back into)
+    the rotation themselves. Admin-made changes need no notice."""
+    aa_ids = {m.user_id for m in db.list_memberships_for_app(app.app_id)
+              if m.app_role == "aa" and m.user_id != member.user_id}
+    if not aa_ids:
+        return
+    domain = os.environ.get("DOMAIN_NAME", "community.example.org")
+    if paused:
+        subject = (f"{app.name} -- {member.name} paused their scheduling")
+        line = (f"{member.name} has stepped out of the rotation "
+                + (f"until {_pretty_date(until)}." if until
+                   else "until further notice."))
+    else:
+        subject = f"{app.name} -- {member.name} is back in the rotation"
+        line = f"{member.name} is available for scheduling again."
+    body_text = (f"Hi,\n\n{line}\n\nMembers: https://{domain}/admin/users"
+                 f"\n\n-- {app.name}\n")
+    from community_organizer.providers.email import get_email_provider
+    provider = get_email_provider()
+    for aa in db.list_users(community.community_id):
+        if (aa.user_id not in aa_ids or not aa.email
+                or aa.email_undeliverable):
+            continue
+        try:
+            provider.send(
+                community_id=community.community_id,
+                from_addr=f"organizer@{domain}", to_addr=aa.email,
+                subject=subject, body_text=body_text,
+                kind="change_notification",
+                related_user_id=aa.user_id,
+                related_app_id=app.app_id,
+            )
+        except Exception as e:    # noqa: BLE001
+            log.warning("inactive-notify failed user=%s: %s", aa.user_id, e)
 
 
 def _api_blocked_date_delete(event: dict, user: User,
@@ -8674,6 +8914,13 @@ def _api_admin_assign(event: dict, user: User, community: Community | None,
         return _error_redirect_or_next(event,
             f"/schedules/{yyyy_mm}",
             f"{target.name} has marked {slot.local_date} as unavailable.")
+    target_mem = db.get_membership(app.app_id, user_id)
+    if (app.app_type in SCHEDULING_APP_TYPES and target_mem
+            and target_mem.inactive_on(slot.local_date)):
+        return _error_redirect_or_next(event,
+            f"/schedules/{yyyy_mm}",
+            f"{target.name} is {_inactive_label(target_mem)}. Reactivate "
+            "them on the Members page first.")
     asg = Assignment(
         community_id=user.community_id, app_id=app.app_id,
         yyyy_mm=yyyy_mm, slot_id=slot_id, user_id=user_id,
@@ -8729,7 +8976,7 @@ def _api_admin_bulk_assign(event: dict, user: User, community: Community | None,
                       db.list_memberships_for_app(app.app_id)}
     # Honor member-declared unavailability — skip anyone who has
     # blocked this slot's date.
-    blocked = db.list_blocked_users_on_date(app.app_id, slot.local_date)
+    blocked = _unavailable_on(app, slot.local_date)
     # only "cohort:<id>" mode is supported now. The
     # legacy "all" mode (add every app member) was a UI experiment
     # that turned out to add clutter without solving a real workflow;
@@ -10592,6 +10839,33 @@ def _api_settings_defaults(event: dict, user: User, community: Community | None,
     return _redirect("/admin/settings")
 
 
+def _status_form_html(u: User, mem: Membership, today: str,
+                      next_url: str) -> str:
+    """Members-page edit row: set a member inactive with an optional
+    return date and note, or change those while they're out."""
+    paused = mem.inactive_on(today)
+    lbl = "display:flex;flex-direction:column;font-size:0.85em;color:#666"
+    return (
+        "<form method='post' action='/api/membership/inactive' "
+        "style='display:flex;gap:8px;align-items:end;flex-wrap:wrap;"
+        "margin-top:10px;padding-top:10px;border-top:1px dashed #ddd'>"
+        f"<input type='hidden' name='user_id' value='{u.user_id}'>"
+        "<input type='hidden' name='action' value='pause'>"
+        f"<input type='hidden' name='next' value='{html.escape(next_url)}'>"
+        "<span style='font-size:0.85em;color:#666;align-self:center'>"
+        + ("Inactive." if paused else "Active.") + "</span>"
+        f"<label style='{lbl}'>Back on (optional)"
+        f"<input type='date' name='until' min='{today}' "
+        f"value='{html.escape(mem.inactive_until or '') if paused else ''}' "
+        "style='padding:4px'></label>"
+        f"<label style='{lbl}'>Reason (optional)"
+        f"<input name='note' maxlength='80' "
+        f"value='{html.escape(mem.inactive_note or '') if paused else ''}' "
+        "placeholder='e.g. travel' style='padding:4px;width:140px'></label>"
+        "<button type='submit' style='padding:4px 12px;cursor:pointer'>"
+        + ("Update" if paused else "Mark inactive") + "</button></form>")
+
+
 def _users_page(event: dict, user: User, community: Community | None,
                 app: Application, membership: Membership | None) -> dict:
     if not _is_admin(user, membership):
@@ -10652,6 +10926,22 @@ def _users_page(event: dict, user: User, community: Community | None,
         for cm in db.list_cohort_members(c.cohort_id):
             user_cohorts.setdefault(cm.user_id, []).append(c.name)
     edit_id = _get_param(event, "edit")
+    # Scheduling apps: members can be out of the rotation for a while.
+    has_rotation = app.app_type in SCHEDULING_APP_TYPES
+    tz_name = (user.preferred_tz or
+               (community.default_timezone if community else "America/New_York"))
+    today = dt.datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    inactive_ids = {uid for uid, m in memberships.items()
+                    if has_rotation and m.inactive_on(today)}
+
+    def _status_note(m: Membership | None) -> str:
+        if m is None or m.user_id not in inactive_ids:
+            return ""
+        until = (f"until {_pretty_date(m.inactive_until)}"
+                 if m.inactive_until else "until further notice")
+        note = f" &middot; {html.escape(m.inactive_note)}" if m.inactive_note else ""
+        return ("<div style='font-size:0.8em;color:#a80;margin-top:2px;"
+                f"white-space:normal'>Inactive {until}{note}</div>")
 
     rows = ""
     for idx, u in enumerate(all_users):
@@ -10711,7 +11001,11 @@ def _users_page(event: dict, user: User, community: Community | None,
                 + "<button type='submit' style='padding:4px 12px;cursor:pointer'>"
                 "Save</button>"
                 " <a href='/admin/users' style='font-size:0.85em'>cancel</a>"
-                "</form></td></tr>"
+                "</form>"
+                + (_status_form_html(u, mem, today,
+                                     f"/admin/users#user-{anchor_uid}")
+                   if has_rotation and mem else "")
+                + "</td></tr>"
             )
         else:
             bounce_cell = ""
@@ -10782,6 +11076,27 @@ def _users_page(event: dict, user: User, community: Community | None,
                     f"<button type='submit' style='{_act};color:#a80'>"
                     "reset access</button></form>"
                 )
+            if has_rotation and mem is not None:
+                paused = u.user_id in inactive_ids
+                actions.append(
+                    "<form method='post' action='/api/membership/inactive' "
+                    "style='display:inline'"
+                    + ("" if paused else
+                       f" onsubmit=\"return confirmSubmit(this,"
+                       f"'Mark {html.escape(u.name)} inactive until further "
+                       "notice? They will not be scheduled or asked to "
+                       "cover. Use edit to set a return date.',"
+                       "'Mark inactive','#a80')\"")
+                    + ">"
+                    f"<input type='hidden' name='user_id' value='{u.user_id}'>"
+                    "<input type='hidden' name='action' "
+                    f"value='{'resume' if paused else 'pause'}'>"
+                    "<input type='hidden' name='next' "
+                    f"value='/admin/users#user-{anchor_uid}'>"
+                    f"<button type='submit' style='{_act};"
+                    f"color:{'#2a7' if paused else '#a80'}'>"
+                    f"{'reactivate' if paused else 'mark inactive'}"
+                    "</button></form>")
             if not is_self:
                 actions.append(
                     f"<form method='post' action='/api/users/remove-from-app"
@@ -10801,7 +11116,8 @@ def _users_page(event: dict, user: User, community: Community | None,
             rows += (
                 f"<tr id='user-{u.user_id}' style='scroll-margin-top:120px'>"
                 f"<td style='padding:6px 12px;white-space:nowrap;text-align:left'>"
-                f"{html.escape(u.name)}{bounce_cell}{_household_note(u)}</td>"
+                f"{html.escape(u.name)}{bounce_cell}{_household_note(u)}"
+                f"{_status_note(mem)}</td>"
                 f"<td style='padding:6px 12px;font-size:0.9em;text-align:left'>"
                 f"{html.escape(u.email)}</td>"
                 f"<td style='padding:6px 12px;font-size:0.9em;text-align:center'>"
@@ -10871,11 +11187,19 @@ def _users_page(event: dict, user: User, community: Community | None,
             "</tr></thead><tbody>" + rows + "</tbody></table></div>"
         )
 
+    count_line = ""
+    if has_rotation and all_users:
+        count_line = (
+            "<p style='color:#666;margin:4px 0'>"
+            f"{len(all_users) - len(inactive_ids)} active"
+            + (f" &middot; {len(inactive_ids)} inactive" if inactive_ids else "")
+            + "</p>")
     body = (
         f"<h1>{html.escape(org_name)}</h1>"
         "<h2 style='font-size:1.1em;color:#444'>Manage members</h2>"
         + _flash_banner_html(event)
         + conflict_banner
+        + count_line
         + table + add_form
         + _admin_nav_bar("members", app=app)
     )
@@ -11491,6 +11815,16 @@ def _api_swap_create(event: dict, user: User, community: Community | None,
     )
     if not has_assignment:
         return _text(403, "you are not assigned to that slot")
+    # An inactive member can still withdraw from slots they hold, but a
+    # trade would hand them a different slot to cover.
+    for pref_id in preferred:
+        pref = db.find_slot_in_month(app.app_id, yyyy_mm, pref_id)
+        refusal = pref and _inactive_refusal(app, membership, pref.local_date)
+        if refusal:
+            return _error_redirect("/your-schedule",
+                refusal.replace("take on new slots",
+                                "trade into another slot") +
+                " Or withdraw from this one.")
     from community_organizer.core.models import SwapRequest
     swap = SwapRequest(
         community_id=user.community_id, app_id=app.app_id, yyyy_mm=yyyy_mm,
@@ -11728,6 +12062,9 @@ def _api_swap_accept(event: dict, user: User, community: Community | None,
     requester = db.get_user(user.community_id, swap.requester_user_id)
     if not requester:
         return _text(404, "requester not found")
+    refusal = _inactive_refusal(app, membership, release_slot.local_date)
+    if refusal:
+        return _error_redirect("/your-schedule", refusal)
     if not swap.released:
         db.delete_assignment(app.app_id, yyyy_mm, swap.release_slot_id, swap.requester_user_id)
     db.delete_assignment(app.app_id, yyyy_mm, accept_slot_id, user.user_id)
@@ -15629,6 +15966,19 @@ def _error_redirect_or_next(event: dict, default_source: str, msg: str) -> dict:
     raw_next = _get_param(event, "next")
     source = _safe_next(raw_next) if raw_next else default_source
     return _error_redirect(source, msg)
+
+
+def _notice_redirect_or_next(event: dict, default_source: str,
+                             msg: str) -> dict:
+    """The success-path twin of ``_error_redirect_or_next``: land on the
+    form's ``next`` (or ``default_source``) with ``?notice=`` set,
+    keeping any ``#fragment``."""
+    raw_next = _get_param(event, "next")
+    source = _safe_next(raw_next) if raw_next else default_source
+    base, _, frag = source.partition("#")
+    sep = "&" if "?" in base else "?"
+    url = f"{base}{sep}notice={urllib.parse.quote(msg, safe='')}"
+    return _redirect(url + (f"#{frag}" if frag else ""))
 
 
 _FLASH_BANNER_STYLE_ERROR = (

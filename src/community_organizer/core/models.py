@@ -199,6 +199,21 @@ class Membership:
     # poll form; the send-poll/close fan-outs skip opted-out members.
     opted_out: bool = False
     opted_out_at: str | None = None
+    # Scheduling apps only (coverage / recurring_commitments): a member
+    # who has stepped back from the rotation for a while. Set by the
+    # member ("Pause my scheduling") or an admin. While inactive they
+    # are left out of the pick list, bulk assign, sign-ups and opening
+    # emails; existing assignments and history are untouched.
+    # inactive_until is the first date they count as active again
+    # (YYYY-MM-DD); None means "until further notice".
+    inactive_since: str | None = None
+    inactive_until: str | None = None
+    inactive_note: str | None = None
+
+    def inactive_on(self, local_date: str) -> bool:
+        """True if this member is out of the rotation on local_date."""
+        return bool(self.inactive_since) and (
+            not self.inactive_until or local_date < self.inactive_until)
 
 
 @dataclass

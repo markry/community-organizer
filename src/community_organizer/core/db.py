@@ -782,6 +782,46 @@ def set_membership_opt_out(app_id: str, user_id: str,
         raise
 
 
+def set_membership_inactive(app_id: str, user_id: str, *,
+                            inactive: bool, until: str | None = None,
+                            note: str | None = None) -> bool:
+    """Mark a member inactive in THIS app (or active again).
+
+    Same atomic ``update_item`` + ``attribute_exists`` guard as
+    ``set_membership_opt_out``. Re-marking an already-inactive member
+    keeps the original ``inactive_since`` so "inactive since" stays
+    true; only the end date and note change. Returns False when the
+    membership doesn't exist.
+    """
+    from botocore.exceptions import ClientError
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    if inactive:
+        # Not if_not_exists(): put_membership writes the attribute as an
+        # explicit NULL, which counts as existing.
+        current = get_membership(app_id, user_id)
+        since = (current.inactive_since if current else None) or now
+        expr = ("SET inactive_since = :t, "
+                "inactive_until = :u, inactive_note = :n")
+        values = {":t": since, ":u": until or None, ":n": note or None}
+    else:
+        expr = "REMOVE inactive_since, inactive_until, inactive_note"
+        values = None
+    kwargs = {"ExpressionAttributeValues": values} if values else {}
+    try:
+        _table().update_item(
+            Key={"PK": _app_pk(app_id), "SK": _member_sk(user_id)},
+            UpdateExpression=expr,
+            ConditionExpression="attribute_exists(SK)",
+            **kwargs,
+        )
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == \
+                "ConditionalCheckFailedException":
+            return False
+        raise
+    return True
+
+
 def list_memberships_for_user(user_id: str) -> Iterator[Membership]:
     """GSI1 lookup: every Application this user is a member of.
 

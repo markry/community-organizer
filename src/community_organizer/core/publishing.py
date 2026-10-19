@@ -203,6 +203,19 @@ def _month_human(yyyy_mm: str) -> str:
     return f"{_MONTH_LABEL[int(m)]} {y}"
 
 
+def _month_bounds(period: str) -> tuple[str, str]:
+    """First and last date (ISO) of a schedule period: "2026-05" (a month)
+    or "2026-W22" (an ISO week)."""
+    if "-W" in period:
+        y, w = period.split("-W")
+        first = dt.date.fromisocalendar(int(y), int(w), 1)
+        return first.isoformat(), (first + dt.timedelta(days=6)).isoformat()
+    y, m = (int(x) for x in period.split("-"))
+    first = dt.date(y, m, 1)
+    nxt = dt.date(y + (m == 12), m % 12 + 1, 1)
+    return first.isoformat(), (nxt - dt.timedelta(days=1)).isoformat()
+
+
 @dataclass
 class PublishPlan:
     """One planned broadcast email — the unit of work ``plan_publish`` returns.
@@ -432,14 +445,21 @@ def plan_publish(community: Community, app: Application,
     for a in db.list_assignments_for_month(app.app_id, yyyy_mm):
         asgns_by_user.setdefault(a.user_id, []).append(a)
 
-    member_user_ids = {m.user_id for m in db.list_memberships_for_app(app.app_id)}
+    memberships = {m.user_id: m for m in db.list_memberships_for_app(app.app_id)}
+    month_first, month_last = _month_bounds(yyyy_mm)
     plans: list[PublishPlan] = []
     for user in db.list_users(community.community_id):
-        if user.user_id not in member_user_ids:
+        mem = memberships.get(user.user_id)
+        if mem is None:
             continue
         if user.email_undeliverable or not user.email or user.channel == "none":
             continue
         user_asgns = asgns_by_user.get(user.user_id, [])
+        # A member out of the rotation for the whole month, with nothing
+        # assigned in it, has no reason to get the schedule.
+        if (not user_asgns and mem.inactive_on(month_first)
+                and mem.inactive_on(month_last)):
+            continue
         user_slots = [slots_by_id[a.slot_id] for a in user_asgns
                       if a.slot_id in slots_by_id]
         user_slots.sort(key=lambda s: (s.local_date, s.start_time))

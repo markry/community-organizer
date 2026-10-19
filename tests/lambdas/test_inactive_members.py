@@ -7,13 +7,20 @@ apps have no rotation and refuse the action.
 """
 from __future__ import annotations
 
+import copy
+import datetime as dt
+import json
+import shutil
+import subprocess
 import urllib.parse
+from html.parser import HTMLParser
 
 import pytest
 
 from community_organizer.core import db, publishing
 from community_organizer.core.models import (
-    Application, Assignment, Community, Membership, Schedule, Slot, User,
+    Application, Assignment, Community, Membership, Schedule, Slot,
+    SwapRequest, User,
 )
 from community_organizer.lambdas import web
 
@@ -446,3 +453,211 @@ def test_weekly_grid_hides_sign_up_while_paused(weekly) -> None:
                                inactive=True)
     assert "+ Sign up" not in grid()
     assert "Take this slot weekly" not in grid()
+
+
+# ---- review fixes -----------------------------------------------------------
+
+def _assign(w, u: User, slot: Slot | None = None) -> None:
+    s = slot or w["slot"]
+    db.put_assignment(Assignment(
+        community_id=CID, app_id=w["app"].app_id, yyyy_mm=s.yyyy_mm,
+        slot_id=s.slot_id, user_id=u.user_id, local_date=s.local_date))
+
+
+def _slot_like(w, slot_id: str, **changes) -> Slot:
+    s = copy.deepcopy(w["slot"])
+    s.slot_id = slot_id
+    for k, v in changes.items():
+        setattr(s, k, v)
+    db.put_slot(s)
+    return s
+
+
+def _onsubmit_handlers(page: str) -> list[str]:
+    class Forms(HTMLParser):
+        handlers: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            d = dict(attrs)
+            if tag == "form" and d.get("onsubmit"):
+                self.handlers.append(d["onsubmit"])
+    p = Forms()
+    p.handlers = []
+    p.feed(page)
+    return p.handlers
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+def test_confirm_messages_survive_apostrophes_and_quotes(world) -> None:
+    w = world
+    w["member"].name = "Member's label'+(globalThis.marker=1)+'"
+    db.put_user(w["member"])
+    page = web._users_page(_get("/admin/users"), w["admin"], w["community"],
+                           w["app"], _mem(w, w["admin"]))["body"]
+    handlers = [h for h in _onsubmit_handlers(page) if "Member" in h]
+    assert len(handlers) >= 2          # mark inactive + remove from app
+    js = ("globalThis.marker=0;let msgs=[];"
+          "globalThis.confirmSubmit=(f,m)=>{msgs.push(m);return true};"
+          + "".join(f"new Function({json.dumps(h)}).call({{}});"
+                    for h in handlers)
+          + "if(globalThis.marker!==0)throw Error('ran');"
+          "if(!msgs.every(m=>m.includes(\"Member's label'+\")))"
+          "throw Error(JSON.stringify(msgs));")
+    subprocess.run(["node", "-e", js], check=True, capture_output=True,
+                   text=True)
+
+
+def test_impossible_return_date_is_refused(world) -> None:
+    resp = _pause(world, world["member"],
+                  {"action": "pause", "until": "2030-02-31"})
+    assert "Invalid date" in _location(resp)
+    assert not _mem(world, world["member"]).inactive_since
+
+
+def test_a_malformed_stored_date_does_not_break_pages(world) -> None:
+    w = world
+    db.set_membership_inactive(w["app"].app_id, w["member"].user_id,
+                               inactive=True, until="2030-02-31")
+    web._users_page(_get("/admin/users"), w["admin"], w["community"],
+                    w["app"], _mem(w, w["admin"]))
+    web._my_availability_page(_get("/my-availability"), w["member"],
+                              w["community"], w["app"],
+                              _mem(w, w["member"]))
+
+
+def test_copy_from_leaves_out_inactive_members(world) -> None:
+    w = world
+    _assign(w, w["member"])
+    target = _slot_like(w, "next-month", yyyy_mm="2030-07",
+                        local_date="2030-07-07", concrete_date="2030-07-07")
+    db.set_membership_inactive(w["app"].app_id, w["member"].user_id,
+                               inactive=True)
+    resp = web._api_schedule_copy_from(
+        _post("/api/schedules/copy-from",
+              {"month": "2030-07", "source": "2030-06"}),
+        w["admin"], w["community"], w["app"], _mem(w, w["admin"]))
+    assert "Left out 1" in _location(resp)
+    assert not list(db.list_assignments_for_slot(w["app"].app_id, "2030-07",
+                                                 target.slot_id))
+
+
+def test_split_refuses_an_inactive_partner(world) -> None:
+    w = world
+    prior = _slot_like(w, "prior", start_time="07:00")
+    _assign(w, w["member"], prior)
+    db.set_membership_inactive(w["app"].app_id, w["member"].user_id,
+                               inactive=True)
+    resp = web._api_cover_released(
+        _post("/api/assignments/cover",
+              {"slot_id": w["slot"].slot_id, "month": "2030-06",
+               "mode": "split", "with": w["member"].user_id}),
+        w["admin"], w["community"], w["app"], _mem(w, w["admin"]))
+    assert "taking a break" in _location(resp)
+    assert not list(db.list_assignments_for_slot(w["app"].app_id, "2030-06",
+                                                 w["slot"].slot_id))
+
+
+def test_trade_refused_once_the_requester_pauses(world) -> None:
+    w = world
+    second = _slot_like(w, "second", local_date="2030-06-09",
+                        concrete_date="2030-06-09")
+    _assign(w, w["member"])
+    _assign(w, w["admin"], second)
+    swap = SwapRequest(community_id=CID, app_id=w["app"].app_id,
+                       yyyy_mm="2030-06", requester_user_id=w["member"].user_id,
+                       release_slot_id=w["slot"].slot_id,
+                       preferred_slot_ids=[second.slot_id])
+    db.put_swap(swap)
+    db.set_membership_inactive(w["app"].app_id, w["member"].user_id,
+                               inactive=True)
+    resp = web._api_swap_accept(
+        _post("/api/swap/accept",
+              {"swap_id": swap.swap_id, "month": "2030-06",
+               "accept_slot_id": second.slot_id}),
+        w["admin"], w["community"], w["app"], _mem(w, w["admin"]))
+    assert "taking a break" in _location(resp)
+    assert {a.user_id for a in db.list_assignments_for_slot(
+        w["app"].app_id, "2030-06", second.slot_id)} == {w["admin"].user_id}
+
+
+def test_neighbor_cover_emails_skip_inactive_members(world) -> None:
+    w = world
+    w["app"].app_type = "recurring_commitments"
+    prior = _slot_like(w, "prior", start_time="07:00")
+    _assign(w, w["member"], prior)
+    db.set_membership_inactive(w["app"].app_id, w["member"].user_id,
+                               inactive=True)
+    web._send_take_or_split_emails(w["admin"], w["community"], w["app"],
+                                   w["slot"], "2030-06")
+    assert not [m for m in w["outbox"].sent
+                if m["to_addr"] == w["member"].email]
+
+
+def test_resume_restores_weeks_made_while_paused(weekly) -> None:
+    w = weekly
+    u = w["paused"]
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W22")
+    db.delete_assignment(w["app"].app_id, "2030-W22",
+                         next(iter(db.list_slots(w["app"].app_id,
+                                                 "2030-W22"))).slot_id,
+                         u.user_id)          # withdrew from that week
+    older = db.get_schedule(w["app"].app_id, "2030-W22")
+    older.created_at = "2020-01-01T00:00:00+00:00"   # before the pause
+    db.put_schedule(older)
+    db.set_membership_inactive(w["app"].app_id, u.user_id, inactive=True)
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
+    assert u.user_id not in _assigned(w["app"], "2030-W23")
+    resp = _pause(w, u, {"action": "resume"})
+    assert "back on 1 weekly slot" in _location(resp)
+    assert u.user_id in _assigned(w["app"], "2030-W23")
+    assert u.user_id not in _assigned(w["app"], "2030-W22")
+
+
+def test_earlier_return_date_restores_weeks_from_then(weekly) -> None:
+    w = weekly
+    u = w["paused"]
+    db.set_membership_inactive(w["app"].app_id, u.user_id, inactive=True)
+    for period in ("2030-W23", "2030-W24"):        # Wed Jun 5, Jun 12
+        web._ensure_period_materialized(w["community"], w["app"], period)
+    _pause(w, u, {"action": "pause", "until": "2030-06-10"})
+    assert u.user_id not in _assigned(w["app"], "2030-W23")
+    assert u.user_id in _assigned(w["app"], "2030-W24")
+
+
+def test_today_is_the_apps_day_not_the_admins(world, monkeypatch) -> None:
+    class Clock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 20, 2, tzinfo=dt.timezone.utc).astimezone(tz)
+    monkeypatch.setattr(web.dt, "datetime", Clock)
+    w = world
+    w["app"].default_timezone = "America/New_York"     # still Oct 19 there
+    w["admin"].preferred_tz = "Asia/Tokyo"             # already Oct 20
+    resp = _pause(w, w["admin"], {"action": "pause", "until": "2026-10-20",
+                                  "user_id": w["member"].user_id})
+    assert "notice=" in resp["headers"]["Location"]
+    assert _mem(w, w["member"]).inactive_until == "2026-10-20"
+
+
+def test_a_vanished_membership_is_not_reported_as_saved(world,
+                                                        monkeypatch) -> None:
+    w = world
+    real = db.set_membership_inactive
+
+    def vanish(app_id, user_id, **kw):
+        db.delete_membership(app_id, user_id)
+        return real(app_id, user_id, **kw)
+    monkeypatch.setattr(db, "set_membership_inactive", vanish)
+    resp = _pause(w, w["member"], {"action": "pause"})
+    assert "error=" in resp["headers"]["Location"]
+    assert not w["outbox"].sent
+
+
+def test_a_mail_failure_does_not_fail_the_pause(world, monkeypatch) -> None:
+    def broken():
+        raise RuntimeError("no mail today")
+    monkeypatch.setattr(
+        "community_organizer.providers.email.get_email_provider", broken)
+    resp = _pause(world, world["member"], {"action": "pause"})
+    assert "notice=" in resp["headers"]["Location"]
+    assert _mem(world, world["member"]).inactive_since

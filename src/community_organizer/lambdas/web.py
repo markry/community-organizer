@@ -5956,9 +5956,38 @@ _MONTH_LABEL = {1: "January", 2: "February", 3: "March", 4: "April",
 
 
 def _pretty_date(iso_date: str) -> str:
-    y, mo, d = (int(x) for x in iso_date.split("-"))
-    date = dt.date(y, mo, d)
-    return f"{_DAY_LABEL[date.weekday()]}, {_MONTH_LABEL[mo]} {d}"
+    try:
+        date = dt.date.fromisoformat(iso_date)
+    except (TypeError, ValueError):
+        # A malformed stored date shouldn't take the whole page down.
+        return str(iso_date)
+    return f"{_DAY_LABEL[date.weekday()]}, {_MONTH_LABEL[date.month]} {date.day}"
+
+
+def _next_day(iso_date: str) -> str:
+    return (dt.date.fromisoformat(iso_date) + dt.timedelta(days=1)).isoformat()
+
+
+def _valid_iso_date(s: str) -> bool:
+    """True for a real calendar date written YYYY-MM-DD."""
+    if not _ISO_DATE_RE.match(s):
+        return False
+    try:
+        dt.date.fromisoformat(s)
+    except ValueError:
+        return False
+    return True
+
+
+def _js_str(s: str) -> str:
+    """Text to put inside a single-quoted JavaScript string in an HTML
+    attribute (the confirmSubmit messages). The browser decodes HTML
+    entities before the script is parsed, so html.escape alone would let
+    an apostrophe end the string."""
+    js = (s.replace("\\", "\\\\").replace("'", "\\'")
+          .replace("\n", "\\n").replace("\r", "\\r")
+          .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+    return html.escape(js)
 
 
 def _inactive_memberships(app: Application) -> dict[str, Membership]:
@@ -7409,8 +7438,14 @@ def _send_take_or_split_emails(
     prior_users, next_users = _find_adjacent_assignees(app, slot, yyyy_mm)
     # Don't try to email the releaser themselves (e.g., they released
     # two consecutive slots).
-    prior_users = [u for u in prior_users if u.user_id != releaser.user_id]
-    next_users = [u for u in next_users if u.user_id != releaser.user_id]
+    # Nor anyone taking a break that day: they keep the slots they hold
+    # but aren't asked to take on more, or offered as a split partner.
+    out = {uid for uid, m in _inactive_memberships(app).items()
+           if m.inactive_on(slot.local_date)}
+    prior_users = [u for u in prior_users
+                   if u.user_id != releaser.user_id and u.user_id not in out]
+    next_users = [u for u in next_users
+                  if u.user_id != releaser.user_id and u.user_id not in out]
     if not (prior_users or next_users):
         return
     domain = os.environ.get("DOMAIN_NAME", "community.example.org")
@@ -7996,6 +8031,13 @@ def _api_cover_released(event: dict, user: User,
     refusal = _inactive_refusal(app, membership, slot.local_date)
     if refusal:
         return _error_redirect("/your-schedule", refusal)
+    if mode == "split" and with_uid:
+        partner_mem = db.get_membership(app.app_id, with_uid)
+        if (partner_mem is not None
+                and partner_mem.inactive_on(slot.local_date)):
+            return _error_redirect("/your-schedule",
+                "Your partner is taking a break from the schedule, so "
+                "they can't be added. You can still take the whole slot.")
 
     def _assign(target: User) -> bool:
         """Idempotent assignment. Returns True if we wrote a new row."""
@@ -8259,7 +8301,7 @@ def _my_availability_page(event: dict, user: User,
             "<form method='post' action='/api/blocked-dates/delete' "
             "style='display:inline' "
             f"onsubmit=\"return confirmSubmit(this,"
-            f"'Remove the block for {html.escape(_pretty_date(b.local_date))}?',"
+            f"'Remove the block for {_js_str(_pretty_date(b.local_date))}?',"
             "'Remove','#c33')\">"
             f"<input type='hidden' name='local_date' value='{b.local_date}'>"
             "<button type='submit' style='font-size:0.85em;cursor:pointer;"
@@ -8360,7 +8402,7 @@ def _pause_section_html(app: Application, membership: Membership | None,
         "<input type='hidden' name='action' value='pause'>"
         "<label style='display:block;color:#444;margin-bottom:8px'>"
         "Back on (optional): "
-        f"<input type='date' name='until' min='{today}' "
+        f"<input type='date' name='until' min='{_next_day(today)}' "
         "style='padding:6px;font-size:1em'></label>"
         "<button type='submit' style='padding:6px 16px;cursor:pointer;"
         "font-size:1em'>Pause my scheduling</button>"
@@ -8433,30 +8475,44 @@ def _api_membership_inactive(event: dict, user: User,
         return _error_redirect_or_next(event, back,
             "Not a member of this group.")
     action = (_get_param(event, "action") or "").strip()
-    tz_name = (user.preferred_tz or
-               (community.default_timezone if community else "America/New_York"))
+    # Slot dates are in the app's zone, so "today" is too: an admin's
+    # own zone mustn't change which return dates are allowed.
+    tz_name = (app.default_timezone
+               or (community.default_timezone if community else None)
+               or "America/New_York")
     today = dt.datetime.now(ZoneInfo(tz_name)).date().isoformat()
     who = "You are" if is_self else f"{target.name} is"
     if action == "resume":
-        db.set_membership_inactive(app.app_id, target_id, inactive=False)
+        if not db.set_membership_inactive(app.app_id, target_id,
+                                          inactive=False):
+            return _error_redirect_or_next(event, back,
+                "Not a member of this group.")
+        restored = _restore_paused_weeks(community, app, target_mem, today)
         log.info("user %s reactivated %s in app %s",
                  user.user_id, target_id, app.app_id)
         if is_self and community is not None:
             _notify_admins_of_inactive_change(target, community, app,
                                               paused=False)
-        return _notice_redirect_or_next(event, back, f"{who} active again.")
+        return _notice_redirect_or_next(event, back, f"{who} active again."
+            + (f" {'You are' if is_self else 'They are'} back on "
+               f"{restored} weekly slot{'s' if restored != 1 else ''} "
+               "already on the schedule." if restored else ""))
     if action != "pause":
         return _error_redirect_or_next(event, back, "Unknown action.")
     until = (_get_param(event, "until") or "").strip() or None
-    if until and not _ISO_DATE_RE.match(until):
+    if until and not _valid_iso_date(until):
         return _error_redirect_or_next(event, back,
             "Invalid date — use the date picker.")
     if until and until <= today:
         return _error_redirect_or_next(event, back,
             "Pick a return date after today, or leave it blank.")
     note = (_get_param(event, "note") or "").strip()[:80] or None
-    db.set_membership_inactive(app.app_id, target_id, inactive=True,
-                               until=until, note=note)
+    if not db.set_membership_inactive(app.app_id, target_id, inactive=True,
+                                      until=until, note=note):
+        return _error_redirect_or_next(event, back,
+            "Not a member of this group.")
+    # An earlier return date can bring back weeks already generated.
+    _restore_paused_weeks(community, app, target_mem, today)
     log.info("user %s marked %s inactive in app %s until %s",
              user.user_id, target_id, app.app_id, until or "-")
     if is_self and community is not None:
@@ -8482,7 +8538,20 @@ def _notify_admins_of_inactive_change(member: User, community: Community,
                                       app: Application, *, paused: bool,
                                       until: str | None = None) -> None:
     """Tell the app's admins when a member steps out of (or back into)
-    the rotation themselves. Admin-made changes need no notice."""
+    the rotation themselves. Admin-made changes need no notice. Best
+    effort: the change is already saved, so a failure here is logged and
+    never fails the request."""
+    try:
+        _send_inactive_change_notice(member, community, app,
+                                     paused=paused, until=until)
+    except Exception as e:    # noqa: BLE001
+        log.warning("inactive-notify failed app=%s member=%s: %s",
+                    app.app_id, member.user_id, e)
+
+
+def _send_inactive_change_notice(member: User, community: Community,
+                                  app: Application, *, paused: bool,
+                                  until: str | None) -> None:
     aa_ids = {m.user_id for m in db.list_memberships_for_app(app.app_id)
               if m.app_role == "aa" and m.user_id != member.user_id}
     if not aa_ids:
@@ -8877,7 +8946,8 @@ def _api_schedule_copy_from(event: dict, user: User, community: Community | None
         for i, s in enumerate(slot_list):
             src_ordinal[s.slot_id] = i
     source_asgns = list(db.list_assignments_for_month(app.app_id, source_mm))
-    copied = 0
+    inactive = _inactive_memberships(app)
+    copied = skipped = 0
     for a in source_asgns:
         src_slot = src_slot_map.get(a.slot_id)
         if not src_slot:
@@ -8888,6 +8958,10 @@ def _api_schedule_copy_from(event: dict, user: User, community: Community | None
         if ordinal >= len(tgt_list):
             continue
         tgt_slot = tgt_list[ordinal]
+        m = inactive.get(a.user_id)
+        if m is not None and m.inactive_on(tgt_slot.local_date):
+            skipped += 1
+            continue
         asg = Assignment(
             community_id=user.community_id, app_id=app.app_id,
             yyyy_mm=target_mm, slot_id=tgt_slot.slot_id,
@@ -8896,8 +8970,14 @@ def _api_schedule_copy_from(event: dict, user: User, community: Community | None
         )
         db.put_assignment(asg)
         copied += 1
-    log.info("admin %s copied %d assignments from %s to %s",
-             user.user_id, copied, source_mm, target_mm)
+    log.info("admin %s copied %d assignments from %s to %s "
+             "(%d skipped: member inactive)",
+             user.user_id, copied, source_mm, target_mm, skipped)
+    if skipped:
+        return _notice_redirect_or_next(event, f"/schedules/{target_mm}",
+            f"Copied {copied} assignment{'s' if copied != 1 else ''}. "
+            f"Left out {skipped} for members who are inactive on those "
+            "dates.")
     return _redirect(f"/schedules/{target_mm}")
 
 
@@ -9435,7 +9515,7 @@ def _templates_page(event: dict, user: User, community: Community | None,
                 f"<form method='post' action='/api/templates/delete"
                 f"?template_id={t.template_id}' style='display:inline'"
                 f" onsubmit=\"return confirmSubmit(this,"
-                f"'Delete template: {html.escape(t.name)}?',"
+                f"'Delete template: {_js_str(t.name)}?',"
                 f"'Delete','#c33')\">"
                 "<button type='submit' style='font-size:0.85em;cursor:pointer;"
                 "color:#c33;background:none;border:none;text-decoration:underline;"
@@ -10878,7 +10958,7 @@ def _status_form_html(u: User, mem: Membership, today: str,
         "<span style='font-size:0.85em;color:#666;align-self:center'>"
         + ("Inactive." if paused else "Active.") + "</span>"
         f"<label style='{lbl}'>Back on (optional)"
-        f"<input type='date' name='until' min='{today}' "
+        f"<input type='date' name='until' min='{_next_day(today)}' "
         f"value='{html.escape(mem.inactive_until or '') if paused else ''}' "
         "style='padding:4px'></label>"
         f"<label style='{lbl}'>Reason (optional)"
@@ -11089,7 +11169,7 @@ def _users_page(event: dict, user: User, community: Community | None,
                     f"<form method='post' action='/api/users/reset-access"
                     f"?user_id={u.user_id}' style='display:inline'"
                     f" onsubmit=\"return confirmSubmit(this,"
-                    f"'Reset access for {html.escape(u.name)}? Their "
+                    f"'Reset access for {_js_str(u.name)}? Their "
                     f"password will be reset and they will be signed out "
                     f"of all devices. They can recover access via the "
                     f"\\x27New user or forgot your password?\\x27 link.',"
@@ -11106,7 +11186,7 @@ def _users_page(event: dict, user: User, community: Community | None,
                     "style='display:inline'"
                     + ("" if paused else
                        f" onsubmit=\"return confirmSubmit(this,"
-                       f"'Mark {html.escape(u.name)} inactive until further "
+                       f"'Mark {_js_str(u.name)} inactive until further "
                        "notice? They will not be scheduled or asked to "
                        "cover. Use edit to set a return date.',"
                        "'Mark inactive','#a80')\"")
@@ -11125,7 +11205,7 @@ def _users_page(event: dict, user: User, community: Community | None,
                     f"<form method='post' action='/api/users/remove-from-app"
                     f"?user_id={u.user_id}' style='display:inline'"
                     f" onsubmit=\"return confirmSubmit(this,"
-                    f"'Remove {html.escape(u.name)} from this app? "
+                    f"'Remove {_js_str(u.name)} from this app? "
                     f"They will remain in the community.','Remove','#a80')\">"
                     f"<input type='hidden' name='next' "
                     f"value='/admin/users#user-{anchor_uid}'>"
@@ -12088,6 +12168,12 @@ def _api_swap_accept(event: dict, user: User, community: Community | None,
     refusal = _inactive_refusal(app, membership, release_slot.local_date)
     if refusal:
         return _error_redirect("/your-schedule", refusal)
+    requester_mem = db.get_membership(app.app_id, swap.requester_user_id)
+    if (requester_mem is not None
+            and requester_mem.inactive_on(accept_slot.local_date)):
+        return _error_redirect("/your-schedule",
+            f"{requester.name} is taking a break from the schedule, so "
+            "this trade can't go ahead.")
     if not swap.released:
         db.delete_assignment(app.app_id, yyyy_mm, swap.release_slot_id, swap.requester_user_id)
     db.delete_assignment(app.app_id, yyyy_mm, accept_slot_id, user.user_id)
@@ -13164,7 +13250,7 @@ def _cohorts_page(event: dict, user: User, community: Community | None,
                 f" <form method='post' action='/api/cohorts/delete"
                 f"?cohort_id={c.cohort_id}' style='display:inline'"
                 f" onsubmit=\"return confirmSubmit(this,"
-                f"'Delete cohort: {html.escape(c.name)}?','Delete','#c33')\">"
+                f"'Delete cohort: {_js_str(c.name)}?','Delete','#c33')\">"
                 "<button type='submit' style='font-size:0.75em;cursor:pointer;"
                 "color:#c33;background:none;border:none;text-decoration:underline;"
                 "padding:0'>delete</button></form>"
@@ -13251,6 +13337,57 @@ def _fill_future_cohort_assignments(community: Community,
                 yyyy_mm=sch.yyyy_mm, slot_id=slot.slot_id,
                 user_id=user_id, local_date=slot.local_date,
                 created_by="cohort-join",
+            ))
+            added += 1
+    return added
+
+
+def _restore_paused_weeks(community: Community, app: Application,
+                          before: Membership, today: str) -> int:
+    """Put a member back on the future weeks they were left out of while
+    paused, once they resume or move their return date earlier.
+
+    Only weeks generated after the pause began are touched: those are the
+    weeks that skipped them. A missing assignment in an older week means
+    they withdrew from it, and stays missing. Dates they are still out
+    (under the new status) or have blocked are skipped too.
+    """
+    if (app.app_type != "recurring_commitments" or community is None
+            or not before.inactive_since):
+        return 0
+    after = db.get_membership(app.app_id, before.user_id)
+    if after is None:
+        return 0
+    templates = set()
+    for cm in db.list_cohorts_for_user(before.user_id):
+        c = db.get_cohort(app.app_id, cm.cohort_id)
+        if c is not None and c.linked_template_id:
+            templates.add(c.linked_template_id)
+    if not templates:
+        return 0
+    blocked = {b.local_date for b in
+               db.list_blocked_dates_for_user(app.app_id, before.user_id)}
+    added = 0
+    for sch in db.list_schedules(app.app_id):
+        if (sch.state != "materialized"
+                or sch.created_at < before.inactive_since):
+            continue
+        for slot in db.list_slots(app.app_id, sch.yyyy_mm):
+            if (slot.template_id not in templates
+                    or slot.local_date < today
+                    or not before.inactive_on(slot.local_date)
+                    or after.inactive_on(slot.local_date)
+                    or slot.local_date in blocked):
+                continue
+            if any(a.user_id == before.user_id for a in
+                   db.list_assignments_for_slot(app.app_id, sch.yyyy_mm,
+                                                slot.slot_id)):
+                continue
+            db.put_assignment(Assignment(
+                community_id=community.community_id, app_id=app.app_id,
+                yyyy_mm=sch.yyyy_mm, slot_id=slot.slot_id,
+                user_id=before.user_id, local_date=slot.local_date,
+                created_by="resume",
             ))
             added += 1
     return added
@@ -14832,8 +14969,8 @@ def _render_user_apps_cell(target_user: User,
             "action='/api/community-users/remove-membership' "
             "style='display:inline'"
             f" onsubmit=\"return confirmSubmit(this,"
-            f"'Remove {html.escape(target_user.name)} from "
-            f"{html.escape(app_obj.name)}?','Remove','#c33')\">"
+            f"'Remove {_js_str(target_user.name)} from "
+            f"{_js_str(app_obj.name)}?','Remove','#c33')\">"
             f"<input type='hidden' name='user_id' value='{target_user.user_id}'>"
             f"<input type='hidden' name='target_app_id' value='{mem.app_id}'>"
             f"<input type='hidden' name='next' "
@@ -14966,7 +15103,7 @@ def _ca_users_page(event: dict, user: User,
                     f"<form method='post' action='/api/users/reset-access"
                     f"?user_id={u.user_id}' style='display:inline'"
                     f" onsubmit=\"return confirmSubmit(this,"
-                    f"'Reset access for {html.escape(u.name)}? Their "
+                    f"'Reset access for {_js_str(u.name)}? Their "
                     f"password will be reset and they will be signed out "
                     f"of all devices.',"
                     f"'Reset access','#a80')\">"
@@ -14979,7 +15116,7 @@ def _ca_users_page(event: dict, user: User,
                     f"?user_id={u.user_id}&next=/admin/community-users' "
                     "style='display:inline'"
                     f" onsubmit=\"return confirmSubmit(this,"
-                    f"'Permanently delete {html.escape(u.name)} from the "
+                    f"'Permanently delete {_js_str(u.name)} from the "
                     f"entire community? This cannot be undone, and any "
                     f"app memberships, assignments, or schedule history "
                     f"tied to them will be orphaned.','Delete','#c33')\">"
@@ -14995,7 +15132,7 @@ def _ca_users_page(event: dict, user: User,
                         f"?user_id={u.user_id}&role=member' "
                         "style='display:inline'"
                         f" onsubmit=\"return confirmSubmit(this,"
-                        f"'Demote {html.escape(u.name)} from "
+                        f"'Demote {_js_str(u.name)} from "
                         f"Community Admin?','Demote','#a80')\">"
                         f"<input type='hidden' name='next' "
                         f"value='/admin/community-users#user-{anchor_uid}'>"
@@ -15009,7 +15146,7 @@ def _ca_users_page(event: dict, user: User,
                         f"?user_id={u.user_id}&role=ca' "
                         "style='display:inline'"
                         f" onsubmit=\"return confirmSubmit(this,"
-                        f"'Make {html.escape(u.name)} a Community Admin? "
+                        f"'Make {_js_str(u.name)} a Community Admin? "
                         f"They will be able to manage all apps, members, "
                         f"and settings community-wide.',"
                         f"'Make CA','#2a7')\">"

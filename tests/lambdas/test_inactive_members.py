@@ -306,3 +306,143 @@ def test_event_app_members_page_has_no_status(world) -> None:
                            w["app"], _mem(w, w["admin"]))["body"]
     assert "mark inactive" not in page and " active" not in page.split(
         "Manage members")[1][:200]
+
+
+# ---- openings, cohorts and weekly (recurring) apps --------------------------
+
+from community_organizer.core.models import (  # noqa: E402
+    Cohort, CohortMembership, SlotTemplate,
+)
+
+
+def _cohort(w, app: Application, template_id: str, *users: User) -> Cohort:
+    c = Cohort(community_id=CID, app_id=app.app_id, name="Sun 8",
+               linked_template_id=template_id)
+    db.put_cohort(c)
+    for u in users:
+        db.put_cohort_membership(CohortMembership(cohort_id=c.cohort_id,
+                                                  user_id=u.user_id))
+    return c
+
+
+def test_opening_email_skips_inactive_cohort_members(world) -> None:
+    w = world
+    other, _ = w["add"]("Other")
+    _cohort(w, w["app"], "t1", w["member"], other)
+    db.set_membership_inactive(w["app"].app_id, w["member"].user_id,
+                               inactive=True)
+    web._notify_cohort_of_opening(w["admin"], w["community"], w["app"],
+                                  w["slot"], "2030-06")
+    openings = [s for s in w["outbox"].sent if "opening" in s["subject"]]
+    assert [s["to_addr"] for s in openings] == ["Other@example.com"]
+
+
+def test_cohorts_page_marks_inactive_members(world) -> None:
+    w = world
+    _cohort(w, w["app"], "t1", w["member"])
+    db.set_membership_inactive(w["app"].app_id, w["member"].user_id,
+                               inactive=True)
+    page = web._cohorts_page(_get("/admin/cohorts"), w["admin"],
+                             w["community"], w["app"],
+                             _mem(w, w["admin"]))["body"]
+    assert "Member <i style='color:#a80'>(inactive)</i>" in page
+
+
+@pytest.fixture
+def weekly(world):
+    """A recurring-commitments app with one weekly template and cohort."""
+    w = world
+    app = Application(community_id=CID, name="Adoration",
+                      app_type="recurring_commitments", period_type="weekly")
+    db.put_application(app)
+    tpl = SlotTemplate(community_id=CID, app_id=app.app_id, name="Wed 3 AM",
+                       day_of_week=2, start_time="03:00", duration_minutes=60)
+    db.put_template(tpl)
+    people = []
+    for name in ("Paused", "Steady"):
+        u = User(community_id=CID, email=f"{name}@example.com", name=name)
+        db.put_user(u)
+        db.put_membership(Membership(community_id=CID, app_id=app.app_id,
+                                     user_id=u.user_id))
+        people.append(u)
+    cohort = _cohort(w, app, tpl.template_id, *people)
+    return dict(w, app=app, tpl=tpl, paused=people[0], steady=people[1],
+                cohort=cohort)
+
+
+def _assigned(app: Application, period: str) -> set[str]:
+    return {a.user_id for a in db.list_assignments_for_month(app.app_id,
+                                                             period)}
+
+
+def test_new_weeks_skip_a_paused_cohort_member(weekly) -> None:
+    w = weekly
+    db.set_membership_inactive(w["app"].app_id, w["paused"].user_id,
+                               inactive=True, until="2030-06-10")
+    assert web._ensure_period_materialized(w["community"], w["app"],
+                                           "2030-W23")     # Wed Jun 5
+    assert _assigned(w["app"], "2030-W23") == {w["steady"].user_id}
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W24")
+    assert _assigned(w["app"], "2030-W24") == {      # Wed Jun 12: back
+        w["paused"].user_id, w["steady"].user_id}
+
+
+def test_cohort_backfill_skips_weeks_they_are_out(weekly) -> None:
+    w = weekly
+    newcomer = User(community_id=CID, email="new@example.com", name="New")
+    db.put_user(newcomer)
+    db.put_membership(Membership(community_id=CID, app_id=w["app"].app_id,
+                                 user_id=newcomer.user_id))
+    for period in ("2030-W23", "2030-W24"):
+        web._ensure_period_materialized(w["community"], w["app"], period)
+    db.set_membership_inactive(w["app"].app_id, newcomer.user_id,
+                               inactive=True, until="2030-06-10")
+    added = web._fill_future_cohort_assignments(
+        w["community"], w["app"], w["cohort"], newcomer.user_id)
+    assert added == 1
+    assert newcomer.user_id not in _assigned(w["app"], "2030-W23")
+    assert newcomer.user_id in _assigned(w["app"], "2030-W24")
+
+
+def test_paused_member_cannot_join_a_weekly_cohort(weekly) -> None:
+    w = weekly
+    joiner = User(community_id=CID, email="j@example.com", name="Joiner")
+    db.put_user(joiner)
+    db.put_membership(Membership(community_id=CID, app_id=w["app"].app_id,
+                                 user_id=joiner.user_id))
+    db.set_membership_inactive(w["app"].app_id, joiner.user_id,
+                               inactive=True)
+    resp = web._api_cohort_add_member(
+        _post("/api/cohorts/add-member",
+              qs={"cohort_id": w["cohort"].cohort_id,
+                  "user_id": joiner.user_id}),
+        joiner, w["community"], w["app"],
+        db.get_membership(w["app"].app_id, joiner.user_id))
+    assert "can't take on new slots" in _location(resp)
+    assert joiner.user_id not in {cm.user_id for cm in
+                                  db.list_cohort_members(w["cohort"].cohort_id)}
+
+
+def test_weekly_grid_hides_sign_up_while_paused(weekly) -> None:
+    w = weekly
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
+    slots = list(db.list_slots(w["app"].app_id, "2030-W23"))
+    outsider = User(community_id=CID, email="o@example.com", name="Outsider")
+    db.put_user(outsider)
+    db.put_membership(Membership(community_id=CID, app_id=w["app"].app_id,
+                                 user_id=outsider.user_id))
+
+    def grid() -> str:
+        return web._render_recurring_grid(
+            slots=slots, asgns_by_slot={}, users_by_id={},
+            current_user=outsider, cohorts_by_template_id={
+                w["tpl"].template_id: w["cohort"]},
+            my_cohort_ids=set(),
+            viewer_membership=db.get_membership(w["app"].app_id,
+                                                outsider.user_id))
+
+    assert "+ Sign up" in grid() and "Take this slot weekly" in grid()
+    db.set_membership_inactive(w["app"].app_id, outsider.user_id,
+                               inactive=True)
+    assert "+ Sign up" not in grid()
+    assert "Take this slot weekly" not in grid()

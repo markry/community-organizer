@@ -5159,11 +5159,17 @@ def _ensure_period_materialized(community: Community | None,
         for c in db.list_cohorts(app.app_id)
         if c.linked_template_id
     }
+    inactive = _inactive_memberships(app)
     for slot in slots:
         cohort = cohorts_by_template.get(slot.template_id)
         if cohort is None:
             continue
         for cm in db.list_cohort_members(cohort.cohort_id):
+            # A cohort member taking a break keeps their weekly spot but
+            # isn't put on the weeks they're out.
+            if cm.user_id in inactive and inactive[cm.user_id].inactive_on(
+                    slot.local_date):
+                continue
             db.put_assignment(Assignment(
                 community_id=community.community_id, app_id=app.app_id,
                 yyyy_mm=period_id, slot_id=slot.slot_id,
@@ -5318,6 +5324,7 @@ def _recurring_home(user: User, community: Community | None,
         is_admin=is_admin, app_members=app_member_users,
         blocked_by_date=blocked_by_date,
         cohort_members_by_template=cohort_members_by_template,
+        viewer_membership=membership,
     )
 
     # Pagination links — one calendar month per step.
@@ -5366,6 +5373,7 @@ def _recurring_home(user: User, community: Community | None,
     body = (
         f"<h1>{html.escape(org_name)}</h1>"
         + _flash_banner_html(event)
+        + _paused_banner_html(app, membership, today.isoformat())
         + f"<p style='color:#888;font-size:0.9em'>"
         f"Hello, {html.escape(user.name)} &middot; {html.escape(role_label)}"
         f"</p>"
@@ -5399,7 +5407,8 @@ def _render_recurring_grid(*, slots: list[Slot],
                            is_admin: bool = False,
                            app_members: list[User] | None = None,
                            blocked_by_date: dict[str, dict[str, str]] | None = None,
-                           cohort_members_by_template: dict[str, set[str]] | None = None) -> str:
+                           cohort_members_by_template: dict[str, set[str]] | None = None,
+                           viewer_membership: Membership | None = None) -> str:
     """Render the slot grid for a recurring app.
 
     Personalization (per task #165 part 2): the viewer's own slots
@@ -5494,6 +5503,10 @@ def _render_recurring_grid(*, slots: list[Slot],
                     "text-decoration:underline;font-size:inherit'>"
                     "Confirm</button></form>"
                 )
+        elif viewer_membership and viewer_membership.inactive_on(slot.local_date):
+            # Taking a break: no sign-up or weekly-commit offers (the
+            # server refuses them too). The page banner says why.
+            pass
         else:
             # User isn't on this slot. Offer a one-off sign-up so they
             # can pick up a specific occurrence without committing to
@@ -5515,7 +5528,10 @@ def _render_recurring_grid(*, slots: list[Slot],
         # slot's template. The cohorts_by_template_id map is keyed by
         # the cohort's linked_template_id, set at cohort creation.
         cohort = cohorts_by_template_id.get(slot.template_id)
-        if cohort:
+        viewer_paused = bool(viewer_membership
+                             and viewer_membership.inactive_on(slot.local_date))
+        if cohort and not (viewer_paused
+                           and cohort.cohort_id not in my_cohort_ids):
             if cohort.cohort_id in my_cohort_ids:
                 actions.append(
                     f"<form method='post' action='/api/cohorts/remove-member?"
@@ -5972,6 +5988,22 @@ def _unavailable_on(app: Application, local_date: str) -> dict[str, str]:
         if m.inactive_on(local_date):
             out[uid] = _inactive_label(m)
     return out
+
+
+def _paused_banner_html(app: Application, membership: Membership | None,
+                        today: str) -> str:
+    """Banner for a member who is taking a break, on the pages where
+    they'd otherwise sign up for slots. Empty when they aren't."""
+    if (app.app_type not in SCHEDULING_APP_TYPES or membership is None
+            or not membership.inactive_on(today)):
+        return ""
+    when = (f"(back on {html.escape(_pretty_date(membership.inactive_until))})"
+            if membership.inactive_until else "until further notice")
+    return ("<div style='margin:12px 0;padding:10px 14px;border-radius:4px;"
+            "border:1px solid #e3c27a;background:#fffaf0;color:#555'>"
+            f"You're taking a break {when}, so you can't sign up for slots. "
+            "<a href='/my-availability' style='color:#2a7'>"
+            "Change this on My Availability &rarr;</a></div>")
 
 
 def _inactive_refusal(app: Application, membership: Membership | None,
@@ -8176,17 +8208,8 @@ def _open_slots_page(event: dict, user: User, community: Community | None,
         "<a href='/my-availability' style='color:#2a7'>"
         "Set days I'm unavailable &rarr;</a></p>"
     )
-    if (app.app_type in SCHEDULING_APP_TYPES and membership is not None
-            and membership.inactive_on(today)):
-        availability_link = (
-            "<div style='margin:12px 0;padding:10px 14px;border-radius:4px;"
-            "border:1px solid #e3c27a;background:#fffaf0;color:#555'>"
-            "You're taking a break "
-            + (f"(back on {html.escape(_pretty_date(membership.inactive_until))})"
-               if membership.inactive_until else "until further notice")
-            + ", so you can't sign up for slots. "
-            "<a href='/my-availability' style='color:#2a7'>"
-            "Change this on My Availability &rarr;</a></div>")
+    availability_link = (_paused_banner_html(app, membership, today)
+                         or availability_link)
     body = (
         f"<h1>{html.escape(org_name)}</h1>"
         + _flash_banner_html(event)
@@ -13081,6 +13104,14 @@ def _cohorts_page(event: dict, user: User, community: Community | None,
                    for u in db.list_users(user.community_id)
                    if u.user_id in members_by_app}
 
+    # Members taking a break stay in their cohorts but are marked, so the
+    # admin can see who the rotation can't currently count on.
+    tz_name = (user.preferred_tz or
+               (community.default_timezone if community else "America/New_York"))
+    today = dt.datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    paused = {uid for uid, m in _inactive_memberships(app).items()
+              if m.inactive_on(today)}
+
     sections = ""
     for c in cohorts:
         cmems = list(db.list_cohort_members(c.cohort_id))
@@ -13089,10 +13120,16 @@ def _cohorts_page(event: dict, user: User, community: Community | None,
         for cm in cmems:
             u = users_by_id.get(cm.user_id)
             name = u.name if u else "Unknown"
+            is_paused = cm.user_id in paused
             member_rows += (
                 f"<span style='display:inline-block;margin:2px 8px 2px 0;"
-                f"padding:2px 8px;background:#f0f0f0;border-radius:12px;font-size:0.9em'>"
-                f"{html.escape(name)} "
+                f"padding:2px 8px;border-radius:12px;font-size:0.9em;"
+                + ("background:#fffaf0;border:1px solid #e3c27a;color:#888'"
+                   " title='Inactive: taking a break from the rotation'>"
+                   if is_paused else "background:#f0f0f0'>")
+                + f"{html.escape(name)}"
+                + (" <i style='color:#a80'>(inactive)</i>" if is_paused else "")
+                + " "
                 f"<form method='post' action='/api/cohorts/remove-member"
                 f"?cohort_id={c.cohort_id}&user_id={cm.user_id}' style='display:inline'>"
                 "<button type='submit' style='font-size:0.8em;cursor:pointer;"
@@ -13109,7 +13146,8 @@ def _cohorts_page(event: dict, user: User, community: Community | None,
         add_form = ""
         if available:
             opts = "".join(
-                f"<option value='{uid}'>{html.escape(name)}</option>"
+                f"<option value='{uid}'>{html.escape(name)}"
+                f"{' (inactive)' if uid in paused else ''}</option>"
                 for uid, name in available
             )
             add_form = (
@@ -13192,6 +13230,7 @@ def _fill_future_cohort_assignments(community: Community,
         return 0
     if not cohort.linked_template_id:
         return 0
+    mem = db.get_membership(app.app_id, user_id)
     added = 0
     for sch in db.list_schedules(app.app_id):
         if sch.state != "materialized":
@@ -13199,6 +13238,8 @@ def _fill_future_cohort_assignments(community: Community,
         for slot in db.list_slots(app.app_id, sch.yyyy_mm):
             if slot.template_id != cohort.linked_template_id:
                 continue
+            if mem is not None and mem.inactive_on(slot.local_date):
+                continue    # taking a break that week
             existing = any(
                 a.user_id == user_id for a in
                 db.list_assignments_for_slot(app.app_id, sch.yyyy_mm,
@@ -13483,6 +13524,13 @@ def _api_cohort_add_member(event: dict, user: User, community: Community | None,
     if not (is_admin or is_self):
         return _error_redirect_or_next(event, "/admin/cohorts",
             "You can only add yourself to a cohort.")
+    if is_self and app.app_type == "recurring_commitments":
+        tz_name = (user.preferred_tz or (community.default_timezone
+                   if community else "America/New_York"))
+        today = dt.datetime.now(ZoneInfo(tz_name)).date().isoformat()
+        refusal = _inactive_refusal(app, membership, today)
+        if refusal:
+            return _error_redirect_or_next(event, "/", refusal)
     cohort = db.get_cohort(app.app_id, cohort_id)
     if cohort is None or cohort.app_id != app.app_id:
         # Either doesn't exist or belongs to another app — same

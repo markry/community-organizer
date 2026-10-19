@@ -929,3 +929,23 @@ def test_summary_on_a_one_date_invitation_and_not_on_a_several_date_poll(
     body = _results(cid, app, aa, aa_mem, evt)
     assert "<b>Answered 2 of 4</b>" in body
     assert "Coming 1</b>" not in body and "Expected headcount" in body
+
+
+def test_household_recount_reads_what_was_just_saved(ddb_table, outbox,
+                                                     monkeypatch) -> None:
+    # The recount after a save must use a strongly consistent read, or it
+    # can miss the writes it just made and leave household counts unequal.
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    _adopt(cid, app, aa, aa_mem)
+    evt = _the_event()
+    reads = []
+    real = db.list_flexible_rsvps
+
+    def spy(app_id, event_id, **kw):
+        reads.append(kw.get("consistent", False))
+        return real(app_id, event_id, **kw)
+    monkeypatch.setattr(db, "list_flexible_rsvps", spy)
+    _mark(cid, app, aa, aa_mem, evt,
+          {bob.user_id: "yes", sue.user_id: "yes", joe.user_id: ""})
+    assert reads[-1] is True
+    assert _rsvp(evt, bob).party_size == _rsvp(evt, sue).party_size == 2

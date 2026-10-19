@@ -245,3 +245,57 @@ def test_list_flexible_rsvps(ddb_table) -> None:
     users = sorted(r.user_id
                    for r in db.list_flexible_rsvps("a2", "e1"))
     assert users == ["alice", "bob", "charlie"]
+
+
+def _recreated(stale: FlexibleRSVP) -> FlexibleRSVP:
+    """Delete a stored reply and create a new one in its place, as a
+    member answering again after an organizer cleared them would."""
+    db.delete_flexible_rsvp(stale.app_id, stale.event_id, stale.user_id)
+    fresh = FlexibleRSVP(community_id="c1", app_id=stale.app_id,
+                         event_id=stale.event_id, user_id=stale.user_id,
+                         confirmed_response="no")
+    db.put_flexible_rsvp(fresh, create_only=True)
+    return fresh
+
+
+def test_update_refuses_a_reply_recreated_since_it_was_read(ddb_table) -> None:
+    r = FlexibleRSVP(community_id="c1", app_id="a1", event_id="e1",
+                     user_id="u1", confirmed_response="yes")
+    db.put_flexible_rsvp(r, create_only=True)
+    read = db.get_flexible_rsvp("a1", "e1", "u1")
+    fresh = _recreated(read)
+    assert fresh.version == read.version == 1    # version alone can't tell
+    read.confirmed_response = "maybe"
+    with pytest.raises(db.ConcurrencyConflict):
+        db.put_flexible_rsvp(read, expected_version=1, update_only=True)
+    got = db.get_flexible_rsvp("a1", "e1", "u1")
+    assert (got.rsvp_id, got.confirmed_response) == (fresh.rsvp_id, "no")
+
+
+def test_delete_refuses_a_reply_recreated_since_it_was_read(ddb_table) -> None:
+    r = FlexibleRSVP(community_id="c1", app_id="a1", event_id="e1",
+                     user_id="u1", confirmed_response="yes")
+    db.put_flexible_rsvp(r, create_only=True)
+    read = db.get_flexible_rsvp("a1", "e1", "u1")
+    fresh = _recreated(read)
+    with pytest.raises(db.ConcurrencyConflict):
+        db.delete_flexible_rsvp("a1", "e1", "u1", expected_version=1,
+                                expected_rsvp_id=read.rsvp_id)
+    assert db.get_flexible_rsvp("a1", "e1", "u1").rsvp_id == fresh.rsvp_id
+    db.delete_flexible_rsvp("a1", "e1", "u1", expected_version=1,
+                            expected_rsvp_id=fresh.rsvp_id)
+    assert db.get_flexible_rsvp("a1", "e1", "u1") is None
+
+
+def test_update_still_works_on_a_reply_without_a_stored_id(ddb_table) -> None:
+    r = FlexibleRSVP(community_id="c1", app_id="a1", event_id="e1",
+                     user_id="u1", confirmed_response="yes")
+    db.put_flexible_rsvp(r, create_only=True)
+    db._table().update_item(Key={"PK": db._app_pk("a1"),
+                                 "SK": db._flex_rsvp_sk("e1", "u1")},
+                            UpdateExpression="REMOVE rsvp_id")
+    old = db.get_flexible_rsvp("a1", "e1", "u1")    # hydrates a new id
+    old.confirmed_response = "no"
+    db.put_flexible_rsvp(old, expected_version=1, update_only=True)
+    assert db.get_flexible_rsvp("a1", "e1", "u1").confirmed_response == "no"
+

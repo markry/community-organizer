@@ -2506,7 +2506,11 @@ def put_flexible_rsvp(rsvp: FlexibleRSVP, *,
     stricter than ``expected_version=0``, which a version-0 row would pass.
     ``update_only`` (with ``expected_version``) also fails if the row is no
     longer there: without it the version check accepts a missing row, so an
-    update racing a delete would quietly bring the reply back."""
+    update racing a delete would quietly bring the reply back. It also
+    requires the stored row to be the same reply (same ``rsvp_id``), so a
+    reply deleted and re-created since it was read is a conflict too, not
+    something to overwrite. Rows from before ``rsvp_id`` was stored have
+    none to compare and pass on version alone."""
     from botocore.exceptions import ClientError
     if create_only:
         rsvp.version = 1
@@ -2522,10 +2526,15 @@ def put_flexible_rsvp(rsvp: FlexibleRSVP, *,
     if create_only:
         kwargs["ConditionExpression"] = "attribute_not_exists(PK)"
     elif expected_version is not None:
-        kwargs["ConditionExpression"] = (
-            "attribute_exists(PK) AND version = :expected" if update_only else
-            "attribute_not_exists(version) OR version = :expected")
         kwargs["ExpressionAttributeValues"] = {":expected": expected_version}
+        if update_only:
+            kwargs["ConditionExpression"] = (
+                "attribute_exists(PK) AND version = :expected AND "
+                "(attribute_not_exists(rsvp_id) OR rsvp_id = :rid)")
+            kwargs["ExpressionAttributeValues"][":rid"] = rsvp.rsvp_id
+        else:
+            kwargs["ConditionExpression"] = (
+                "attribute_not_exists(version) OR version = :expected")
     try:
         _table().put_item(**kwargs)
     except ClientError as e:
@@ -2547,10 +2556,13 @@ def get_flexible_rsvp(app_id: str, event_id: str,
 
 
 def delete_flexible_rsvp(app_id: str, event_id: str, user_id: str, *,
-                         expected_version: int | None = None) -> None:
+                         expected_version: int | None = None,
+                         expected_rsvp_id: str | None = None) -> None:
     """Forget a member's response entirely (an AA un-marking someone) — back
     to "haven't heard", not a decline. With ``expected_version`` the delete is
-    conditional: ConcurrencyConflict if the row changed since it was read."""
+    conditional: ConcurrencyConflict if the row changed since it was read.
+    ``expected_rsvp_id`` also requires it to be the same reply, not one
+    re-created in its place (rows that predate ``rsvp_id`` pass)."""
     from botocore.exceptions import ClientError
     kwargs = {"Key": {
         "PK": _app_pk(app_id),
@@ -2559,6 +2571,10 @@ def delete_flexible_rsvp(app_id: str, event_id: str, user_id: str, *,
     if expected_version is not None:
         kwargs["ConditionExpression"] = "version = :expected"
         kwargs["ExpressionAttributeValues"] = {":expected": expected_version}
+        if expected_rsvp_id is not None:
+            kwargs["ConditionExpression"] += (
+                " AND (attribute_not_exists(rsvp_id) OR rsvp_id = :rid)")
+            kwargs["ExpressionAttributeValues"][":rid"] = expected_rsvp_id
     try:
         _table().delete_item(**kwargs)
     except ClientError as e:
@@ -2569,11 +2585,14 @@ def delete_flexible_rsvp(app_id: str, event_id: str, user_id: str, *,
         raise
 
 
-def list_flexible_rsvps(app_id: str,
-                        event_id: str) -> Iterator[FlexibleRSVP]:
+def list_flexible_rsvps(app_id: str, event_id: str, *,
+                        consistent: bool = False) -> Iterator[FlexibleRSVP]:
+    """An event's replies. ``consistent`` asks for a strongly consistent
+    read, for callers that must see writes they have just made."""
     for item in _paginate_query(
         KeyConditionExpression=Key("PK").eq(_app_pk(app_id))
         & Key("SK").begins_with(f"EVT#{event_id}#RSVP#"),
+        ConsistentRead=consistent,
     ):
         yield _hydrate(FlexibleRSVP, _strip_keys(item))
 

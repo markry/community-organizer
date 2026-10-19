@@ -3532,7 +3532,8 @@ def _api_flex_event_save_attendance(event: dict, user: User,
             if r is not None:
                 try:
                     db.delete_flexible_rsvp(app.app_id, event_id, uid,
-                                            expected_version=r.version)
+                                            expected_version=r.version,
+                                            expected_rsvp_id=r.rsvp_id)
                     changed += 1
                 except db.ConcurrencyConflict:
                     conflicts += 1
@@ -3590,7 +3591,8 @@ def _api_flex_event_save_attendance(event: dict, user: User,
     # and a row that changed underneath is simply left for next time.
     touched_hh = {_hh_key(users, uid) for uid in listed}
     now_stored = {r.user_id: r
-                  for r in db.list_flexible_rsvps(app.app_id, event_id)}
+                  for r in db.list_flexible_rsvps(app.app_id, event_id,
+                                                  consistent=True)}
     really_coming: dict[str, int] = {}
     for uid, r in now_stored.items():
         if _going(_stored(r)):

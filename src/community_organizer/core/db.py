@@ -85,6 +85,7 @@ from .models import (
     FlexibleSeries,
     Membership,
     Notification,
+    PauseSkip,
     Schedule,
     Slot,
     SlotTemplate,
@@ -744,6 +745,39 @@ def delete_membership(app_id: str, user_id: str) -> None:
     each caller, is what keeps a later re-add from reviving old links."""
     _table().delete_item(Key={"PK": _app_pk(app_id), "SK": _member_sk(user_id)})
     revoke_event_tokens_for_user(app_id, user_id)
+    for skip in list_pause_skips(app_id, user_id):
+        delete_pause_skip(skip)
+
+
+def _pause_skip_sk(user_id: str, yyyy_mm: str = "", slot_id: str = "") -> str:
+    """``PSKIP#<uid>#<period>#<slot_id>``; the bare prefix lists one
+    member's records."""
+    sk = f"PSKIP#{user_id}#"
+    return f"{sk}{yyyy_mm}#{slot_id}" if yyyy_mm else sk
+
+
+def put_pause_skip(skip: PauseSkip) -> None:
+    item = dataclasses.asdict(skip) | {
+        "PK": _app_pk(skip.app_id),
+        "SK": _pause_skip_sk(skip.user_id, skip.yyyy_mm, skip.slot_id),
+    }
+    _table().put_item(Item=item)
+
+
+def list_pause_skips(app_id: str, user_id: str) -> list[PauseSkip]:
+    """One member's records, strongly consistent: read right after the
+    status change that needs them."""
+    return [_hydrate(PauseSkip, _strip_keys(item)) for item in
+            _paginate_query(
+                KeyConditionExpression=Key("PK").eq(_app_pk(app_id))
+                & Key("SK").begins_with(_pause_skip_sk(user_id)),
+                ConsistentRead=True)]
+
+
+def delete_pause_skip(skip: PauseSkip) -> None:
+    _table().delete_item(Key={
+        "PK": _app_pk(skip.app_id),
+        "SK": _pause_skip_sk(skip.user_id, skip.yyyy_mm, skip.slot_id)})
 
 
 def list_memberships_for_app(app_id: str) -> Iterator[Membership]:

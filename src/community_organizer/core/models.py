@@ -413,6 +413,24 @@ class Assignment:
 
 
 @dataclass
+class PauseSkip:
+    """A weekly slot a cohort member was left off because they were
+    taking a break (Membership.inactive_*) when it was generated.
+
+    The record of why the assignment is missing: when they come back,
+    exactly these are restored, and each record goes once handled. A
+    missing assignment without one (they withdrew or traded it) is
+    never brought back.
+    """
+    app_id: str
+    user_id: str
+    yyyy_mm: str
+    slot_id: str
+    local_date: str
+    created_at: str = field(default_factory=_now)
+
+
+@dataclass
 class BlockedDate:
     """A member-declared "I can't do this day" for an app.
 

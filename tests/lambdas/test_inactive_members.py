@@ -601,9 +601,6 @@ def test_resume_restores_weeks_made_while_paused(weekly) -> None:
                          next(iter(db.list_slots(w["app"].app_id,
                                                  "2030-W22"))).slot_id,
                          u.user_id)          # withdrew from that week
-    older = db.get_schedule(w["app"].app_id, "2030-W22")
-    older.created_at = "2020-01-01T00:00:00+00:00"   # before the pause
-    db.put_schedule(older)
     db.set_membership_inactive(w["app"].app_id, u.user_id, inactive=True)
     web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
     assert u.user_id not in _assigned(w["app"], "2030-W23")
@@ -661,3 +658,65 @@ def test_a_mail_failure_does_not_fail_the_pause(world, monkeypatch) -> None:
     resp = _pause(world, world["member"], {"action": "pause"})
     assert "notice=" in resp["headers"]["Location"]
     assert _mem(world, world["member"]).inactive_since
+
+
+def _week_slot(w, period: str) -> Slot:
+    (slot,) = list(db.list_slots(w["app"].app_id, period))
+    return slot
+
+
+def test_a_week_withdrawn_from_after_restoring_stays_withdrawn(weekly) -> None:
+    w = weekly
+    u = w["paused"]
+    _pause(w, u, {"action": "pause"})
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
+    _pause(w, u, {"action": "pause", "until": "2030-06-01"})  # back earlier
+    assert u.user_id in _assigned(w["app"], "2030-W23")
+    db.delete_assignment(w["app"].app_id, "2030-W23",
+                         _week_slot(w, "2030-W23").slot_id, u.user_id)
+    _pause(w, u, {"action": "pause"})        # out indefinitely again
+    _pause(w, u, {"action": "resume"})
+    assert u.user_id not in _assigned(w["app"], "2030-W23")
+
+
+def test_a_skip_record_waits_while_they_are_still_out(weekly) -> None:
+    w = weekly
+    u = w["paused"]
+    _pause(w, u, {"action": "pause", "until": "2030-06-20"})
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W24")
+    _pause(w, u, {"action": "pause", "until": "2030-06-15"})  # Jun 12 still out
+    assert u.user_id not in _assigned(w["app"], "2030-W24")
+    assert len(db.list_pause_skips(w["app"].app_id, u.user_id)) == 1
+    _pause(w, u, {"action": "resume"})
+    assert u.user_id in _assigned(w["app"], "2030-W24")
+    assert db.list_pause_skips(w["app"].app_id, u.user_id) == []
+
+
+def test_a_failed_restore_can_be_finished_by_resuming_again(weekly,
+                                                           monkeypatch) -> None:
+    w = weekly
+    u = w["paused"]
+    _pause(w, u, {"action": "pause"})
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
+    real = db.put_assignment
+
+    def flaky(a):
+        raise RuntimeError("write failed")
+    monkeypatch.setattr(db, "put_assignment", flaky)
+    with pytest.raises(RuntimeError):
+        _pause(w, u, {"action": "resume"})
+    assert _mem(w, u).inactive_since                 # still paused
+    monkeypatch.setattr(db, "put_assignment", real)
+    _pause(w, u, {"action": "resume"})
+    assert u.user_id in _assigned(w["app"], "2030-W23")
+    assert not _mem(w, u).inactive_since
+
+
+def test_leaving_the_app_clears_skip_records(weekly) -> None:
+    w = weekly
+    u = w["paused"]
+    _pause(w, u, {"action": "pause"})
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
+    assert db.list_pause_skips(w["app"].app_id, u.user_id)
+    db.delete_membership(w["app"].app_id, u.user_id)
+    assert db.list_pause_skips(w["app"].app_id, u.user_id) == []

@@ -4911,3 +4911,42 @@ def test_logout_clears_both_cookie_variants(monkeypatch) -> None:
         assert any("Domain=" not in c for c in variants), name   # host-only
         assert any("Domain=community.example.org;" in c for c in variants), name
     assert all("Max-Age=0" in c for c in jar)
+
+
+def test_ca_delete_app_confirm_survives_an_apostrophe(ddb_table) -> None:
+    import json
+    import shutil
+    import subprocess
+    from html.parser import HTMLParser
+
+    import pytest
+
+    from community_organizer.core import db
+    from community_organizer.lambdas import web
+
+    if shutil.which("node") is None:
+        pytest.skip("needs node")
+    community, ca, _, app_a, _ = _seed_two_apps(ddb_table)
+    app_a.name = "Group's'+(globalThis.marker=1)+'"
+    db.put_application(app_a)
+    body = web._ca_landing_page({}, ca, community)["body"]
+
+    class Buttons(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.handlers = []
+
+        def handle_starttag(self, tag, attrs):
+            d = dict(attrs)
+            if tag == "button" and "Delete app" in (d.get("onclick") or ""):
+                self.handlers.append(d["onclick"])
+    p = Buttons()
+    p.feed(body)
+    (handler,) = [h for h in p.handlers if "Group" in h]
+    js = ("globalThis.marker=0;let msg='';"
+          "globalThis.confirmModal=(m)=>{msg=m};"
+          f"new Function({json.dumps(handler)}).call({{}});"
+          "if(globalThis.marker!==0)throw Error('ran');"
+          "if(!msg.includes(\"Group's'+\"))throw Error(msg);")
+    subprocess.run(["node", "-e", js], check=True, capture_output=True,
+                   text=True)

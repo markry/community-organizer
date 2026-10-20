@@ -8491,7 +8491,7 @@ def _api_membership_inactive(event: dict, user: User,
         # Restore first, from the status they're about to have: if this
         # stops partway, they're still paused and their skip records are
         # still there, so "I'm back" again finishes the job.
-        restored = _restore_paused_weeks(
+        restored, full = _restore_paused_weeks(
             community, app,
             dataclasses.replace(target_mem, inactive_since=None,
                                 inactive_until=None, inactive_note=None),
@@ -8508,7 +8508,11 @@ def _api_membership_inactive(event: dict, user: User,
         return _notice_redirect_or_next(event, back, f"{who} active again."
             + (f" {'You are' if is_self else 'They are'} back on "
                f"{restored} weekly slot{'s' if restored != 1 else ''} "
-               "already on the schedule." if restored else ""))
+               "already on the schedule." if restored else "")
+            + (f" {full} week{'s' if full != 1 else ''} filled up "
+               "meanwhile, so " + ("you weren't" if is_self else
+                                   "they weren't")
+               + " added back there." if full else ""))
     if action != "pause":
         return _error_redirect_or_next(event, back, "Unknown action.")
     until = (_get_param(event, "until") or "").strip() or None
@@ -13343,15 +13347,15 @@ def _fill_future_cohort_assignments(community: Community,
         for slot in db.list_slots(app.app_id, sch.yyyy_mm):
             if slot.template_id != cohort.linked_template_id:
                 continue
-            if mem is not None and mem.inactive_on(slot.local_date):
-                _record_pause_skip(app, user_id, slot)
-                continue    # taking a break that week
             existing = any(
                 a.user_id == user_id for a in
                 db.list_assignments_for_slot(app.app_id, sch.yyyy_mm,
                                              slot.slot_id))
             if existing:
                 continue
+            if mem is not None and mem.inactive_on(slot.local_date):
+                _record_pause_skip(app, user_id, slot)
+                continue    # taking a break that week
             db.put_assignment(Assignment(
                 community_id=community.community_id, app_id=app.app_id,
                 yyyy_mm=sch.yyyy_mm, slot_id=slot.slot_id,
@@ -13371,7 +13375,7 @@ def _record_pause_skip(app: Application, user_id: str, slot: Slot) -> None:
 
 
 def _restore_paused_weeks(community: Community | None, app: Application,
-                          status: Membership, today: str) -> int:
+                          status: Membership, today: str) -> tuple[int, int]:
     """Put a member back on the weekly slots they were left off while
     paused, for the days ``status`` (their status as it now is, or is
     about to be) no longer has them out.
@@ -13380,13 +13384,18 @@ def _restore_paused_weeks(community: Community | None, app: Application,
     or traded away is never brought back. Each record handled is deleted;
     records for days they're still out are kept for later. Slots that are
     past, gone, no longer in one of their cohorts, or on a date they've
-    blocked are dropped without an assignment.
+    blocked are dropped without an assignment, as are slots that have
+    filled up meanwhile. Returns (restored, full).
+
+    Each record is deleted before its assignment is written: if the write
+    then fails, the cost is one week not restored, never a week they gave
+    up coming back.
     """
     if app.app_type != "recurring_commitments" or community is None:
-        return 0
+        return 0, 0
     skips = db.list_pause_skips(app.app_id, status.user_id)
     if not skips:
-        return 0
+        return 0, 0
     templates = set()
     for cm in db.list_cohorts_for_user(status.user_id):
         c = db.get_cohort(app.app_id, cm.cohort_id)
@@ -13394,26 +13403,27 @@ def _restore_paused_weeks(community: Community | None, app: Application,
             templates.add(c.linked_template_id)
     blocked = {b.local_date for b in
                db.list_blocked_dates_for_user(app.app_id, status.user_id)}
-    added = 0
+    added = full = 0
     for skip in skips:
         if status.inactive_on(skip.local_date):
             continue
         slot = (db.find_slot_in_month(app.app_id, skip.yyyy_mm, skip.slot_id)
                 if skip.local_date >= today else None)
-        if (slot is not None and slot.template_id in templates
-                and skip.local_date not in blocked
-                and not any(a.user_id == status.user_id for a in
-                            db.list_assignments_for_slot(
-                                app.app_id, skip.yyyy_mm, skip.slot_id))):
-            db.put_assignment(Assignment(
-                community_id=community.community_id, app_id=app.app_id,
-                yyyy_mm=skip.yyyy_mm, slot_id=skip.slot_id,
-                user_id=status.user_id, local_date=skip.local_date,
-                created_by="resume",
-            ))
-            added += 1
         db.delete_pause_skip(skip)
-    return added
+        if (slot is None or slot.template_id not in templates
+                or skip.local_date in blocked
+                or any(a.user_id == status.user_id for a in
+                       db.list_assignments_for_slot(
+                           app.app_id, skip.yyyy_mm, skip.slot_id))):
+            continue
+        try:
+            db.atomic_signup_assignment(slot, user_id=status.user_id,
+                                        community_id=community.community_id,
+                                        created_by="resume")
+            added += 1
+        except db.CapacityExceeded:
+            full += 1
+    return added, full
 
 
 def _delete_future_cohort_assignments(app: Application, cohort: Cohort,

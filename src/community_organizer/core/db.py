@@ -1545,7 +1545,11 @@ def confirm_assignment(app_id: str, yyyy_mm: str, slot_id: str,
 def delete_assignment(app_id: str, yyyy_mm: str, slot_id: str, user_id: str) -> None:
     """Remove an assignment and take the person off the slot's count, in one
     transaction. Removing one that is not there does nothing — so two
-    releases of the same assignment racing each other count once."""
+    releases of the same assignment racing each other count once.
+
+    The same transaction drops any pause-skip record for this member and
+    slot: once they've given the slot up, coming back from a break must
+    not put them on it again."""
     from botocore.exceptions import ClientError
     pk = _app_month_pk(app_id, yyyy_mm)
     _ensure_slot_count(app_id, yyyy_mm, slot_id)
@@ -1556,6 +1560,10 @@ def delete_assignment(app_id: str, yyyy_mm: str, slot_id: str, user_id: str) -> 
                                 "SK": {"S": _asgn_sk(slot_id, user_id)}},
                         "ConditionExpression": "attribute_exists(SK)"}},
             _count_update(pk, slot_id, -1),
+            {"Delete": {"TableName": TABLE_NAME,
+                        "Key": {"PK": {"S": _app_pk(app_id)},
+                                "SK": {"S": _pause_skip_sk(
+                                    user_id, yyyy_mm, slot_id)}}}},
         ])
     except ClientError as e:
         legs = _cancelled_legs(e)

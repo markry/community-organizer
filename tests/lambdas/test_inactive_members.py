@@ -698,15 +698,15 @@ def test_a_failed_restore_can_be_finished_by_resuming_again(weekly,
     u = w["paused"]
     _pause(w, u, {"action": "pause"})
     web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
-    real = db.put_assignment
+    real = db.find_slot_in_month
 
-    def flaky(a):
-        raise RuntimeError("write failed")
-    monkeypatch.setattr(db, "put_assignment", flaky)
+    def flaky(*a, **kw):
+        raise RuntimeError("read failed")
+    monkeypatch.setattr(db, "find_slot_in_month", flaky)
     with pytest.raises(RuntimeError):
         _pause(w, u, {"action": "resume"})
     assert _mem(w, u).inactive_since                 # still paused
-    monkeypatch.setattr(db, "put_assignment", real)
+    monkeypatch.setattr(db, "find_slot_in_month", real)
     _pause(w, u, {"action": "resume"})
     assert u.user_id in _assigned(w["app"], "2030-W23")
     assert not _mem(w, u).inactive_since
@@ -719,4 +719,55 @@ def test_leaving_the_app_clears_skip_records(weekly) -> None:
     web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
     assert db.list_pause_skips(w["app"].app_id, u.user_id)
     db.delete_membership(w["app"].app_id, u.user_id)
+    assert db.list_pause_skips(w["app"].app_id, u.user_id) == []
+
+
+def test_rejoining_a_cohort_while_paused_records_no_false_skip(weekly) -> None:
+    w = weekly
+    u = w["paused"]
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
+    _pause(w, u, {"action": "pause"})          # still holds W23
+    web._fill_future_cohort_assignments(w["community"], w["app"],
+                                        w["cohort"], u.user_id)
+    assert db.list_pause_skips(w["app"].app_id, u.user_id) == []
+
+
+def test_giving_up_a_slot_drops_its_skip_record(weekly) -> None:
+    w = weekly
+    u = w["paused"]
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
+    slot = _week_slot(w, "2030-W23")
+    web._record_pause_skip(w["app"], u.user_id, slot)   # however it got there
+    db.delete_assignment(w["app"].app_id, "2030-W23", slot.slot_id, u.user_id)
+    assert db.list_pause_skips(w["app"].app_id, u.user_id) == []
+
+
+def test_resume_respects_a_slot_that_filled_up(weekly) -> None:
+    w = weekly
+    u = w["paused"]
+    _pause(w, u, {"action": "pause"})
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
+    slot = _week_slot(w, "2030-W23")
+    slot.max_volunteers = 1                    # the steady member fills it
+    db.put_slot(slot)
+    resp = _pause(w, u, {"action": "resume"})
+    assert "1 week filled up meanwhile" in _location(resp)
+    assert _assigned(w["app"], "2030-W23") == {w["steady"].user_id}
+
+
+def test_a_failed_restore_write_never_revives_a_given_up_week(weekly,
+                                                             monkeypatch) -> None:
+    # The record goes first, so a write that fails afterwards costs one
+    # restored week rather than leaving a record that could later bring
+    # back a week the member gave up.
+    w = weekly
+    u = w["paused"]
+    _pause(w, u, {"action": "pause"})
+    web._ensure_period_materialized(w["community"], w["app"], "2030-W23")
+
+    def broken(*a, **kw):
+        raise RuntimeError("write failed")
+    monkeypatch.setattr(db, "atomic_signup_assignment", broken)
+    with pytest.raises(RuntimeError):
+        _pause(w, u, {"action": "resume"})
     assert db.list_pause_skips(w["app"].app_id, u.user_id) == []

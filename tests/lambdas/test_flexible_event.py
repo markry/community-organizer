@@ -383,6 +383,9 @@ def test_results_page_has_message_editor(ddb_table) -> None:
         ev, aa, db.get_community(cid), app, aa_mem)["body"]
     assert "Message to the group" in body
     assert "/api/flex/event/message" in body
+    # Save starts greyed out; editing the text is what enables it.
+    assert "<button type='submit' disabled" in body
+    assert "this.value===this.defaultValue" in body
 
 
 def test_cancel_scheduled_event(ddb_table) -> None:

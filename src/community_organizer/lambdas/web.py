@@ -2899,10 +2899,15 @@ def _flex_event_results_page(event: dict, user: User,
             "<p style='color:#888;font-size:0.85em;margin:0 0 4px'>Goes in the "
             "invitation and reminder emails — the book, what to expect, anything "
             "you'd like to say.</p>"
+            # Save stays disabled until the text actually differs from what's
+            # saved, so an untouched message can't look unsaved.
             "<textarea name='description' rows='4' style='padding:6px;"
-            f"width:100%'>{html.escape(evt.description or '')}</textarea>"
-            "<p style='margin:6px 0 0'><button type='submit' "
-            "style='padding:6px 16px;cursor:pointer'>Save message</button></p>"
+            "width:100%' oninput=\"var b=this.form.querySelector("
+            "'button[type=submit]');b.disabled=(this.value===this.defaultValue);"
+            "b.style.cursor=b.disabled?'default':'pointer'\">"
+            f"{html.escape(evt.description or '')}</textarea>"
+            "<p style='margin:6px 0 0'><button type='submit' disabled "
+            "style='padding:6px 16px;cursor:default'>Save message</button></p>"
             "</form>")
 
     state_banner = ""

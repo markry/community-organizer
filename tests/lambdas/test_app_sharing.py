@@ -146,7 +146,7 @@ def test_card_art_is_shown_on_the_front_door_and_the_sign_in(ddb_table, monkeypa
     no art of its own shows no picture."""
     cid, app, _ = _seed()
     monkeypatch.setattr(web, "COMMUNITY_ID", cid)
-    img = "<img src='/og/bookclub.png'"
+    img = "<img src='/og/bookclub.png?v="
     login = {"rawPath": "/login",
              "queryStringParameters": {"next": "/?app_id=bookclub"}}
     assert img not in web._app_landing({}, app.public_slug)["body"]
@@ -158,7 +158,7 @@ def test_card_art_is_shown_on_the_front_door_and_the_sign_in(ddb_table, monkeypa
     assert img in b and "<h1 style='margin-bottom:8px'>Summer Book Club</h1>" in b
     for page in (b, web._app_landing({}, app.public_slug)["body"]):
         assert (f"property='og:image' content='https://{web.DOMAIN_NAME}"
-                "/og/bookclub.png'") in page
+                "/og/bookclub.png?v=1'") in page
         assert "content='summary_large_image'" in page
     assert "property='og:title' content='Summer Book Club'" in b
     # A sign-in that is not headed for an app is as before.
@@ -385,6 +385,40 @@ def test_upload_art_accepts_png(ddb_table, monkeypatch):
                                     db.get_membership("bookclub", u.user_id))
     assert r["statusCode"] == 302
     assert db.get_application(cid, "bookclub").og_art_content_type == "image/png"
+
+
+def test_card_art_url_changes_when_art_is_set(ddb_table, monkeypatch):
+    # The image is served with a day-long browser cache at a URL that is
+    # otherwise the same for every upload; the settings page kept showing
+    # the old picture. Each upload must yield a new URL.
+    import re
+    import boto3
+    boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="ogart")
+    cid, app, u = _seed()
+    monkeypatch.setattr(web, "OG_ART_BUCKET", "ogart")
+    monkeypatch.setattr(web, "_s3_client_cache", None)
+    mem = db.get_membership("bookclub", u.user_id)
+    get = {"requestContext": {"http": {"method": "GET"}}}
+
+    def preview_src():
+        page = web._admin_settings_page(get, u, db.get_community(cid),
+                                        db.get_application(cid, "bookclub"),
+                                        mem)["body"]
+        return re.search(r"src='(/og/[^']+)' alt='card preview'", page).group(1)
+
+    before = preview_src()
+    body = (b'------x\r\nContent-Disposition: form-data; name="art"; '
+            b'filename="card.png"\r\nContent-Type: image/png\r\n\r\n'
+            + _tiny_png() + b'\r\n------x--\r\n')
+    post = {"requestContext": {"http": {"method": "POST"}},
+            "headers": {"content-type": "multipart/form-data; boundary=----x"},
+            "body": base64.b64encode(body).decode(), "isBase64Encoded": True}
+    web._api_sharing_upload_art(post, u, db.get_community(cid),
+                                db.get_application(cid, "bookclub"), mem)
+    after = preview_src()
+    assert db.get_application(cid, "bookclub").og_art_updated_at
+    assert before != after and "?v=" in after
+    assert web._app_og_image_url(db.get_application(cid, "bookclub")).endswith(after)
 
 
 def test_upload_art_accepts_non_ascii_filename(ddb_table, monkeypatch):

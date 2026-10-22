@@ -142,6 +142,10 @@ class Application:
     # bucket under the app_id). Holds the image's MIME type ("image/png" /
     # "image/jpeg"); None = use the generic Community Organizer image.
     og_art_content_type: str | None = None
+    # When the art was last set. Goes into the image URL as ?v= so a
+    # replaced image gets a new URL (the image is served with a day-long
+    # browser cache, and the URL is otherwise the same for every upload).
+    og_art_updated_at: str | None = None
     terminology: str = "volunteer"
     terminology_plural: str = ""  # blank → derived by pluralizer
     event_noun: str = "event"

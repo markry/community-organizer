@@ -15741,13 +15741,23 @@ def _maybe_current_user(event: dict) -> User | None:
         sub, community_id=os.environ.get("COMMUNITY_ID") or None)
 
 
+def _og_art_path(app: Application) -> str:
+    """``/og/<app_id>.png?v=<n>``. The ``v`` changes whenever the art is set
+    or removed, so a browser holding the old image (cached for a day) fetches
+    the new one. Rows that predate ``og_art_updated_at`` get a fixed ``v``,
+    still distinct from the bare URL those browsers cached."""
+    stamp = "".join(ch for ch in (app.og_art_updated_at or "") if ch.isdigit())
+    v = stamp or ("1" if app.og_art_content_type else "0")
+    return f"/og/{app.app_id}.png?v={v}"
+
+
 def _app_card_art_html(app: Application | None) -> str:
     """The app's own card art, shown ON the page: the picture a link preview
     shows is the one the person who follows the link should see too. Empty
     for an app with no art of its own (the generic card is not repeated)."""
     if app is None or not app.og_art_content_type:
         return ""
-    return (f"<img src='/og/{app.app_id}.png' alt='' width='1200' height='630' "
+    return (f"<img src='{_og_art_path(app)}' alt='' width='1200' height='630' "
             "style='display:block;width:100%;height:auto;border-radius:8px;"
             "margin:0 auto 20px'>")
 
@@ -15756,7 +15766,7 @@ def _app_og_image_url(app: Application) -> str:
     """The preview picture for an app's pages: its own art, or "" (none)."""
     if not app.og_art_content_type:
         return ""
-    return f"https://{DOMAIN_NAME}/og/{app.app_id}.png"
+    return f"https://{DOMAIN_NAME}{_og_art_path(app)}"
 
 
 def _app_named_by_next(next_url: str) -> Application | None:
@@ -15881,7 +15891,7 @@ def _public_page_section(app: Application, slug: str, share_url: str,
     multipart — its body fields aren't visible to _get_param."""
     has_art = bool(app.og_art_content_type)
     art_block = (
-        f"<img src='/og/{app.app_id}.png' alt='card preview' "
+        f"<img src='{_og_art_path(app)}' alt='card preview' "
         "style='max-width:100%;width:480px;border:1px solid #ddd;"
         "border-radius:8px;margin:8px 0'>"
         + (f"<form method='post' class='no-spinner' "
@@ -16039,6 +16049,8 @@ def _api_sharing_upload_art(event: dict, user: User, community: Community | None
         return _error_redirect_or_next(event, nxt,
             "Upload failed — please try again.")
     app.og_art_content_type = ctype
+    app.og_art_updated_at = dt.datetime.now(dt.timezone.utc).isoformat(
+        timespec="seconds")
     db.put_application(app)
     log.info("AA %s set card art for app %s (%s, %d bytes)",
              user.user_id, app.app_id, ctype, len(data))
@@ -16058,6 +16070,8 @@ def _api_sharing_delete_art(event: dict, user: User, community: Community | None
         except Exception:
             log.exception("og art delete failed for app %s", app.app_id)
     app.og_art_content_type = None
+    app.og_art_updated_at = dt.datetime.now(dt.timezone.utc).isoformat(
+        timespec="seconds")
     db.put_application(app)
     return _redirect(nxt)
 

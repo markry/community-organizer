@@ -14661,6 +14661,15 @@ def _ca_landing_page(event: dict, user: User,
         f"<option value='{k}'>{html.escape(v)}</option>"
         for k, v in _APP_TYPE_LABEL.items()
     )
+    # Candidates for "make this person an admin" on the create form:
+    # everyone else in the community with a name, alphabetical.
+    admin_options = "".join(
+        f"<option value='{u.user_id}'>{html.escape(u.name)}"
+        + (f" ({html.escape(u.email)})" if u.email else "") + "</option>"
+        for u in sorted((u for u in db.list_users(user.community_id)
+                         if u.user_id != user.user_id and u.name),
+                        key=lambda u: u.name.lower())
+    ) if can_create_delete_apps else ""
 
     role_label = ("Community Admin landing"
                   if user.community_role == "ca"
@@ -14698,7 +14707,11 @@ def _ca_landing_page(event: dict, user: User,
         "</p>"
         "<form method='post' action='/api/apps/create' "
         "style='display:flex;flex-direction:column;gap:10px;"
-        "max-width:520px'>"
+        "max-width:520px' "
+        # Same rule the server enforces; caught here so the form isn't lost.
+        "onsubmit=\"if(!this.admin_self.checked&&!this.admin_user_id.value)"
+        "{alert('An app needs at least one admin: tick \\u201cMake me the "
+        "app admin\\u201d or pick someone.');return false}\">"
         "<label>Name "
         "<input name='name' required maxlength='80' "
         "style='width:100%;padding:6px;box-sizing:border-box'></label>"
@@ -14730,6 +14743,19 @@ def _ca_landing_page(event: dict, user: User,
         "<option value='weekly'>weekly</option>"
         "<option value='ad_hoc'>Ad hoc</option>"
         "</select></label>"
+        "<fieldset style='border:1px solid #ddd;border-radius:4px;"
+        "padding:8px 12px'>"
+        "<legend style='font-size:0.95em'>App admin (required)</legend>"
+        "<label style='display:block'>"
+        "<input type='checkbox' name='admin_self' value='1' checked> "
+        "Make me the app admin</label>"
+        "<label style='display:block;margin-top:8px'>"
+        "&hellip;or (also) make this person an admin "
+        "<select name='admin_user_id' style='width:100%;padding:6px'>"
+        "<option value=''>(nobody else)</option>"
+        f"{admin_options}"
+        "</select></label>"
+        "</fieldset>"
         "<button type='submit' "
         "style='padding:8px 16px;cursor:pointer;background:#2a7;"
         "color:white;border:none;border-radius:4px;align-self:flex-start'>"
@@ -14832,15 +14858,34 @@ def _api_app_create(event: dict, user: User,
     if period_type not in ("monthly", "weekly", "ad_hoc"):
         return _error_redirect("/admin/apps",
             f"Unsupported period type: {period_type!r}")
+    # An app with no admin is unusable (nobody can open it to run it), so
+    # creation requires one: the creator, another community member, or both.
+    admin_ids: list[str] = []
+    if (_get_param(event, "admin_self") or "") == "1":
+        admin_ids.append(user.user_id)
+    other_id = (_get_param(event, "admin_user_id") or "").strip()
+    if other_id and other_id not in admin_ids:
+        if db.get_user(user.community_id, other_id) is None:
+            return _error_redirect("/admin/apps",
+                "The person picked as app admin wasn't found.")
+        admin_ids.append(other_id)
+    if not admin_ids:
+        return _error_redirect("/admin/apps",
+            "An app needs at least one admin: tick \"Make me the app "
+            "admin\" or pick someone.")
     app = Application(community_id=user.community_id, name=name,
                       app_type=app_type, period_type=period_type,
                       description=description)
     app.public_slug = _unique_slug(user.community_id, name)
     db.put_application(app)
-    log.info("CA %s created app %s name=%r type=%s period=%s slug=%s",
-             user.user_id, app.app_id, name, app_type, period_type,
-             app.public_slug)
-    return _redirect("/admin/apps")
+    for uid in admin_ids:
+        db.put_membership(Membership(
+            community_id=user.community_id, app_id=app.app_id,
+            user_id=uid, app_role="aa"))
+    log.info("CA %s created app %s name=%r type=%s period=%s slug=%s "
+             "admins=%s", user.user_id, app.app_id, name, app_type,
+             period_type, app.public_slug, admin_ids)
+    return _redirect(f"/?app_id={app.app_id}")
 
 
 def _render_user_apps_cell(target_user: User,

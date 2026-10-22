@@ -59,7 +59,8 @@ def test_app_create_assigns_slug(ddb_table):
     db.put_user(ca)
     event = {"requestContext": {"http": {"method": "POST"}},
              "queryStringParameters": {"name": "Men's Group",
-                                       "app_type": "flexible_event"}}
+                                       "app_type": "flexible_event",
+                                       "admin_self": "1"}}
     web._api_app_create(event, ca, db.get_community("test-community"))
     apps = [a for a in db.list_applications("test-community")
             if a.name == "Men's Group"]

@@ -1194,6 +1194,7 @@ def test_api_app_create_happy_path(ddb_table) -> None:
             "app_type": "recurring_commitments",
             "period_type": "weekly",
             "description": "Weekly Eucharistic adoration cohort.",
+            "admin_self": "1",
         },
     }
     resp = web._api_app_create(event, ca, db.get_community(cid))
@@ -1223,6 +1224,7 @@ def test_api_app_create_defaults_period_when_omitted(ddb_table) -> None:
         "requestContext": {"http": {"method": "POST"}},
         "queryStringParameters": {
             "name": "Sunday Ushers", "app_type": "coverage",
+            "admin_self": "1",
         },
     }
     resp = web._api_app_create(event, ca, db.get_community(cid))
@@ -1230,6 +1232,86 @@ def test_api_app_create_defaults_period_when_omitted(ddb_table) -> None:
     apps = list(db.list_applications(cid))
     assert apps[0].period_type == "monthly"     # defaulted from coverage
     assert apps[0].description == ""             # blank, not None
+
+
+def _create_event(**params) -> dict:
+    return {"rawPath": "/api/apps/create",
+            "requestContext": {"http": {"method": "POST"}},
+            "queryStringParameters": {"name": "Supper Club",
+                                      "app_type": "flexible_event", **params}}
+
+
+def test_api_app_create_requires_an_admin(ddb_table) -> None:
+    """An app nobody administers can't be opened to run it, so creation
+    with neither the creator nor another person as admin is refused and
+    nothing is written."""
+    from community_organizer.core import db
+    from community_organizer.core.models import Community
+    from community_organizer.lambdas import web
+
+    cid = "c1"
+    db.put_community(Community(community_id=cid, name="Test"))
+    ca = User(community_id=cid, email="ca@example.com", name="CA",
+              community_role="ca")
+    db.put_user(ca)
+    resp = web._api_app_create(_create_event(), ca, db.get_community(cid))
+    assert "error=" in resp["headers"]["Location"]
+    assert list(db.list_applications(cid)) == []
+
+
+def test_api_app_create_makes_creator_and_or_picked_person_admin(ddb_table) -> None:
+    from community_organizer.core import db
+    from community_organizer.core.models import Community
+    from community_organizer.lambdas import web
+
+    cid = "c1"
+    db.put_community(Community(community_id=cid, name="Test"))
+    ca = User(community_id=cid, email="ca@example.com", name="CA",
+              community_role="ca")
+    other = User(community_id=cid, email="org@example.com", name="Organizer")
+    db.put_user(ca)
+    db.put_user(other)
+
+    def admins_of(app_name: str) -> set[str]:
+        (app,) = [a for a in db.list_applications(cid) if a.name == app_name]
+        return {m.user_id for m in db.list_memberships_for_app(app.app_id)
+                if m.app_role == "aa"}
+
+    web._api_app_create(_create_event(name="A", admin_self="1"),
+                        ca, db.get_community(cid))
+    assert admins_of("A") == {ca.user_id}
+    web._api_app_create(_create_event(name="B", admin_user_id=other.user_id),
+                        ca, db.get_community(cid))
+    assert admins_of("B") == {other.user_id}
+    web._api_app_create(_create_event(name="C", admin_self="1",
+                                      admin_user_id=other.user_id),
+                        ca, db.get_community(cid))
+    assert admins_of("C") == {ca.user_id, other.user_id}
+    # Someone not in the community: refused, no app.
+    resp = web._api_app_create(_create_event(name="D", admin_user_id="nobody"),
+                               ca, db.get_community(cid))
+    assert "error=" in resp["headers"]["Location"]
+    assert not [a for a in db.list_applications(cid) if a.name == "D"]
+
+
+def test_create_form_offers_creator_checkbox_and_people(ddb_table) -> None:
+    from community_organizer.core import db
+    from community_organizer.core.models import Community
+    from community_organizer.lambdas import web
+
+    cid = "c1"
+    db.put_community(Community(community_id=cid, name="Test"))
+    ca = User(community_id=cid, email="ca@example.com", name="CA",
+              community_role="ca")
+    other = User(community_id=cid, email="org@example.com", name="Organizer")
+    db.put_user(ca)
+    db.put_user(other)
+    body = web._ca_landing_page({"rawPath": "/admin/apps"}, ca,
+                                db.get_community(cid))["body"]
+    assert "name='admin_self' value='1' checked" in body
+    assert f"<option value='{other.user_id}'>Organizer" in body
+    assert f"<option value='{ca.user_id}'>" not in body   # the box covers self
+    assert "this.admin_self.checked" in body               # client-side check
 
 
 def test_api_app_create_rejects_unsupported_type(ddb_table) -> None:
@@ -1274,13 +1356,15 @@ def test_api_app_create_accepts_standing_event(ddb_table) -> None:
         "requestContext": {"http": {"method": "POST"}},
         "queryStringParameters": {
             "name": "Book Club", "app_type": "flexible_event",
+            "admin_self": "1",
         },
     }
     resp = web._api_app_create(event, ca, db.get_community(cid))
     assert resp["statusCode"] == 302
-    assert resp["headers"]["Location"] == "/admin/apps"
     apps = list(db.list_applications(cid))
     assert len(apps) == 1
+    # Lands in the new app, not back on the list.
+    assert resp["headers"]["Location"] == f"/?app_id={apps[0].app_id}"
     assert apps[0].app_type == "flexible_event"
     assert apps[0].name == "Book Club"
 

@@ -11249,12 +11249,14 @@ def _users_page(event: dict, user: User, community: Community | None,
         "<h3 style='font-size:1em;color:#444;margin-top:24px'>Add new member</h3>"
         "<form method='post' action='/api/users/add' "
         "style='margin:8px 0;display:flex;gap:8px;align-items:end;flex-wrap:wrap'>"
-        "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
-        "Name (required)<input name='name' required "
-        "style='padding:4px;width:140px'></label>"
+        # Email identifies the person. Someone already in the community keeps
+        # their stored name, so a name is only needed for someone new.
         "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
         "Email (required)<input type='email' name='email' required "
         "style='padding:4px;width:180px'></label>"
+        "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
+        "Name (if new to the community)<input name='name' "
+        "style='padding:4px;width:140px'></label>"
         "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
         "Phone (optional)<input name='phone' style='padding:4px;width:120px'></label>"
         "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
@@ -11334,9 +11336,9 @@ def _api_user_add(event: dict, user: User, community: Community | None,
     email = _get_param(event, "email")
     phone = _get_param(event, "phone") or None
     notes = _get_param(event, "notes") or None
-    if not name or not email:
-        return _error_redirect("/admin/users",
-            "Name and email are both required.")
+    name = (name or "").strip()
+    if not email:
+        return _error_redirect("/admin/users", "Email is required.")
     # Case 2 or 3: detect an existing community user with this email.
     # `get_user_by_email` already does case-insensitive matching, so
     # "User@example.com" finds "user@example.com" without local normalization.
@@ -11369,7 +11371,12 @@ def _api_user_add(event: dict, user: User, community: Community | None,
             return _redirect(
                 "/admin/users?notice=" + urllib.parse.quote(notice))
         return _redirect("/admin/users")
-    # Case 1: net-new community user.
+    # Case 1: net-new community user. Only here is a name needed: there is
+    # no stored one to use.
+    if not name:
+        return _error_redirect("/admin/users",
+            f"{email} isn't in the community yet. Enter their name too "
+            "to add them.")
     new_user = User(community_id=user.community_id, email=email, name=name,
                     community_role="member", phone=phone, notes=notes,
                     lead_times_minutes=list(

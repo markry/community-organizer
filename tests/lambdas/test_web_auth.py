@@ -2386,6 +2386,51 @@ def test_api_user_add_existing_community_email_no_duplicate(
     assert mems == sorted([app_a.app_id, app_b.app_id])
 
 
+def test_api_user_add_name_needed_only_for_someone_new(
+        ddb_table, monkeypatch) -> None:
+    """Email identifies the person. An address already in the community is
+    added with no name typed (the stored name is used); a new address with
+    no name is refused, since there's no name to give the new person."""
+    from community_organizer.core import db
+    from community_organizer.core.models import (
+        Application, Community, Membership,
+    )
+    from community_organizer.lambdas import web
+
+    cid = "c1"
+    db.put_community(Community(community_id=cid, name="Test"))
+    app = Application(community_id=cid, name="Supper Club",
+                      app_type="flexible_event", period_type="ad_hoc")
+    db.put_application(app)
+    aa = User(community_id=cid, email="aa@example.com", name="AA")
+    db.put_user(aa)
+    db.put_membership(Membership(community_id=cid, app_id=app.app_id,
+                                 user_id=aa.user_id, app_role="aa"))
+    aa_mem = db.get_membership(app.app_id, aa.user_id)
+    spouse = User(community_id=cid, email="spouse@example.com",
+                  name="Spouse Name")
+    db.put_user(spouse)
+    monkeypatch.setattr(web, "_create_cognito_user", lambda *a, **k: None)
+
+    def add(**params):
+        return web._api_user_add(
+            {"rawPath": "/api/users/add",
+             "requestContext": {"http": {"method": "POST"}},
+             "queryStringParameters": params},
+            aa, db.get_community(cid), app, aa_mem)
+
+    resp = add(email="spouse@example.com")
+    assert resp["headers"]["Location"] == "/admin/users"     # no notice
+    assert db.get_membership(app.app_id, spouse.user_id) is not None
+    assert db.get_user(cid, spouse.user_id).name == "Spouse Name"
+
+    before = len(list(db.list_users(cid)))
+    resp = add(email="newcomer@example.com")
+    assert "error=" in resp["headers"]["Location"]
+    assert len(list(db.list_users(cid))) == before
+    assert db.get_user_by_email(cid, "newcomer@example.com") is None
+
+
 def test_api_user_add_existing_email_with_name_mismatch_notice(
         ddb_table, monkeypatch) -> None:
     """#198: when an AA adds an existing community email but types a

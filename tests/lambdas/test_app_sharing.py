@@ -387,6 +387,30 @@ def test_upload_art_accepts_png(ddb_table, monkeypatch):
     assert db.get_application(cid, "bookclub").og_art_content_type == "image/png"
 
 
+def test_upload_art_accepts_non_ascii_filename(ddb_table, monkeypatch):
+    # macOS screenshot names contain U+202F ("...at 9.57.00 AM.png").
+    # Raw non-ASCII bytes make the email parser return the
+    # Content-Disposition as a Header object, not a str; the upload used to
+    # 500 on the substring test.
+    import boto3
+    boto3.client("s3", region_name="us-east-1").create_bucket(Bucket="ogart")
+    cid, app, u = _seed()
+    monkeypatch.setattr(web, "OG_ART_BUCKET", "ogart")
+    monkeypatch.setattr(web, "_s3_client_cache", None)
+    png = _tiny_png()
+    name = "Screenshot 2026-10-22 at 9.57.00 AM.png".encode("utf-8")
+    body = (b'------x\r\nContent-Disposition: form-data; name="art"; '
+            b'filename="' + name + b'"\r\nContent-Type: image/png\r\n\r\n'
+            + png + b'\r\n------x--\r\n')
+    event = {"requestContext": {"http": {"method": "POST"}},
+             "headers": {"content-type": "multipart/form-data; boundary=----x"},
+             "body": base64.b64encode(body).decode(), "isBase64Encoded": True}
+    r = web._api_sharing_upload_art(event, u, db.get_community(cid), app,
+                                    db.get_membership("bookclub", u.user_id))
+    assert r["statusCode"] == 302
+    assert db.get_application(cid, "bookclub").og_art_content_type == "image/png"
+
+
 # ---- site icon ------------------------------------------------------------
 
 def test_site_icon_is_served_and_linked(ddb_table, monkeypatch):

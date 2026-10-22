@@ -15863,7 +15863,9 @@ def _parse_multipart_file(event: dict, field: str) -> tuple[bytes | None, str]:
     for part in msg.walk():
         if part.get_content_maintype() == "multipart":
             continue
-        disp = part.get("Content-Disposition", "") or ""
+        # str(): a non-ASCII filename (macOS screenshot names carry U+202F)
+        # makes the parser return a Header object, which `in` can't search.
+        disp = str(part.get("Content-Disposition", "") or "")
         if f'name="{field}"' in disp:
             payload = part.get_payload(decode=True)
             return payload, part.get_content_type()

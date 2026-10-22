@@ -11436,20 +11436,28 @@ def _users_add_many_page(event: dict, user: User, community: Community | None,
         "<th style='text-align:left;padding:6px 12px'>Email</th>"
         "<th style='text-align:left;padding:6px 12px'>Phone</th>"
         "</tr></thead><tbody>" + rows + "</tbody></table>"
-        "<p style='margin:18px 0'><button type='submit' id='add-many-go' "
-        "disabled style='padding:8px 18px;cursor:pointer'>"
-        f"Add all selected users to {app_name} "
-        "(<span id='add-many-n'>0</span>)</button>"
+        # Two ways out: add and stay (search, tick, add, search again), or
+        # add and go back to where the picker was opened from.
+        "<p style='margin:18px 0'><button type='submit' name='stay' value='1' "
+        "class='add-many-go' disabled style='padding:8px 18px;cursor:pointer'>"
+        f"Add selected users to {app_name} "
+        "(<span class='add-many-n'>0</span>)</button> "
+        "<button type='submit' class='add-many-go' disabled "
+        "style='padding:8px 18px;cursor:pointer'>Add and exit "
+        "(<span class='add-many-n'>0</span>)</button>"
         f" <a href='{html.escape(back)}' style='margin-left:8px'>cancel</a></p>"
         "</form>"
-        "<script>(function(){var b=document.getElementById('add-many-go'),"
-        "c=document.getElementById('add-many-n');"
+        "<script>(function(){"
         "document.querySelectorAll(\"#pick-rows input[name='user_id']\")"
         ".forEach(function(x){x.addEventListener('change',function(){"
         "var k=document.querySelectorAll("
         "\"#pick-rows input[name='user_id']:checked\").length;"
-        "c.textContent=k;b.disabled=!k;});});})();</script>"
-        + _admin_nav_bar("members", app=app))
+        "document.querySelectorAll('.add-many-n').forEach(function(c){"
+        "c.textContent=k;});"
+        "document.querySelectorAll('.add-many-go').forEach(function(b){"
+        "b.disabled=!k;});});});})();</script>"
+        # A sub-page with no tab of its own: Members stays a live link.
+        + _admin_nav_bar("", app=app))
     return _html(200, _page(body, narrow=False, title=app.name))
 
 
@@ -11478,9 +11486,14 @@ def _api_users_add_many(event: dict, user: User, community: Community | None,
         added += 1
     log.info("admin %s added %d member(s) to app %s",
              user.user_id, added, app.app_id)
-    return _notice_redirect_or_next(
-        event, "/admin/users",
-        f"Added {added} member{'s' if added != 1 else ''} to {app.name}.")
+    msg = f"Added {added} member{'s' if added != 1 else ''} to {app.name}."
+    if _get_param(event, "stay"):
+        # Back to the picker, still carrying where "exit" should go.
+        back = _safe_next(_get_param(event, "next") or "/admin/users")
+        return _redirect("/admin/users/add-many?next="
+                         + urllib.parse.quote(back, safe="")
+                         + "&notice=" + urllib.parse.quote(msg))
+    return _notice_redirect_or_next(event, "/admin/users", msg)
 
 
 def _api_user_add(event: dict, user: User, community: Community | None,
@@ -15376,7 +15389,7 @@ def _ca_users_page(event: dict, user: User,
     )
 
     add_form = (
-        "<h3 style='font-size:1em;color:#444;margin-top:24px'>Add user</h3>"
+        "<h3 style='font-size:1em;color:#444;margin-top:12px'>Add user</h3>"
         "<p style='color:#888;font-size:0.85em'>This adds the user to the "
         "community only. App membership is granted from each app's "
         "<i>View, add, or remove members</i> page.</p>"
@@ -15403,7 +15416,7 @@ def _ca_users_page(event: dict, user: User,
         f"<p style='color:#888;margin-top:0'>"
         f"{html.escape(org_name)} — all users, all apps</p>"
         + _flash_banner_html(event)
-        + table + add_form
+        + add_form + table
         + _ca_nav_bar("community-users")
     )
     return _html(200, _page(body, narrow=False, title="Community users"))

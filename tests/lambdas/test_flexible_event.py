@@ -412,9 +412,10 @@ def test_add_many_page_lists_the_community_with_checkboxes(ddb_table) -> None:
     assert f"name='user_id' value='{dan.user_id}'" in body
     assert f"value='{bob.user_id}'" not in body          # already a member
     assert "already a member" in body
-    assert "Add all selected users to Book Club" in body
+    assert "Add selected users to Book Club" in body
     assert "pick-rows-q" in body                          # the search box
     assert "value='/flex/event/results?event=e1'" in body  # comes back here
+    assert "<a href='/admin/users' style='color:#2a7;" in body  # Members tab live
 
 
 def test_add_many_adds_the_ticked_people(ddb_table) -> None:
@@ -430,6 +431,27 @@ def test_add_many_adds_the_ticked_people(ddb_table) -> None:
     assert db.get_membership("a1", ann.user_id) is not None
     assert db.get_membership("a1", dan.user_id) is not None
     assert db.get_membership("a1", "nobody") is None
+
+
+def test_add_many_can_stay_on_the_picker(ddb_table) -> None:
+    """"Add selected" (stay) comes back to the picker, still knowing where
+    exit goes; the people added now show as already members."""
+    cid, app, aa, aa_mem, bob, ann, dan = _add_many_setup(ddb_table)
+    resp = web._api_users_add_many(
+        _post("/api/users/add-many",
+              {"user_id": [ann.user_id], "stay": "1",
+               "next": "/flex/event/results?event=e1"}),
+        aa, db.get_community(cid), app, aa_mem)
+    loc = resp["headers"]["Location"]
+    assert loc.startswith("/admin/users/add-many?next="
+                          "%2Fflex%2Fevent%2Fresults%3Fevent%3De1&notice=")
+    body = web._users_add_many_page(
+        {"requestContext": {"http": {"method": "GET"}},
+         "queryStringParameters": {"next": "/flex/event/results?event=e1"}},
+        aa, db.get_community(cid), app, aa_mem)["body"]
+    assert f"value='{ann.user_id}'" not in body
+    assert f"value='{dan.user_id}'" in body
+    assert "name='stay' value='1'" in body and "Add and exit" in body
 
 
 def test_add_many_is_for_community_admins_only(ddb_table) -> None:
@@ -483,6 +505,8 @@ def test_member_pages_have_search_and_no_scroll_box(ddb_table) -> None:
     assert users.index("/admin/users/add-many") < users.index("id='member-rows'")
     ca = web._ca_users_page(get, aa, db.get_community(cid))["body"]
     assert "community-rows-q" in ca and "max-height:500px" not in ca
+    # Community users: adding one person comes first, above the search.
+    assert ca.index("/api/community-users/add") < ca.index("community-rows-q")
 
 
 def test_cancel_scheduled_event(ddb_table) -> None:

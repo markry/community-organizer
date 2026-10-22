@@ -388,6 +388,103 @@ def test_results_page_has_message_editor(ddb_table) -> None:
     assert "this.value===this.defaultValue" in body
 
 
+def _add_many_setup(ddb_table):
+    """The seeded app plus two community members who aren't in it, with the
+    AA promoted to community admin (the bulk add lists the whole community,
+    so it is theirs alone)."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    aa.community_role = "ca"
+    db.put_user(aa)
+    ann = User(community_id=cid, email="ann@example.com", name="Ann")
+    dan = User(community_id=cid, email="dan@example.com", name="Dan")
+    for u in (ann, dan):
+        db.put_user(u)
+    return cid, app, aa, aa_mem, bob, ann, dan
+
+
+def test_add_many_page_lists_the_community_with_checkboxes(ddb_table) -> None:
+    cid, app, aa, aa_mem, bob, ann, dan = _add_many_setup(ddb_table)
+    body = web._users_add_many_page(
+        {"requestContext": {"http": {"method": "GET"}},
+         "queryStringParameters": {"next": "/flex/event/results?event=e1"}},
+        aa, db.get_community(cid), app, aa_mem)["body"]
+    assert f"name='user_id' value='{ann.user_id}'" in body
+    assert f"name='user_id' value='{dan.user_id}'" in body
+    assert f"value='{bob.user_id}'" not in body          # already a member
+    assert "already a member" in body
+    assert "Add all selected users to Book Club" in body
+    assert "pick-rows-q" in body                          # the search box
+    assert "value='/flex/event/results?event=e1'" in body  # comes back here
+
+
+def test_add_many_adds_the_ticked_people(ddb_table) -> None:
+    cid, app, aa, aa_mem, bob, ann, dan = _add_many_setup(ddb_table)
+    resp = web._api_users_add_many(
+        _post("/api/users/add-many",
+              {"user_id": [ann.user_id, dan.user_id, bob.user_id, "nobody"],
+               "next": "/flex/event/results?event=e1"}),
+        aa, db.get_community(cid), app, aa_mem)
+    loc = resp["headers"]["Location"]
+    assert loc.startswith("/flex/event/results?event=e1&notice=")
+    assert "Added+2+members" in loc or "Added%202%20members" in loc
+    assert db.get_membership("a1", ann.user_id) is not None
+    assert db.get_membership("a1", dan.user_id) is not None
+    assert db.get_membership("a1", "nobody") is None
+
+
+def test_add_many_is_for_community_admins_only(ddb_table) -> None:
+    """A plain AA sees only their own app's roster, so neither the page nor
+    the handler is theirs."""
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    ann = User(community_id=cid, email="ann@example.com", name="Ann")
+    db.put_user(ann)
+    page = web._users_add_many_page(
+        {"requestContext": {"http": {"method": "GET"}}},
+        aa, db.get_community(cid), app, aa_mem)
+    assert page["statusCode"] == 403 and "ann@example.com" not in page["body"]
+    resp = web._api_users_add_many(
+        _post("/api/users/add-many", {"user_id": [ann.user_id]}),
+        aa, db.get_community(cid), app, aa_mem)
+    assert resp["statusCode"] == 403
+    assert db.get_membership("a1", ann.user_id) is None
+
+
+def test_event_page_links_to_add_members(ddb_table) -> None:
+    cid, app, aa, aa_mem, *_ = _seed(ddb_table)
+    evt, opt = _mk_event(cid)
+    _add_option(cid, evt, "2026-08-22")        # two dates: "Answered N of M"
+    ev = {"requestContext": {"http": {"method": "GET"}},
+          "queryStringParameters": {"event": evt.event_id}}
+
+    def page():
+        return web._flex_event_results_page(
+            ev, db.get_user(cid, aa.user_id), db.get_community(cid), app,
+            aa_mem)["body"]
+    # A plain AA goes to the members page (add by email) ...
+    assert "<a href='/admin/users' style='color:#2a7'>Add members...</a>" in page()
+    # ... a community admin to the bulk picker, which brings them back.
+    aa.community_role = "ca"
+    db.put_user(aa)
+    body = page()
+    assert "/admin/users/add-many?next=%2Fflex%2Fevent%2Fresults%3Fevent%3D" in body
+    assert body.index("Add members...") < body.index("Answered ")
+
+
+def test_member_pages_have_search_and_no_scroll_box(ddb_table) -> None:
+    cid, app, aa, aa_mem, *_ = _seed(ddb_table)
+    aa.community_role = "ca"
+    db.put_user(aa)
+    get = {"requestContext": {"http": {"method": "GET"}}}
+    users = web._users_page(get, aa, db.get_community(cid), app, aa_mem)["body"]
+    assert "View, add, or remove members" in users
+    assert "member-rows-q" in users and "max-height:500px" not in users
+    # Single add stays on top, with the bulk link beside it, above the list.
+    assert users.index("/api/users/add") < users.index("id='member-rows'")
+    assert users.index("/admin/users/add-many") < users.index("id='member-rows'")
+    ca = web._ca_users_page(get, aa, db.get_community(cid))["body"]
+    assert "community-rows-q" in ca and "max-height:500px" not in ca
+
+
 def test_cancel_scheduled_event(ddb_table) -> None:
     cid, app, aa, aa_mem, *_ = _seed(ddb_table)
     evt, opt = _mk_event(cid, state="scheduled")
@@ -815,12 +912,20 @@ def test_flexible_home_dashboard(ddb_table) -> None:
     _mk_event(cid)   # an open poll ("August Book Club")
     db.put_flexible_event(FlexibleEvent(
         community_id=cid, app_id="a1", title="July Dinner", state="scheduled",
-        winning_date="2026-07-04", winning_start_time="18:00", location="Hall"))
+        winning_date="2099-07-04", winning_start_time="18:00", location="Hall"))
+    db.put_flexible_event(FlexibleEvent(
+        community_id=cid, app_id="a1", title="Spring Picnic", state="scheduled",
+        winning_date="2020-05-01", winning_start_time="12:00"))
     resp = web._flexible_home(event={}, user=aa, community=db.get_community(cid),
                               app=app, membership=aa_mem, org_name="Book Club")
     body = resp["body"]
+    assert "Active events / open polls" in body
     assert "Open polls" in body and "August Book Club" in body
-    assert "Scheduled" in body and "July Dinner" in body
+    assert "Date set (poll closed)" in body and "July Dinner" in body
+    # Once its day is over a scheduled event moves to the collapsed Past list.
+    active, past = body.split("Past events (1)")
+    assert "Spring Picnic" not in active
+    assert "Spring Picnic" in past and "(held)" in past
     assert "+ New event" in body                       # admin affordance
     assert "/flex/event/results?event=" in body        # manage links
     # a plain member sees the read view without the create button

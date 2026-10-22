@@ -311,8 +311,9 @@ def test_event_app_members_page_has_no_status(world) -> None:
     w["app"].app_type = "flexible_event"
     page = web._users_page(_get("/admin/users"), w["admin"], w["community"],
                            w["app"], _mem(w, w["admin"]))["body"]
-    assert "mark inactive" not in page and " active" not in page.split(
-        "Manage members")[1][:200]
+    above_list = page.split("View, add, or remove members")[1].split(
+        "id='member-rows'")[0]
+    assert "mark inactive" not in page and " active" not in above_list
 
 
 # ---- openings, cohorts and weekly (recurring) apps --------------------------

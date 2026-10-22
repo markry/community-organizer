@@ -384,7 +384,7 @@ def test_send_email_offers_the_people_coming(ddb_table, outbox) -> None:
 
 def test_home_lists_an_adopted_event_as_scheduled(ddb_table, outbox) -> None:
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
-    _adopt(cid, app, aa, aa_mem)
+    _adopt(cid, app, aa, aa_mem, date0="2099-11-14")   # still upcoming
     evt = _the_event()
     db.put_flexible_rsvp(FlexibleRSVP(
         community_id=cid, app_id="a1", event_id=evt.event_id,
@@ -392,7 +392,7 @@ def test_home_lists_an_adopted_event_as_scheduled(ddb_table, outbox) -> None:
     body = web._flexible_home(event={}, user=aa, community=db.get_community(cid),
                               app=app, membership=aa_mem,
                               org_name="Book Club")["body"]
-    assert "Scheduled" in body and "Autumn Dinner" in body
+    assert "Date set (poll closed)" in body and "Autumn Dinner" in body
     assert "1 coming (3 people)" in body and "Open polls" not in body
 
 

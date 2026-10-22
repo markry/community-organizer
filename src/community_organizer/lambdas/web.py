@@ -946,6 +946,10 @@ def _dispatch(event: dict, context) -> dict:  # noqa: ARG001
         return _route(event, _users_page)
     if path == "/api/users/add":
         return _route(event, _api_user_add)
+    if path == "/admin/users/add-many":
+        return _route(event, _users_add_many_page)
+    if path == "/api/users/add-many":
+        return _route(event, _api_users_add_many)
     if path == "/api/users/edit":
         return _route(event, _api_user_edit)
     if path == "/api/users/delete":
@@ -2278,11 +2282,15 @@ def _flexible_home(*, event: dict, user: User, community: Community | None,
     memberships = list(db.list_memberships_for_app(app.app_id))
     users = {u.user_id: u for u in db.list_users(app.community_id)}
     total_households = len({_hh_key(users, m.user_id) for m in memberships})
+    # A scheduled event stays active through its day, then moves to Past.
+    tz_name = (user.preferred_tz or
+               (community.default_timezone if community else "America/New_York"))
+    today = dt.datetime.now(ZoneInfo(tz_name)).date().isoformat()
     open_polls, scheduled, past = [], [], []
     for evt in db.list_flexible_events(app.app_id):
         if evt.state == "poll":
             open_polls.append(evt)
-        elif evt.state == "scheduled":
+        elif evt.state == "scheduled" and (evt.winning_date or "9999") >= today:
             scheduled.append(evt)
         else:
             past.append(evt)
@@ -2313,6 +2321,9 @@ def _flexible_home(*, event: dict, user: User, community: Community | None,
             "color:#fff;border-radius:5px;text-decoration:none'>"
             "+ New event / date poll</a></p>")
 
+    if open_polls or scheduled:
+        parts.append("<h2 style='font-size:1.2em;color:#2a7;margin-bottom:4px'>"
+                     "Active events / open polls</h2>")
     if open_polls:
         rows = ""
         for e in open_polls:
@@ -2326,7 +2337,8 @@ def _flexible_home(*, event: dict, user: User, community: Community | None,
                      f" &middot; {opts} proposed date(s)"
                      + (f" &middot; {status}" if is_admin else "")
                      + results_link(e) + "</li>")
-        parts.append("<h2 style='font-size:1.1em;color:#2a7'>Open polls</h2>"
+        parts.append("<h3 style='font-size:1em;color:#444;margin:10px 0 2px'>"
+                     "Open polls</h3>"
                      "<ul style='margin:0 0 18px;padding-left:0;"
                      f"list-style:none'>{rows}</ul>")
 
@@ -2352,7 +2364,8 @@ def _flexible_home(*, event: dict, user: User, community: Community | None,
                 h = users[e.host_user_id]
                 line += f" &middot; host: {html.escape(h.name or h.email)}"
             rows += f"<li style='padding:6px 0'>{line}{results_link(e)}</li>"
-        parts.append("<h2 style='font-size:1.1em;color:#2a7'>Scheduled</h2>"
+        parts.append("<h3 style='font-size:1em;color:#444;margin:10px 0 2px'>"
+                     "Date set (poll closed)</h3>"
                      "<ul style='margin:0 0 18px;padding-left:0;"
                      f"list-style:none'>{rows}</ul>")
 
@@ -2360,7 +2373,8 @@ def _flexible_home(*, event: dict, user: User, community: Community | None,
         rows = "".join(
             f"<li style='padding:4px 0;color:#666'>{html.escape(e.title)} "
             f"&middot; {html.escape(_fmt_iso_date(e.winning_date or '') or e.created_at[:10])}"
-            f" ({html.escape(e.state)}){results_link(e)}</li>"
+            f" ({'held' if e.state == 'scheduled' else html.escape(e.state)})"
+            f"{results_link(e)}</li>"
             for e in past)
         parts.append(
             "<details style='margin-bottom:12px'><summary style='cursor:pointer;"
@@ -3044,6 +3058,20 @@ def _flex_event_results_page(event: dict, user: User,
     else:
         summary_html = ""
 
+    # Growing the group from the event itself. Community-level admins pick
+    # from the whole community (and come back here); an app admin without a
+    # community role may only see this app's roster, so they get the
+    # members page and its add-by-email form.
+    add_members_html = ""
+    if evt.state != "cancelled":
+        _add_href = (
+            "/admin/users/add-many?next=" + urllib.parse.quote(
+                f"/flex/event/results?event={event_id}", safe="")
+            if user.community_role in ("ca", "ua") else "/admin/users")
+        add_members_html = (
+            "<p style='text-align:center;margin:10px 0'>"
+            f"<a href='{_add_href}' style='color:#2a7'>Add members...</a></p>")
+
     # Replies table. Answers also arrive by text, by phone and in person, so
     # the AA can record them here — one column per candidate date while the
     # poll is open, a single coming / not coming once the date is set. People
@@ -3240,6 +3268,7 @@ def _flex_event_results_page(event: dict, user: User,
         f"<p style='color:#666;margin-top:-6px'>{html.escape(app.name)}</p>"
         + _flash_banner_html(event)
         + state_banner
+        + add_members_html
         + summary_html
         + (msg_html if evt.state == "poll"
            else (f"<p>{html.escape(evt.description)}</p>" if evt.description else ""))
@@ -11251,7 +11280,7 @@ def _users_page(event: dict, user: User, community: Community | None,
     # exposed to other apps' rosters because the page filter above
     # already scopes to app_member_ids.
     add_form = (
-        "<h3 style='font-size:1em;color:#444;margin-top:24px'>Add new member</h3>"
+        "<h3 style='font-size:1em;color:#444;margin-top:12px'>Add a member</h3>"
         "<form method='post' action='/api/users/add' "
         "style='margin:8px 0;display:flex;gap:8px;align-items:end;flex-wrap:wrap'>"
         # Email identifies the person. Someone already in the community keeps
@@ -11271,8 +11300,13 @@ def _users_page(event: dict, user: User, community: Community | None,
         "</form>"
     )
     if user.community_role in ("ca", "ua"):
+        # Picking from the whole community is for community-level admins:
+        # a plain AA sees only this app's roster (PRIVACY-AUDIT HIGH-1).
         add_form += (
-            "<p style='color:#888;font-size:0.85em;margin-top:8px'>"
+            "<p style='margin:8px 0 4px'>"
+            "<a href='/admin/users/add-many' style='color:#2a7'>"
+            "Add several from the community...</a></p>"
+            "<p style='color:#888;font-size:0.85em;margin:4px 0 16px'>"
             "Cross-app roster management: "
             "<a href='/admin/community-users' style='color:#2a7'>"
             "Community users</a>."
@@ -11281,13 +11315,12 @@ def _users_page(event: dict, user: User, community: Community | None,
 
     table = ""
     if all_users:
-        scroll_style = ("max-height:500px;overflow-y:auto;border:1px solid #eee;"
-                        "border-radius:4px" if len(all_users) > 10 else "")
         table = (
-            f"<div style='{scroll_style};margin-top:12px'>"
-            "<table style='border-collapse:collapse;width:100%;font-size:0.95em'>"
-            "<thead><tr style='color:#888;border-bottom:1px solid #ddd;"
-            "position:sticky;top:0;background:white'>"
+            _row_filter_html("member-rows")
+            + "<div style='margin-top:12px'>"
+            "<table id='member-rows' "
+            "style='border-collapse:collapse;width:100%;font-size:0.95em'>"
+            "<thead><tr style='color:#888;border-bottom:1px solid #ddd'>"
             "<th style='text-align:left;padding:6px 12px;white-space:nowrap'>Name</th>"
             "<th style='text-align:left;padding:6px 12px'>Email</th>"
             f"<th style='text-align:center;padding:6px 12px'>{'Role' if is_event else 'Role/Cohorts'}</th>"
@@ -11306,14 +11339,148 @@ def _users_page(event: dict, user: User, community: Community | None,
             + "</p>")
     body = (
         f"<h1>{html.escape(org_name)}</h1>"
-        "<h2 style='font-size:1.1em;color:#444'>Manage members</h2>"
+        "<h2 style='font-size:1.1em;color:#444'>View, add, or remove members</h2>"
         + _flash_banner_html(event)
         + conflict_banner
+        + add_form
         + count_line
-        + table + add_form
+        + table
         + _admin_nav_bar("members", app=app)
     )
     return _html(200, _page(body, narrow=False, title=org_name))
+
+
+def _row_filter_html(table_id: str) -> str:
+    """A search box that hides the rows of table ``table_id`` whose text
+    doesn't contain what's typed. Whole rows stay intact, so a match keeps
+    its actions (edit, remove, the add checkbox...). Purely local; hidden
+    rows keep their state, so a ticked box stays ticked."""
+    return (
+        "<p style='margin:12px 0 0'><input type='search' "
+        f"id='{table_id}-q' placeholder='Search by name, email, phone...' "
+        "autocomplete='off' style='padding:6px 8px;width:100%;max-width:360px'>"
+        f" <span id='{table_id}-n' style='color:#888;font-size:0.85em'></span>"
+        "</p>"
+        "<script>(function(){"
+        f"var q=document.getElementById('{table_id}-q'),"
+        f"n=document.getElementById('{table_id}-n');"
+        "q.addEventListener('input',function(){"
+        "var s=q.value.trim().toLowerCase(),shown=0,"
+        f"rows=document.querySelectorAll('#{table_id} tbody tr');"
+        "rows.forEach(function(tr){"
+        "var hit=!s||tr.textContent.toLowerCase().indexOf(s)>=0;"
+        "tr.style.display=hit?'':'none';if(hit)shown++;});"
+        "n.textContent=s?(shown+' of '+rows.length+' shown'):'';});"
+        "})();</script>")
+
+
+def _users_add_many_page(event: dict, user: User, community: Community | None,
+                         app: Application, membership: Membership | None) -> dict:
+    """Tick any number of community members and add them to this app in
+    one go. Community-level admins only: it lists the whole community,
+    which a plain AA must not see (PRIVACY-AUDIT HIGH-1)."""
+    if not _is_admin(user, membership) or user.community_role not in ("ca", "ua"):
+        return _html(403, _page(
+            "<p>Only a community admin can add members from the whole "
+            "community. Use the add-by-email form on the "
+            "<a href='/admin/users'>members page</a>.</p>"))
+    back = _safe_next(_get_param(event, "next") or "/admin/users")
+    members = {m.user_id for m in db.list_memberships_for_app(app.app_id)}
+    everyone = sorted(db.list_users(user.community_id),
+                      key=lambda u: (u.name or u.email).lower())
+    hh_names: dict[str, list[str]] = {}
+    for u in everyone:
+        if u.household_id:
+            hh_names.setdefault(u.household_id, []).append(u.name)
+    rows = ""
+    for u in everyone:
+        already = u.user_id in members
+        others = sorted(n for n in hh_names.get(u.household_id or "", [])
+                        if n != u.name)
+        hh = ("<div style='font-size:0.8em;color:#2a7'>Household: "
+              + html.escape(", ".join(others)) + "</div>" if others else "")
+        label = html.escape(u.name or u.email)
+        if already:
+            box = "<span style='font-size:0.8em'>already a member</span>"
+        else:
+            box = (f"<input type='checkbox' name='user_id' value='{u.user_id}' "
+                   f"id='pick-{u.user_id}' style='transform:scale(1.2)'>")
+            label = (f"<label for='pick-{u.user_id}' style='cursor:pointer'>"
+                     f"{label}</label>")
+        rows += (
+            "<tr style='border-bottom:1px solid #f0f0f0"
+            + (";color:#999" if already else "") + "'>"
+            f"<td style='padding:6px 12px;text-align:center'>{box}</td>"
+            f"<td style='padding:6px 12px;text-align:left'>{label}{hh}</td>"
+            "<td style='padding:6px 12px;font-size:0.9em;text-align:left'>"
+            f"{html.escape(u.email)}</td>"
+            "<td style='padding:6px 12px;font-size:0.85em;color:#666'>"
+            f"{html.escape(u.phone or '')}</td></tr>")
+    app_name = html.escape(app.name)
+    body = (
+        f"<h1>{app_name}</h1>"
+        "<h2 style='font-size:1.1em;color:#444'>Add members from the "
+        "community</h2>"
+        + _flash_banner_html(event)
+        + "<p style='color:#666;font-size:0.9em'>Tick everyone to add, then "
+        "use the button at the bottom. Someone not in the community yet is "
+        "added by email on the <a href='/admin/users'>members page</a>.</p>"
+        "<form method='post' action='/api/users/add-many'>"
+        f"<input type='hidden' name='next' value='{html.escape(back)}'>"
+        + _row_filter_html("pick-rows")
+        + "<table id='pick-rows' style='border-collapse:collapse;width:100%;"
+        "font-size:0.95em;margin-top:12px'>"
+        "<thead><tr style='color:#888;border-bottom:1px solid #ddd'>"
+        "<th style='padding:6px 12px'>Add</th>"
+        "<th style='text-align:left;padding:6px 12px'>Name</th>"
+        "<th style='text-align:left;padding:6px 12px'>Email</th>"
+        "<th style='text-align:left;padding:6px 12px'>Phone</th>"
+        "</tr></thead><tbody>" + rows + "</tbody></table>"
+        "<p style='margin:18px 0'><button type='submit' id='add-many-go' "
+        "disabled style='padding:8px 18px;cursor:pointer'>"
+        f"Add all selected users to {app_name} "
+        "(<span id='add-many-n'>0</span>)</button>"
+        f" <a href='{html.escape(back)}' style='margin-left:8px'>cancel</a></p>"
+        "</form>"
+        "<script>(function(){var b=document.getElementById('add-many-go'),"
+        "c=document.getElementById('add-many-n');"
+        "document.querySelectorAll(\"#pick-rows input[name='user_id']\")"
+        ".forEach(function(x){x.addEventListener('change',function(){"
+        "var k=document.querySelectorAll("
+        "\"#pick-rows input[name='user_id']:checked\").length;"
+        "c.textContent=k;b.disabled=!k;});});})();</script>"
+        + _admin_nav_bar("members", app=app))
+    return _html(200, _page(body, narrow=False, title=app.name))
+
+
+def _api_users_add_many(event: dict, user: User, community: Community | None,
+                        app: Application, membership: Membership | None) -> dict:
+    """Grant membership in this app to each ticked community member."""
+    if not _is_admin(user, membership) or user.community_role not in ("ca", "ua"):
+        return _text(403, "community admins only")
+    if _http_method(event) != "POST":
+        return _text(405, "POST required")
+    picked = _parse_form(event).get("user_id", [])
+    if not picked:
+        return _error_redirect_or_next(event, "/admin/users/add-many",
+                                       "Nobody was ticked.")
+    members = {m.user_id for m in db.list_memberships_for_app(app.app_id)}
+    added = 0
+    for uid in dict.fromkeys(picked):
+        if uid in members:
+            continue
+        u = db.get_user(user.community_id, uid)
+        if u is None:          # not in this community: skip, never create
+            continue
+        db.put_membership(Membership(
+            community_id=user.community_id, app_id=app.app_id,
+            user_id=u.user_id))
+        added += 1
+    log.info("admin %s added %d member(s) to app %s",
+             user.user_id, added, app.app_id)
+    return _notice_redirect_or_next(
+        event, "/admin/users",
+        f"Added {added} member{'s' if added != 1 else ''} to {app.name}.")
 
 
 def _api_user_add(event: dict, user: User, community: Community | None,
@@ -15191,15 +15358,12 @@ def _ca_users_page(event: dict, user: User,
                 "</tr>"
             )
 
-    # Long rosters scroll inside a fixed-height box with a sticky header —
-    # consistent with the per-app Members page (_users_page).
-    scroll_style = ("max-height:500px;overflow-y:auto;border:1px solid #eee;"
-                    "border-radius:4px" if len(all_users) > 10 else "")
     table = (
-        f"<div style='{scroll_style};margin-top:12px'>"
-        "<table style='border-collapse:collapse;width:100%;font-size:0.95em'>"
-        "<thead><tr style='color:#888;border-bottom:1px solid #ddd;"
-        "position:sticky;top:0;background:white'>"
+        _row_filter_html("community-rows")
+        + "<div style='margin-top:12px'>"
+        "<table id='community-rows' "
+        "style='border-collapse:collapse;width:100%;font-size:0.95em'>"
+        "<thead><tr style='color:#888;border-bottom:1px solid #ddd'>"
         "<th style='text-align:left;padding:6px 12px'>Name</th>"
         "<th style='text-align:left;padding:6px 12px'>Email</th>"
         "<th style='text-align:center;padding:6px 12px'>Community role</th>"
@@ -15215,7 +15379,7 @@ def _ca_users_page(event: dict, user: User,
         "<h3 style='font-size:1em;color:#444;margin-top:24px'>Add user</h3>"
         "<p style='color:#888;font-size:0.85em'>This adds the user to the "
         "community only. App membership is granted from each app's "
-        "<i>Manage members</i> page.</p>"
+        "<i>View, add, or remove members</i> page.</p>"
         "<form method='post' action='/api/community-users/add' "
         "style='margin:8px 0;display:flex;gap:8px;align-items:end;"
         "flex-wrap:wrap'>"

@@ -1125,8 +1125,8 @@ def _dispatch(event: dict, context) -> dict:  # noqa: ARG001
         return _ca_route(event, _api_ca_membership_toggle)
     if path == "/admin/households":
         return _ca_route(event, _ca_households_page)
-    if path == "/api/households/pair":
-        return _ca_route(event, _api_ca_household_pair)
+    if path == "/api/households/make":
+        return _ca_route(event, _api_ca_household_make)
     if path == "/api/households/unpair":
         return _ca_route(event, _api_ca_household_unpair)
     return _text(404, "not found")
@@ -15565,39 +15565,50 @@ def _ca_households_page(event: dict, user: User,
     community. household_id lives on the User, so a link spans EVERY app —
     a couple stays paired across the couples club, men's club, women's club,
     etc. The flexible_event "someone in your household already replied"
-    warning reads these."""
+    warning reads these.
+
+    One searchable list of everyone, each row showing their household (with
+    a remove button) and a checkbox; tick the people and make them a
+    household in one go, the same pattern as the bulk member add."""
     org = community.name if community else user.community_id
     users = sorted(db.list_users(user.community_id),
                    key=lambda u: (u.name or u.email).lower())
     by_hh: dict[str, list[User]] = {}
-    ungrouped: list[User] = []
     for u in users:
-        (by_hh.setdefault(u.household_id, []) if u.household_id
-         else ungrouped).append(u)
+        if u.household_id:
+            by_hh.setdefault(u.household_id, []).append(u)
 
     btn = ("font-size:0.8em;cursor:pointer;background:none;border:none;"
            "color:#c33;text-decoration:underline;padding:0;margin-left:6px")
-    hh_html = ""
-    for hid, members in sorted(by_hh.items(),
-                               key=lambda kv: (kv[1][0].name or "").lower()):
-        lis = ""
-        for m in members:
-            lis += (f"<li>{html.escape(m.name or m.email)} "
-                    f"<span style='color:#888'>&lt;{html.escape(m.email)}&gt;</span>"
-                    "<form method='post' action='/api/households/unpair' "
-                    "style='display:inline'>"
-                    f"<input type='hidden' name='user_id' value='{m.user_id}'>"
-                    f"<button type='submit' style='{btn}'>remove</button>"
-                    "</form></li>")
-        warn = (" <span style='color:#a80;font-size:0.85em'>(only one person "
-                "— pair someone in, or remove)</span>" if len(members) == 1 else "")
-        hh_html += ("<div style='margin:8px 0;padding:8px 12px;border:1px solid "
-                    "#e3efe3;border-radius:6px'>"
-                    f"<ul style='margin:0;padding-left:18px'>{lis}</ul>{warn}</div>")
-
-    opts = "".join(
-        f"<option value='{u.user_id}'>{html.escape(u.name or u.email)} "
-        f"({html.escape(u.email)})</option>" for u in users)
+    rows = ""
+    for u in users:
+        hh_cell = ""
+        if u.household_id:
+            others = [o.name or o.email for o in by_hh[u.household_id]
+                      if o.user_id != u.user_id]
+            hh_cell = (
+                html.escape(", ".join(others)) if others else
+                "<span style='color:#a80'>only them &mdash; tick someone "
+                "to join, or remove</span>")
+            # A button, not a nested form: the whole table sits inside the
+            # "make a household" form, and formaction sends it elsewhere.
+            hh_cell += (
+                "<button type='submit' formaction='/api/households/unpair' "
+                f"name='unpair_id' value='{u.user_id}' style='{btn}' "
+                f"onclick=\"return confirm('Remove {_js_str(u.name or u.email)}"
+                " from their household?');\">remove</button>")
+        rows += (
+            "<tr style='border-bottom:1px solid #f0f0f0'>"
+            "<td style='padding:6px 12px;text-align:center'>"
+            f"<input type='checkbox' name='user_id' value='{u.user_id}' "
+            f"id='hh-{u.user_id}' style='transform:scale(1.2)'></td>"
+            "<td style='padding:6px 12px;text-align:left'>"
+            f"<label for='hh-{u.user_id}' style='cursor:pointer'>"
+            f"{html.escape(u.name or u.email)}</label></td>"
+            "<td style='padding:6px 12px;font-size:0.9em;text-align:left'>"
+            f"{html.escape(u.email)}</td>"
+            "<td style='padding:6px 12px;font-size:0.9em;text-align:left;"
+            f"color:#2a7'>{hh_cell}</td></tr>")
 
     body = (
         "<h1>Households</h1>"
@@ -15609,58 +15620,75 @@ def _ca_households_page(event: dict, user: User,
           "not the app. A household can hold more than two people (e.g. grown "
           "children with their own email). The poll's “someone in your "
           "household already replied” warning uses these.</p>"
-          "<h2 style='font-size:1.1em'>Pair two people</h2>"
-          "<form method='post' action='/api/households/pair' "
-          "style='margin-bottom:6px'>"
-          f"<select name='user_a' style='padding:6px'>{opts}</select> "
-          "<b>+</b> "
-          f"<select name='user_b' style='padding:6px'>{opts}</select> "
-          "<button type='submit' style='padding:6px 16px;cursor:pointer'>"
-          "Pair</button></form>"
-          "<p style='color:#888;font-size:0.85em;margin:0 0 18px'>"
-          "Pairing someone who's already in a household just adds the other "
-          "person to it (e.g. a child).</p>"
-          "<h2 style='font-size:1.1em'>Households</h2>"
-        + (hh_html or "<p style='color:#888'>No households yet.</p>")
-        + (f"<h2 style='font-size:1.1em'>Not in a household "
-           f"({len(ungrouped)})</h2>"
-           "<ul style='columns:2;color:#666;max-width:640px;margin:0 auto;"
-           "text-align:left;display:inline-block'>"
-           + "".join(f"<li>{html.escape(u.name or u.email)}</li>"
-                     for u in ungrouped) + "</ul>" if ungrouped else "")
+          "<p style='color:#555;max-width:640px;margin:0 auto 8px'>"
+          "<b>To make a household</b>, tick everyone in it and use the button "
+          "at the bottom. Ticking someone already in a household adds the "
+          "others to theirs (e.g. a grown child).</p>"
+          "<form method='post' action='/api/households/make'>"
+        + _row_filter_html("hh-rows")
+        + "<table id='hh-rows' style='border-collapse:collapse;width:100%;"
+          "font-size:0.95em;margin-top:12px'>"
+          "<thead><tr style='color:#888;border-bottom:1px solid #ddd'>"
+          "<th style='padding:6px 12px'>Pick</th>"
+          "<th style='text-align:left;padding:6px 12px'>Name</th>"
+          "<th style='text-align:left;padding:6px 12px'>Email</th>"
+          "<th style='text-align:left;padding:6px 12px'>Household with</th>"
+          "</tr></thead><tbody>" + rows + "</tbody></table>"
+          "<p style='margin:18px 0'><button type='submit' id='hh-go' disabled "
+          "style='padding:8px 18px;cursor:pointer'>Make the selected people a "
+          "household (<span id='hh-n'>0</span>)</button></p></form>"
+          "<script>(function(){var b=document.getElementById('hh-go'),"
+          "c=document.getElementById('hh-n');"
+          "document.querySelectorAll(\"#hh-rows input[name='user_id']\")"
+          ".forEach(function(x){x.addEventListener('change',function(){"
+          "var k=document.querySelectorAll("
+          "\"#hh-rows input[name='user_id']:checked\").length;"
+          "c.textContent=k;b.disabled=k<2;});});})();</script>"
         + _ca_nav_bar("households")
     )
     return _html(200, _page(body, narrow=False, title="Households"))
 
 
-def _api_ca_household_pair(event: dict, user: User,
+def _api_ca_household_make(event: dict, user: User,
                            community: Community | None) -> dict:
+    """Put the ticked people in one household. If one of them is already in
+    a household, the rest join it; people from two different households are
+    refused rather than silently merged."""
     if _http_method(event) != "POST":
         return _text(405, "POST required")
-    a = (_get_param(event, "user_a") or "").strip()
-    b = (_get_param(event, "user_b") or "").strip()
-    if not a or not b or a == b:
+    picked = list(dict.fromkeys(_parse_form(event).get("user_id", [])))
+    if len(picked) < 2:
         return _error_redirect("/admin/households",
-                               "Pick two different people.")
-    ua = db.get_user(user.community_id, a)
-    ub = db.get_user(user.community_id, b)
-    if ua is None or ub is None:
+                               "Tick at least two people.")
+    people = [db.get_user(user.community_id, uid) for uid in picked]
+    if any(p is None for p in people):
         return _error_redirect("/admin/households", "User not found.")
-    hid = ua.household_id or ub.household_id or ("hh-" + secrets.token_hex(6))
-    for u in (ua, ub):
-        if u.household_id != hid:
-            u.household_id = hid
-            db.put_user(u, expected_version=u.version)
-    log.info("CA %s paired %s + %s household=%s", user.user_id, a, b, hid)
+    existing = {p.household_id for p in people if p.household_id}
+    if len(existing) > 1:
+        names = ", ".join(p.name or p.email for p in people if p.household_id)
+        return _error_redirect(
+            "/admin/households",
+            f"{names} are already in different households. Remove someone "
+            "from theirs first, then try again.")
+    hid = existing.pop() if existing else "hh-" + secrets.token_hex(6)
+    for p in people:
+        if p.household_id != hid:
+            p.household_id = hid
+            db.put_user(p, expected_version=p.version)
+    log.info("CA %s made household %s of %d people", user.user_id, hid,
+             len(people))
+    members = [u for u in db.list_users(user.community_id)
+               if u.household_id == hid]
     return _redirect("/admin/households?notice=" + urllib.parse.quote(
-        f"Paired {ua.name or ua.email} and {ub.name or ub.email}."))
+        "Household: " + ", ".join(sorted(u.name or u.email for u in members))
+        + "."))
 
 
 def _api_ca_household_unpair(event: dict, user: User,
                              community: Community | None) -> dict:
     if _http_method(event) != "POST":
         return _text(405, "POST required")
-    uid = (_get_param(event, "user_id") or "").strip()
+    uid = (_get_param(event, "unpair_id") or "").strip()
     u = db.get_user(user.community_id, uid)
     if u is None:
         return _error_redirect("/admin/households", "User not found.")

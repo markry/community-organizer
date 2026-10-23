@@ -286,6 +286,11 @@ class User:
     # flexible_event polls to warn a responder that someone in their
     # household already replied. None = ungrouped (warning no-ops).
     household_id: str | None = None
+    # The two halves of ``name``, for sorting by surname (core/names.py).
+    # ``name`` stays the display string everything else reads; when these
+    # are set it is composed from them. None on records not yet split.
+    first_name: str | None = None
+    last_name: str | None = None
     version: int = 0
     created_at: str = field(default_factory=_now)
 

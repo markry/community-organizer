@@ -26,6 +26,7 @@ import urllib.parse
 from zoneinfo import ZoneInfo
 
 from community_organizer import auth
+from community_organizer.core import names as person_names
 from community_organizer.core import (
     db, ical, publishing, recurrence, schedule_email, scheduling, standing,
 )
@@ -3110,7 +3111,9 @@ def _flex_event_results_page(event: dict, user: User,
         # Within a group: coming first, then maybe, then not coming (for a
         # poll, by the best answer across its dates), each alphabetical.
         groups: dict[str, list[tuple]] = {"none": [], "aa": [], "member": []}
-        for m in sorted(members, key=lambda m: (name_of(m.user_id) or "").lower()):
+        for m in sorted(members, key=lambda m: (
+                person_names.sort_key(users[m.user_id]) if m.user_id in users
+                else (m.user_id, ""))):
             uid = m.user_id
             r = rsvp_by_user.get(uid)
             kind = _flex_rsvp_origin(evt, r)
@@ -5610,7 +5613,7 @@ def _render_recurring_grid(*, slots: list[Slot],
             #   4) blocked members faded + disabled at the bottom
             available = sorted(
                 [u for u in app_members if u.user_id not in assigned_uids],
-                key=lambda u: u.name.lower(),
+                key=person_names.sort_key,
             )
             if available:
                 blocked = (blocked_by_date or {}).get(slot.local_date, {})
@@ -11030,7 +11033,7 @@ def _users_page(event: dict, user: User, community: Community | None,
     all_users = sorted(
         (u for u in db.list_users(user.community_id)
          if u.user_id in memberships),
-        key=lambda u: u.name.lower(),
+        key=person_names.sort_key,
     )
     # Household (couple/family) visibility for AAs — read-only. Show, per
     # member, the OTHER members of their household who are ALSO in THIS app,
@@ -11099,9 +11102,7 @@ def _users_page(event: dict, user: User, community: Community | None,
                 f"<input type='hidden' name='version' value='{u.version or 0}'>"
                 f"<input type='hidden' name='next' "
                 f"value='/admin/users#user-{anchor_uid}'>"
-                "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
-                f"Name<input name='name' value='{html.escape(u.name)}' required "
-                "style='padding:4px;width:140px'></label>"
+                + _name_fields_html(u) +
                 "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
                 # An email address is also how a member signs in, so only a
                 # community-level admin may change it (see _may_change_email).
@@ -11288,9 +11289,7 @@ def _users_page(event: dict, user: User, community: Community | None,
         "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
         "Email (required)<input type='email' name='email' required "
         "style='padding:4px;width:180px'></label>"
-        "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
-        "Name (if new to the community)<input name='name' "
-        "style='padding:4px;width:140px'></label>"
+        + _name_fields_html(required=False, hint=" (if new)") +
         "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
         "Phone (optional)<input name='phone' style='padding:4px;width:120px'></label>"
         "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
@@ -11350,6 +11349,43 @@ def _users_page(event: dict, user: User, community: Community | None,
     return _html(200, _page(body, narrow=False, title=org_name))
 
 
+def _name_fields_html(u: User | None = None, *, required: bool = True,
+                      hint: str = "") -> str:
+    """First name + Last name inputs. Editing someone not yet split shows
+    the best guess from their one-field name, to confirm or correct."""
+    if u is not None:
+        first, last = u.first_name, u.last_name
+        if first is None and last is None:
+            first, last, _ = person_names.split(u.name)
+    else:
+        first = last = ""
+    req = " required" if required else ""
+    lab = ("<label style='display:flex;flex-direction:column;"
+           "font-size:0.85em;color:#666'>")
+    return (
+        f"{lab}First name{hint}<input name='first_name' "
+        f"value='{html.escape(first or '')}'{req} "
+        "style='padding:4px;width:120px'></label>"
+        f"{lab}Last name{hint}<input name='last_name' "
+        f"value='{html.escape(last or '')}'{req} "
+        "style='padding:4px;width:120px'></label>")
+
+
+def _names_from_form(event: dict) -> tuple[str | None, str | None, str]:
+    """(first, last, display name) from a form. Forms send first_name /
+    last_name; a caller still posting a single ``name`` gets it split."""
+    first = _get_param(event, "first_name")
+    last = _get_param(event, "last_name")
+    if first is None and last is None:
+        whole = " ".join((_get_param(event, "name") or "").split())
+        if not whole:
+            return None, None, ""
+        first, last, _ = person_names.split(whole)
+    first = " ".join((first or "").split()) or None
+    last = " ".join((last or "").split()) or None
+    return first, last, person_names.compose(first, last)
+
+
 def _row_filter_html(table_id: str) -> str:
     """A search box that hides the rows of table ``table_id`` whose text
     doesn't contain what's typed. Whole rows stay intact, so a match keeps
@@ -11387,7 +11423,7 @@ def _users_add_many_page(event: dict, user: User, community: Community | None,
     back = _safe_next(_get_param(event, "next") or "/admin/users")
     members = {m.user_id for m in db.list_memberships_for_app(app.app_id)}
     everyone = sorted(db.list_users(user.community_id),
-                      key=lambda u: (u.name or u.email).lower())
+                      key=person_names.sort_key)
     hh_names: dict[str, list[str]] = {}
     for u in everyone:
         if u.household_id:
@@ -11517,11 +11553,10 @@ def _api_user_add(event: dict, user: User, community: Community | None,
               or event.get("httpMethod") or "GET").upper()
     if method != "POST":
         return _text(405, "POST required")
-    name = _get_param(event, "name")
+    first, last, name = _names_from_form(event)
     email = _get_param(event, "email")
     phone = _get_param(event, "phone") or None
     notes = _get_param(event, "notes") or None
-    name = (name or "").strip()
     if not email:
         return _error_redirect("/admin/users", "Email is required.")
     # Case 2 or 3: detect an existing community user with this email.
@@ -11563,6 +11598,7 @@ def _api_user_add(event: dict, user: User, community: Community | None,
             f"{email} isn't in the community yet. Enter their name too "
             "to add them.")
     new_user = User(community_id=user.community_id, email=email, name=name,
+                    first_name=first, last_name=last,
                     community_role="member", phone=phone, notes=notes,
                     lead_times_minutes=list(
                         publishing.DEFAULT_LEAD_TIMES
@@ -11663,7 +11699,9 @@ def _api_user_edit(event: dict, user: User, community: Community | None,
         expected_version = int(expected_version_raw) if expected_version_raw else 0
     except ValueError:
         expected_version = 0
-    target.name = _get_param(event, "name") or target.name
+    first, last, whole = _names_from_form(event)
+    if whole:
+        target.first_name, target.last_name, target.name = first, last, whole
     new_email = (_get_param(event, "email") or "").strip()
     if new_email and new_email.lower() != (target.email or "").strip().lower():
         if not _may_change_email(user, target):
@@ -14860,7 +14898,7 @@ def _ca_landing_page(event: dict, user: User,
         + (f" ({html.escape(u.email)})" if u.email else "") + "</option>"
         for u in sorted((u for u in db.list_users(user.community_id)
                          if u.user_id != user.user_id and u.name),
-                        key=lambda u: u.name.lower())
+                        key=person_names.sort_key)
     ) if can_create_delete_apps else ""
 
     role_label = ("Community Admin landing"
@@ -15218,7 +15256,7 @@ def _ca_users_page(event: dict, user: User,
     """
     org_name = community.name if community else user.community_id
     all_users = sorted(db.list_users(user.community_id),
-                       key=lambda u: u.name.lower())
+                       key=person_names.sort_key)
     all_apps = list(db.list_applications(user.community_id))
     # Pre-build per-user membership lists once so the row renderer
     # doesn't query DDB for every user.
@@ -15257,9 +15295,7 @@ def _ca_users_page(event: dict, user: User,
                 f"<input type='hidden' name='version' value='{u.version or 0}'>"
                 f"<input type='hidden' name='next' "
                 f"value='/admin/community-users#user-{anchor_uid}'>"
-                "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
-                f"Name<input name='name' value='{html.escape(u.name)}' "
-                "required style='padding:4px;width:160px'></label>"
+                + _name_fields_html(u) +
                 "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
                 f"Email<input name='email' value='{html.escape(u.email)}' "
                 "required style='padding:4px;width:200px'></label>"
@@ -15396,9 +15432,7 @@ def _ca_users_page(event: dict, user: User,
         "<form method='post' action='/api/community-users/add' "
         "style='margin:8px 0;display:flex;gap:8px;align-items:end;"
         "flex-wrap:wrap'>"
-        "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
-        "Name (required)<input name='name' required "
-        "style='padding:4px;width:160px'></label>"
+        + _name_fields_html() +
         "<label style='display:flex;flex-direction:column;font-size:0.85em;color:#666'>"
         "Email (required)<input type='email' name='email' required "
         "style='padding:4px;width:200px'></label>"
@@ -15428,7 +15462,7 @@ def _api_ca_user_add(event: dict, user: User,
               or event.get("httpMethod") or "GET").upper()
     if method != "POST":
         return _text(405, "POST required")
-    name = (_get_param(event, "name") or "").strip()
+    first, last, name = _names_from_form(event)
     email = (_get_param(event, "email") or "").strip()
     phone = (_get_param(event, "phone") or "").strip() or None
     notes = (_get_param(event, "notes") or "").strip() or None
@@ -15451,6 +15485,7 @@ def _api_ca_user_add(event: dict, user: User,
             "community. Use the existing entry; you can grant them "
             "app memberships from their row.")
     new_user = User(community_id=user.community_id, email=email, name=name,
+                    first_name=first, last_name=last,
                     community_role="member", phone=phone, notes=notes)
     try:
         db.reserve_email(user.community_id, email, new_user.user_id)
@@ -15572,7 +15607,7 @@ def _ca_households_page(event: dict, user: User,
     household in one go, the same pattern as the bulk member add."""
     org = community.name if community else user.community_id
     users = sorted(db.list_users(user.community_id),
-                   key=lambda u: (u.name or u.email).lower())
+                   key=person_names.sort_key)
     by_hh: dict[str, list[User]] = {}
     for u in users:
         if u.household_id:

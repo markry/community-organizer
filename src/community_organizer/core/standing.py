@@ -116,6 +116,8 @@ def materialize_occurrence_reminders(
         u for uid in member_ids
         if (u := users.get(uid)) is not None
         and u.email and not u.email_undeliverable and u.channel != "none"
+        # A member who unticked every reminder gets none of these either.
+        and (u.lead_times_minutes is None or u.lead_times_minutes)
     ]
     if not eligible:
         return 0

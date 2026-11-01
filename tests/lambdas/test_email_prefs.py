@@ -212,3 +212,37 @@ def test_admin_added_recurring_duty_still_told_without_calendar(world) -> None:
     assert "signed up for Duty" in mail["body_text"]
     assert mail.get("ics_content") is None
     assert "calendar" not in mail["body_text"]
+
+
+def test_standing_reminders_honor_all_reminders_off(world) -> None:
+    import datetime as dt
+    from unittest.mock import patch
+    from community_organizer.core.models import (
+        Notification, StandingOccurrence, StandingSeries,
+    )
+    w = world
+    app = w["app"]
+    app.app_type = "standing_event"
+    db.put_application(app)
+    m = w["member"]
+    m.lead_times_minutes = []
+    db.put_user(m)
+    series = StandingSeries(community_id=app.community_id, app_id=app.app_id,
+                            recurrence="weekly", default_start_time="12:00",
+                            send_calendar_invites=True)
+    db.put_standing_series(series)
+    occ = StandingOccurrence(community_id=app.community_id, app_id=app.app_id,
+                             series_id=series.series_id, iso_date="2099-03-15",
+                             occurrence_id="occ-test")
+    db.put_standing_occurrence(occ)
+    n = Notification(community_id=app.community_id, app_id=app.app_id,
+                     user_id=m.user_id, slot_id=occ.occurrence_id,
+                     yyyy_mm="2099-03", lead_minutes=1440,
+                     send_at=(dt.datetime.now(dt.timezone.utc)
+                              - dt.timedelta(minutes=1)).isoformat(),
+                     source="occurrence")
+    sent = []
+    with patch.object(notifier, "_get_provider", return_value=type(
+            "S", (), {"send": lambda self, **kw: sent.append(kw)})()):
+        notifier._send_reminder(n)
+    assert sent == [] and n.state == "cancelled"

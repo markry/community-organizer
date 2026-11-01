@@ -115,7 +115,7 @@ Don't want calendar invitations? Turn off **Send me calendar invites** in **Your
 | **Cohort coverage update** | When someone assigned to the same {{event}} as you releases their slot. |
 | **Trade completed** | When a trade you requested or accepted is completed. Includes calendar invitation for your new slot. |
 
-To get fewer emails, open **Your notification settings**: untick every reminder, and turn off **Send me calendar invites** and **Ask me to cover or trade when someone drops out**. You'll then get the schedule when it's published, emails about changes to your own assignments, and announcements from the administrators. Your administrator can also change these settings for you.
+To get fewer emails, open **Your notification settings**: untick every reminder (this also stops reminders for regular events like a weekly meeting), and turn off **Send me calendar invites** and **Ask me to cover or trade when someone drops out**. You'll then get the schedule when it's published, emails about changes to your own assignments, and announcements from the administrators. Your administrator can also change these settings for you.
 
 All emails come from `{{from_address}}` and include a link to the schedule where you can take action. Admin-initiated emails show the admin's name in the From field (*e.g.*, "John Doe of Rapids Swim Club"). You can reply to any scheduling email — your reply will be forwarded to the administrators.
 

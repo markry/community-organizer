@@ -399,6 +399,15 @@ def _send_reminder(ntf: Notification) -> bool:
         _settle(ntf)
         return False
     if ntf.source == "occurrence":
+        # The organizer sets a standing series' reminder, but a member who
+        # has unticked every reminder gets none of them (checked as they are
+        # now, in case that changed after this one was queued).
+        if not publishing.effective_lead_times(user):
+            ntf.state = "cancelled"
+            _settle(ntf)
+            log.info("reminder %s cancelled: member has reminders off",
+                     ntf.notification_id)
+            return False
         if _too_late(ntf):
             return False
         return _send_occurrence_reminder(ntf, user, community_id)

@@ -11986,14 +11986,7 @@ def _settings_page(event: dict, user: User, community: Community | None,
         + "<h3 style='font-size:1em;color:#555;margin-top:20px'>"
         "Reminders before each event:</h3>"
         + checks
-        + "<h3 style='font-size:1em;color:#555;margin-top:20px'>"
-        "Calendar pop-up reminder:</h3>"
-        "<p style='color:#888;font-size:0.85em;margin:4px 0 8px 0'>"
-        "Built into each calendar invitation. Useful if you don't want email "
-        "reminders, or as a backup.</p>"
-        f"<select name='alarm' style='padding:4px;font-size:1em'>"
-        f"{alarm_select}</select>"
-        + _email_prefs_html(user)
+        + _email_prefs_html(user, alarm_select=alarm_select)
         + "<p style='margin-top:16px'>"
         "<button type='submit' style='padding:8px 24px;cursor:pointer;"
         "font-size:1em'>Save settings</button></p>"
@@ -12018,9 +12011,32 @@ _PREF_LABELS = (
 )
 
 
-def _email_prefs_html(target: User, *, compact: bool = False) -> str:
+def _calendar_alarm_html(on: bool, alarm_select: str) -> str:
+    """The calendar pop-up reminder, nested under "Send me calendar
+    invites": it lives inside each invite, so it only matters while invites
+    are on. Dimmed (not disabled, so the saved value survives) when off."""
+    return (
+        "<div id='cal-alarm' style='margin:0 0 12px 22px;padding-left:10px;"
+        f"border-left:2px solid #ddd{'' if on else ';opacity:0.45'}'>"
+        "<div style='color:#555'>Calendar pop-up reminder:</div>"
+        "<p style='color:#888;font-size:0.85em;margin:2px 0 6px 0'>"
+        "Built into each calendar invitation. Useful if you don't want email "
+        "reminders, or as a backup.</p>"
+        f"<select name='alarm' style='padding:4px;font-size:1em'>"
+        f"{alarm_select}</select></div>"
+        "<script>(function(){var c=document.querySelector("
+        "'input[name=calendar_invites]'),d=document.getElementById('cal-alarm');"
+        "if(c&&d)c.addEventListener('change',function(){"
+        "d.style.opacity=c.checked?'1':'0.45';});})();</script>"
+    )
+
+
+def _email_prefs_html(target: User, *, compact: bool = False,
+                      alarm_select: str | None = None) -> str:
     """The two email-choice checkboxes (calendar invites; other members'
-    changes) for a settings form. ``compact`` is the admin's member row."""
+    changes) for a settings form. ``compact`` is the admin's member row.
+    ``alarm_select`` (member settings page) nests the calendar pop-up
+    reminder under the calendar-invites box."""
     marker = "<input type='hidden' name='has_prefs' value='1'>"
     if compact:
         return (marker + "<div style='display:flex;flex-direction:column;"
@@ -12033,16 +12049,20 @@ def _email_prefs_html(target: User, *, compact: bool = False) -> str:
                     f"{html.escape(lbl)}</label>"
                     for f, lbl, help_ in _PREF_LABELS)
                 + "</div></div>")
-    return (marker + "<h3 style='font-size:1em;color:#555;margin-top:20px'>"
-            "Other emails:</h3>"
-            + "".join(
-                "<label style='display:block;margin:6px 0'>"
+    def box(f: str, lbl: str, help_: str) -> str:
+        on = getattr(target, f, True)
+        return ("<label style='display:block;margin:6px 0'>"
                 f"<input type='checkbox' name='{f}' value='1'"
-                f"{' checked' if getattr(target, f, True) else ''}> "
+                f"{' checked' if on else ''}> "
                 f"{html.escape(lbl)}</label>"
                 "<p style='color:#888;font-size:0.85em;margin:0 0 8px 22px'>"
                 f"{html.escape(help_)}</p>"
-                for f, lbl, help_ in _PREF_LABELS))
+                + (_calendar_alarm_html(on, alarm_select)
+                   if f == "calendar_invites" and alarm_select is not None
+                   else ""))
+    return (marker + "<h3 style='font-size:1em;color:#555;margin-top:20px'>"
+            "Other emails:</h3>"
+            + "".join(box(*row) for row in _PREF_LABELS))
 
 
 def _apply_email_prefs(target: User, parsed: dict) -> None:

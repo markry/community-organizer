@@ -162,8 +162,12 @@ def test_offer_lapses_on_sweep_and_passes_on(ddb_table, outbox,
 
 def test_cutoff_tells_organizer_instead(ddb_table, outbox) -> None:
     cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
-    soon = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)
-            ).date().isoformat()
+    # Three hours from now in the community's zone, so it is inside the
+    # 24-hour cutoff whatever time of day the suite runs.
+    from zoneinfo import ZoneInfo
+    start = (dt.datetime.now(ZoneInfo("America/New_York"))
+             + dt.timedelta(hours=3))
+    soon, soon_hhmm = start.date().isoformat(), start.strftime("%H:%M")
     evt, (opt,) = _event(cid, cap=1, state="scheduled", dates=(soon,))
     _mk_token(cid, evt, joe.user_id, "tj")
     _mk_token(cid, evt, bob.user_id, "tb")
@@ -174,7 +178,7 @@ def test_cutoff_tells_organizer_instead(ddb_table, outbox) -> None:
     _attend("tb", "yes")
     evt = db.get_flexible_event("a1", evt.event_id)
     evt.winning_date = soon
-    evt.winning_start_time = "23:59"
+    evt.winning_start_time = soon_hhmm
     db.put_flexible_event(evt)
     outbox.clear()
     _attend("tj", "no")

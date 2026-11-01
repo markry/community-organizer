@@ -333,6 +333,10 @@ def _build_email(*, user: User, community: Community, app: Application,
         f"You will receive reminder emails {lead_desc} before each event."
         if _leads else "You have reminder emails turned off.")
     event_type = app.event_noun or "event"
+    # Someone who turned calendar invites off has no calendar entry to
+    # decline: point them at the website only.
+    decline = ("you can decline the calendar event or visit"
+               if prefs.wants_calendar(user) else "you can visit")
     subject = f"{org_name} -- {month} schedule published"
     # arrival_label is on every Application now, but the hasattr guard
     # protects callers in test code that build minimal stub objects.
@@ -352,8 +356,8 @@ def _build_email(*, user: User, community: Community, app: Application,
             f"{rows}\n\n"
             f"{reminder_sentence} You can change your reminder settings at:\n"
             f"  {site_url}\n\n"
-            f"If you need to withdraw from any of these, you can decline "
-            f"the calendar event or visit the link above to release your "
+            f"If you need to withdraw from any of these, {decline} "
+            f"the link above to release your "
             f"slot, take additional slots, or trade for a different one. "
             f"If you withdraw, others covering that {event_type} and "
             f"administrators will be notified, as well as others from "
@@ -374,8 +378,8 @@ def _build_email(*, user: User, community: Community, app: Application,
             f'<ul>{slot_rows_html}</ul>'
             f'<p>{_h(reminder_sentence)} You can change your reminder settings at '
             f'<a href="{_h(site_url)}">{_h(site_url)}</a>.</p>'
-            f'<p>If you need to withdraw from any of these, you can decline '
-            f'the calendar event or visit the link above to release your '
+            f'<p>If you need to withdraw from any of these, {_h(decline)} '
+            f'the link above to release your '
             f'slot, take additional slots, or trade for a different one.</p>'
             f'<p>Full schedule below:</p>'
             f'{table_html}'  # Already-rendered table (escapes within it).

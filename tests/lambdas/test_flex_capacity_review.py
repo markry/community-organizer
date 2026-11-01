@@ -295,3 +295,114 @@ def test_a_turned_away_yes_gets_the_next_seats_that_fit(ddb_table,
                                            "capacity": "5"}),
         w["aa"], db.get_community(w["cid"]), w["app"], w["mem"])
     assert _seat(w, w["bob"]) == "seated"
+
+
+# ---- second review round ----------------------------------------------------
+
+def test_capacity_lowered_mid_request_refuses_the_growth(ddb_table,
+                                                         outbox) -> None:
+    w = _world(ddb_table, cap=3)
+    _attend("ta", "yes", 1)
+    _attend("tj", "yes", 1)
+    original = web._flex_seat_seq
+    once = [False]
+
+    def seq(evt):
+        if not once[0]:
+            once[0] = True
+            web._api_flex_event_save_capacity(
+                _post("/api/flex/event/capacity",
+                      {"event": w["e"].event_id, "capacity": "2"}),
+                w["aa"], db.get_community(w["cid"]), w["app"], w["mem"])
+        return original(evt)
+    with patch.object(web, "_flex_seat_seq", side_effect=seq):
+        body = _attend("tj", "yes", 2)["body"]
+    assert db.get_flexible_event("a1", w["e"].event_id).capacity == 2
+    assert _taken(w) <= 2
+    assert "nothing was saved" in body
+
+
+def test_cancel_during_a_reseat_seats_and_invites_nobody(ddb_table,
+                                                         outbox) -> None:
+    w = _world(ddb_table, cap=1)
+    with patch.object(web, "_flex_reseat", return_value=None):
+        _attend("tj", "yes")
+    outbox.clear()
+    original = db.commit_seat_plan
+    once = [False]
+
+    def commit(*a, **kw):
+        if not once[0]:
+            once[0] = True
+            web._api_flex_event_cancel(
+                _post("/api/flex/event/cancel", {"event": w["e"].event_id}),
+                w["aa"], db.get_community(w["cid"]), w["app"], w["mem"])
+        return original(*a, **kw)
+    with patch.object(db, "commit_seat_plan", side_effect=commit):
+        web._flex_reseat("a1", w["e"].event_id)
+    assert db.get_flexible_event("a1", w["e"].event_id).state == "cancelled"
+    assert _seat(w, w["joe"]) is None
+    assert not _invites(outbox, w["joe"])
+
+
+def test_close_audiences_follow_an_answer_changed_mid_close(ddb_table,
+                                                            outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    e = FlexibleEvent(community_id=cid, app_id="a1", title="Supper",
+                      state="poll", capacity=3)
+    db.put_flexible_event(e)
+    a = FlexiblePollOption(community_id=cid, app_id="a1", event_id=e.event_id,
+                           iso_date=DATE, start_time="18:30", sort_key=0)
+    b = FlexiblePollOption(community_id=cid, app_id="a1", event_id=e.event_id,
+                           iso_date="2099-03-22", start_time="18:30",
+                           sort_key=1)
+    db.put_flexible_poll_option(a)
+    db.put_flexible_poll_option(b)
+    _mk_token(cid, e, joe.user_id, "tj")
+
+    def vote(ans):
+        web._api_flex_token_vote(_post("/api/e/vote", {
+            "token": "tj", f"vote_{a.option_id}": ans}))
+    vote("no")
+    outbox.clear()
+    original = web._flex_close_seats
+
+    def close(*args, **kw):
+        vote("yes")
+        return original(*args, **kw)
+    with patch.object(web, "_flex_close_seats", side_effect=close):
+        web._api_flex_event_close(
+            _post("/api/flex/event/close", {"event": e.event_id,
+                                            "winning_option": a.option_id}),
+            aa, db.get_community(cid), app, aa_mem)
+    assert db.get_flexible_rsvp("a1", e.event_id, joe.user_id).seat == "seated"
+    kinds = [m["kind"] for m in outbox if m["related_user_id"] == joe.user_id]
+    assert kinds == ["event_confirmed"]
+
+
+def test_uncap_invites_the_whole_admitted_household(ddb_table,
+                                                    outbox) -> None:
+    w = _world(ddb_table, cap=1)
+    _attend("ta", "yes")
+    _attend("tb", "yes")                # Bob waits; Sue (same home) silent
+    outbox.clear()
+    web._api_flex_event_save_capacity(
+        _post("/api/flex/event/capacity", {"event": w["e"].event_id,
+                                           "capacity": ""}),
+        w["aa"], db.get_community(w["cid"]), w["app"], w["mem"])
+    assert len(_invites(outbox, w["bob"])) == 1
+    assert len(_invites(outbox, w["sue"])) == 1
+
+
+def test_tier_switch_keeps_the_time_it_was_made(ddb_table, outbox) -> None:
+    w = _world(ddb_table, cap=1)
+    _attend("ta", "yes")
+    _attend("tj", "yes")                # waits first
+    _attend("tb", "maybe")
+    _attend("tb", "yes")                # switches later, same second or not
+    rs = {r.user_id: r for r in db.list_flexible_rsvps("a1", w["e"].event_id)}
+    users = {u.user_id: u for u in db.list_users(w["cid"])}
+    assert web._flex_line_place(rs, users, w["o"], "scheduled",
+                                w["joe"].user_id) == ("wait_yes", 1)
+    assert web._flex_line_place(rs, users, w["o"], "scheduled",
+                                w["bob"].user_id) == ("wait_yes", 2)

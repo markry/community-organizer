@@ -82,6 +82,8 @@ class Group:
     offer_expires_at: str | None
     offer_passed: bool
     forced: bool
+    # When its latest answer was saved: a tier switch's place in line.
+    answered_at: str | None = None
 
 
 @dataclass
@@ -111,7 +113,7 @@ class Plan:
 
 
 def _iso(t: dt.datetime) -> str:
-    return t.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+    return t.astimezone(dt.timezone.utc).isoformat(timespec="microseconds")
 
 
 _EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
@@ -172,7 +174,9 @@ def build_groups(rsvps: dict, hh_key, option_id: str | None,
             queued_at=queued[0] if queued else None,
             offer_expires_at=expiries[0] if expiries else None,
             offer_passed=any(r.offer_passed for r in coming),
-            forced=any(r.seat_forced for r in coming)))
+            forced=any(r.seat_forced for r in coming),
+            answered_at=max((r.updated_at for r in coming if r.updated_at),
+                            key=when, default=None)))
     return groups
 
 
@@ -201,6 +205,19 @@ def plan(*, capacity: int, rsvps: dict, hh_key, option_id: str | None,
         if g.queued_at and not (mine and g.seat is None):
             return g.queued_at
         return min(mine, key=when) if mine else (g.queued_at or now_iso)
+
+    def switched(g: Group) -> str:
+        """Their place after switching tier: when they gave the answer that
+        switched them (the request's time, or failing that the reply's
+        stored time), not when this plan happens to run."""
+        mine = [answered_at[u] for u in g.user_ids if u in answered_at]
+        if mine:
+            return max(mine, key=when)
+        # A stored answer time no later than their current place can't be
+        # the switch (a reply saved without a new time): use now.
+        if g.answered_at and when(g.answered_at) > when(g.queued_at):
+            return g.answered_at
+        return now_iso
 
     groups = build_groups(rsvps, hh_key, option_id, state)
     used = 0
@@ -241,7 +258,7 @@ def plan(*, capacity: int, rsvps: dict, hh_key, option_id: str | None,
             # Waiting on the yes tier, or arriving: a seated household that
             # switched away and back, a maybe switching to yes, a new answer.
             if g.seat != "wait_yes":
-                g = _restart(g, place(g) if g.seat is None else now_iso)
+                g = _restart(g, place(g) if g.seat is None else switched(g))
             yes_line.append((g.queued_at, g))
         else:
             if g.offer_passed and g.seat is None:
@@ -250,7 +267,7 @@ def plan(*, capacity: int, rsvps: dict, hh_key, option_id: str | None,
                                  "offer_passed": True, "seat_forced": False}
                 continue
             if g.seat != "wait_maybe":
-                g = _restart(g, place(g) if g.seat is None else now_iso)
+                g = _restart(g, place(g) if g.seat is None else switched(g))
             maybe_line.append((g.queued_at, g))
 
     yes_line.sort(key=lambda p: (when(p[0]), p[1].key))
@@ -335,7 +352,8 @@ def _restart(g: Group, at: str) -> Group:
     return Group(key=g.key, user_ids=g.user_ids, answer=g.answer, size=g.size,
                  seat=g.seat, queued_at=at,
                  offer_expires_at=g.offer_expires_at,
-                 offer_passed=False, forced=g.forced)
+                 offer_passed=False, forced=g.forced,
+                 answered_at=g.answered_at)
 
 
 def seats_held(rsvps: dict, hh_key, key: str, option_id: str | None,

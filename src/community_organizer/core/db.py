@@ -2370,28 +2370,21 @@ def put_flexible_event(evt: FlexibleEvent, *,
         kwargs["ConditionExpression"] = (
             "attribute_not_exists(version) OR version = :expected")
         kwargs["ExpressionAttributeValues"] = {":expected": expected_version}
-    if seat_seq is not None:
-        try:
-            _seat_seq_write(evt.app_id, evt.event_id, seat_seq, "Put", kwargs)
-        except ConcurrencyConflict:
-            if expected_version is not None:
-                evt.version = expected_version
-            raise
-        return
+    # Every event write moves the seat seq on: capacity, state, dates and
+    # cancellation are all inputs to a seat plan.
     try:
-        _table().put_item(**kwargs)
-    except ClientError as e:
-        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-            raise ConcurrencyConflict(
-                f"flexible_event {evt.event_id} was modified "
-                f"by someone else") from e
+        _seat_seq_write(evt.app_id, evt.event_id, seat_seq, "Put", kwargs)
+    except ConcurrencyConflict:
+        if expected_version is not None:
+            evt.version = expected_version
         raise
 
 
-def get_flexible_event(app_id: str, event_id: str) -> FlexibleEvent | None:
+def get_flexible_event(app_id: str, event_id: str, *,
+                       consistent: bool = False) -> FlexibleEvent | None:
     resp = _table().get_item(Key={
         "PK": _app_pk(app_id), "SK": _flex_event_sk(event_id),
-    })
+    }, ConsistentRead=consistent)
     item = resp.get("Item")
     return _hydrate(FlexibleEvent, _strip_keys(item)) if item else None
 
@@ -2470,15 +2463,18 @@ def put_flexible_poll_option(opt: FlexiblePollOption) -> None:
         "PK": _app_pk(opt.app_id),
         "SK": _flex_option_sk(opt.event_id, opt.sort_key, opt.option_id),
     }
-    _table().put_item(Item=item)
+    # A date added changes whether (and where) seats apply.
+    _seat_seq_write(opt.app_id, opt.event_id, None, "Put", {"Item": item})
 
 
 def list_flexible_poll_options(
-        app_id: str, event_id: str) -> Iterator[FlexiblePollOption]:
+        app_id: str, event_id: str, *,
+        consistent: bool = False) -> Iterator[FlexiblePollOption]:
     """Options for one event, sorted by sort_key via the SK prefix."""
     for item in _paginate_query(
         KeyConditionExpression=Key("PK").eq(_app_pk(app_id))
         & Key("SK").begins_with(f"EVT#{event_id}#OPT#"),
+        ConsistentRead=consistent,
     ):
         yield _hydrate(FlexiblePollOption, _strip_keys(item))
 
@@ -2503,9 +2499,9 @@ def delete_flexible_poll_option(app_id: str, event_id: str,
     options are untouched; a vote on this option simply becomes inert."""
     for opt in list_flexible_poll_options(app_id, event_id):
         if opt.option_id == option_id:
-            _table().delete_item(Key={
+            _seat_seq_write(app_id, event_id, None, "Delete", {"Key": {
                 "PK": _app_pk(app_id),
-                "SK": _flex_option_sk(event_id, opt.sort_key, opt.option_id)})
+                "SK": _flex_option_sk(event_id, opt.sort_key, opt.option_id)}})
             return True
     return False
 
@@ -2517,8 +2513,10 @@ def put_flexible_rsvp(rsvp: FlexibleRSVP, *,
                       create_only: bool = False,
                       update_only: bool = False,
                       seat_seq: int | None = None) -> None:
-    """Persist an RSVP. ``seat_seq``: see ``put_flexible_event`` — every
-    write that can change who holds a seat on a capacity event passes it. ``expected_version`` makes it a conditional update
+    """Persist an RSVP. ``seat_seq``: the event's seat ``seq`` as read
+    before this write was decided; the write then also moves it on, so a
+    seat plan made from an older read can't commit. Every app write passes
+    it (web._flex_seat_seq). ``expected_version`` makes it a conditional update
     (ConcurrencyConflict if the row moved on). ``create_only`` makes it a
     create that fails with ConcurrencyConflict if ANY row is already there —
     stricter than ``expected_version=0``, which a version-0 row would pass.
@@ -2660,11 +2658,12 @@ def get_seat_state(app_id: str, event_id: str) -> dict:
             "cutoff_notice": item.get("cutoff_notice")}
 
 
-def _seat_seq_write(app_id: str, event_id: str, seat_seq: int, op: str,
-                    kwargs: dict) -> None:
+def _seat_seq_write(app_id: str, event_id: str, seat_seq: int | None,
+                    op: str, kwargs: dict) -> None:
     """Do one Put/Delete (given as resource-style kwargs) in a transaction
-    with moving the event's seat ``seq`` on from ``seat_seq``.
-    ConcurrencyConflict if either condition fails."""
+    with moving the event's seat ``seq`` on: from ``seat_seq`` exactly, or
+    (None) from whatever it is — enough to make any seat plan read before
+    this write fail to commit. ConcurrencyConflict if a condition fails."""
     from botocore.exceptions import ClientError
     from boto3.dynamodb.types import TypeSerializer
     ts = TypeSerializer()
@@ -2679,15 +2678,22 @@ def _seat_seq_write(app_id: str, event_id: str, seat_seq: int, op: str,
         if values:
             leg["ExpressionAttributeValues"] = {
                 k: ts.serialize(v) for k, v in values.items()}
-    seq_leg = {"Update": {
-        "TableName": TABLE_NAME,
-        "Key": {"PK": {"S": _app_pk(app_id)},
-                "SK": {"S": _flex_seats_sk(event_id)}},
-        "UpdateExpression": "SET seq = :n",
-        "ConditionExpression": "attribute_not_exists(seq) OR seq = :s",
-        "ExpressionAttributeValues": {":s": {"N": str(seat_seq)},
-                                      ":n": {"N": str(seat_seq + 1)}},
-    }}
+    key = {"PK": {"S": _app_pk(app_id)},
+           "SK": {"S": _flex_seats_sk(event_id)}}
+    if seat_seq is None:
+        seq_leg = {"Update": {
+            "TableName": TABLE_NAME, "Key": key,
+            "UpdateExpression": "ADD seq :one",
+            "ExpressionAttributeValues": {":one": {"N": "1"}},
+        }}
+    else:
+        seq_leg = {"Update": {
+            "TableName": TABLE_NAME, "Key": key,
+            "UpdateExpression": "SET seq = :n",
+            "ConditionExpression": "attribute_not_exists(seq) OR seq = :s",
+            "ExpressionAttributeValues": {":s": {"N": str(seat_seq)},
+                                          ":n": {"N": str(seat_seq + 1)}},
+        }}
     try:
         boto3.client("dynamodb").transact_write_items(
             TransactItems=[{op: leg}, seq_leg])

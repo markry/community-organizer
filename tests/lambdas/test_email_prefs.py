@@ -161,3 +161,54 @@ def test_co_assignee_news_still_goes_by_default(world) -> None:
                                     w["app"], w["slot"], "2030-06",
                                     self_release=True)
     assert _to(w, w["member"])        # the control for the test above
+
+
+def test_member_save_does_not_undo_an_admin_change(world) -> None:
+    w = world
+    stale = db.get_user(w["community"].community_id, w["member"].user_id)
+    web._api_user_edit(
+        _post("/api/users/edit", {"user_id": stale.user_id, "has_prefs": "1",
+                                  "version": str(stale.version or 0)}),
+        w["admin"], w["community"], w["app"], _mem(w, w["admin"]))
+    resp = web._api_settings_save(
+        _post("/api/settings/save", {"channel": "email"}),
+        stale, w["community"], w["app"], _mem(w, stale))
+    u = db.get_user(w["community"].community_id, stale.user_id)
+    assert not u.calendar_invites and not u.peer_emails
+    assert "error=" in resp["headers"]["Location"]
+
+
+def test_announcement_wording_for_calendar_off(world) -> None:
+    w = world
+    _assign(w, w["member"])
+    _off(w["member"], calendar=True)
+    plan = next(p for p in publishing.plan_publish(
+        w["community"], w["app"], "2030-06")
+        if p.user.user_id == w["member"].user_id)
+    assert "calendar" not in plan.body_text
+    assert "decline" not in plan.body_html
+
+
+def test_admin_added_recurring_duty_still_told_without_calendar(world) -> None:
+    from community_organizer.core.models import Cohort, SlotTemplate
+    w = world
+    app = w["app"]
+    app.app_type = "recurring_commitments"
+    db.put_application(app)
+    m = _off(w["member"], calendar=True, peer=True)
+    tpl = SlotTemplate(community_id=app.community_id, app_id=app.app_id,
+                       name="Duty", day_of_week=0, start_time="12:00",
+                       duration_minutes=60, template_id="t9")
+    db.put_template(tpl)
+    cohort = Cohort(community_id=app.community_id, app_id=app.app_id,
+                    name="Duty cohort", linked_template_id="t9")
+    db.put_cohort(cohort)
+    w["outbox"].sent.clear()
+    web._api_cohort_add_member(
+        _post("/api/cohorts/add-member", {"cohort_id": cohort.cohort_id,
+                                          "user_id": m.user_id}),
+        w["admin"], w["community"], app, _mem(w, w["admin"]))
+    (mail,) = _to(w, m)
+    assert "signed up for Duty" in mail["body_text"]
+    assert mail.get("ics_content") is None
+    assert "calendar" not in mail["body_text"]

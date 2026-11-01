@@ -4267,14 +4267,19 @@ def _flex_uncap(app_id: str, event_id: str) -> None:
         except db.ConcurrencyConflict:
             continue
         p = seats.Plan()
+        member_ids = None
         for k in sorted({keyer(u) for u in updates}):
             g = groups.get(k)
             if g is None or g.seat != "wait_yes":
                 continue
+            if member_ids is None:
+                member_ids = {m.user_id for m in
+                              db.list_memberships_for_app(app_id)}
             p.newly_seated.append(g)
             p.news[k] = ("Good news: there's no longer a limit on numbers, "
                          "so you're in.")
-            p.recipients[k] = list(g.user_ids)
+            p.recipients[k] = _flex_hh_recipients(
+                g, rsvps, users, keyer, oid, evt.state, member_ids)
         if p.newly_seated:
             community = db.get_community(evt.community_id)
             app = next((a for a in db.list_applications(evt.community_id)
@@ -4311,10 +4316,9 @@ def _api_flex_event_save_capacity(event: dict, user: User,
                                "Max attendees must be at least 1, or blank "
                                "for no limit.")
     had = evt.capacity
-    seq = _flex_seat_seq(evt)
     evt.capacity = cap
     try:
-        db.put_flexible_event(evt, expected_version=evt.version, seat_seq=seq)
+        db.put_flexible_event(evt, expected_version=evt.version)
     except db.ConcurrencyConflict:
         return _error_redirect(results_url,
                                "Someone else just changed this — refresh.")
@@ -4435,13 +4439,18 @@ def _api_flex_event_choose_host(event: dict, user: User,
 # ---- AA: close (two-step — review the cohorts, then send) ------------------
 
 def _flex_cohorts(app: Application, community: Community | None,
-                  event_id: str, winning_option_id: str):
+                  event_id: str, winning_option_id: str,
+                  rsvps: dict | None = None):
     """Split this app's members for the winning date into two deliverable,
     non-opted-out cohorts: ``confirmed`` (invite + .ics — anyone NOT a No on
     the winning date, incl. non-responders) and ``couldnt`` (courtesy note —
     No on the winning date or a full all-No decline). Returns
-    (confirmed_users, couldnt_users, {user_id: FlexibleRSVP})."""
-    rsvps = {r.user_id: r for r in db.list_flexible_rsvps(app.app_id, event_id)}
+    (confirmed_users, couldnt_users, {user_id: FlexibleRSVP}). ``rsvps``:
+    split these replies instead of reading them (the close passes the
+    snapshot its seating committed from)."""
+    if rsvps is None:
+        rsvps = {r.user_id: r
+                 for r in db.list_flexible_rsvps(app.app_id, event_id)}
     users = {u.user_id: u for u in db.list_users(app.community_id)}
     confirmed: list[User] = []
     couldnt: list[User] = []
@@ -4690,7 +4699,7 @@ def _flex_close_seats(app: Application, community: Community | None,
     """Close a poll on a capacity event: save the event as scheduled TOGETHER
     with the first seating, in one transaction, so no other request can seat
     (and announce) anyone in between. Returns (closed event or None if it
-    was closed meanwhile, invite, claim, rsvps). The close sends the invites
+    was closed meanwhile, invite, claim, courtesy, rsvps). The close sends the invites
     for everyone seated by that commit; anything after is announced by
     whichever request commits it."""
     import copy as _copy
@@ -4707,10 +4716,10 @@ def _flex_close_seats(app: Application, community: Community | None,
         except db.ConcurrencyConflict:
             pass
     for _try in range(6):
-        cur = db.get_flexible_event(app.app_id, evt.event_id)
-        if cur is None or cur.state != "poll":
-            return None, [], [], rsvps
         state = db.get_seat_state(app.app_id, evt.event_id)
+        cur = db.get_flexible_event(app.app_id, evt.event_id, consistent=True)
+        if cur is None or cur.state != "poll":
+            return None, [], [], [], rsvps
         rsvps = {r.user_id: r for r in db.list_flexible_rsvps(
             app.app_id, evt.event_id, consistent=True)}
         work = {u: _copy.copy(r) for u, r in rsvps.items()}
@@ -4749,7 +4758,11 @@ def _flex_close_seats(app: Application, community: Community | None,
         seated_keys = {k for k, g in after.items() if g.seat == "seated"
                        and (k in done or before.get(k) == "seated")}
         stored = {u: (work[u] if keyer(u) in done else rsvps[u])
-                  for u in rsvps}
+                  for u in work if u in rsvps or keyer(u) in done}
+        # Who gets what is worked out from the same replies the seating was
+        # committed from, not from the page's earlier read.
+        confirmed, couldnt, _ = _flex_cohorts(app, community, evt.event_id,
+                                              opt.option_id, rsvps=stored)
         invite, claim = _flex_close_split(confirmed, stored, keyer, opt,
                                           seated_keys)
         # A deliverable organizer counts as coming even if not in the cohort.
@@ -4764,8 +4777,8 @@ def _flex_close_seats(app: Application, community: Community | None,
                              tell_waitlisted=True, tell_cutoff=False,
                              tz_name=_flex_tz(app, community))
         _flex_reseat(app.app_id, evt.event_id, tell_waitlisted=True)
-        return closed, invite, claim, stored
-    return None, [], [], rsvps
+        return closed, invite, claim, couldnt, stored
+    return None, [], [], [], rsvps
 
 
 def _api_flex_event_close(event: dict, user: User,
@@ -4798,7 +4811,7 @@ def _api_flex_event_close(event: dict, user: User,
     # rendered to members (the scheduled view replaces the poll form).
     claim: list[User] = []
     if evt.capacity:
-        closed, confirmed, claim, rsvps = _flex_close_seats(
+        closed, confirmed, claim, couldnt, rsvps = _flex_close_seats(
             app, community, evt, opt, confirmed, rsvps)
         if closed is None:
             return _error_redirect(f"/flex/event/results?event={event_id}",
@@ -5465,6 +5478,20 @@ def _api_flex_token_vote(event: dict) -> dict:
     # between, the save fails and both are done again from fresh.
     for _try in range(4):
         seq = _flex_seat_seq(evt)
+        # The event as it is now, read after the seq: a capacity or date
+        # change since the page's first read is either seen here or makes
+        # the save below fail.
+        fresh_evt = db.get_flexible_event(tok.app_id, tok.event_id,
+                                          consistent=True)
+        if fresh_evt is None or fresh_evt.state != evt.state:
+            return collided
+        evt = fresh_evt
+        if evt.capacity:
+            _all_opts = list(db.list_flexible_poll_options(
+                tok.app_id, tok.event_id, consistent=True))
+        cap_on = _flex_capacity_on(evt, _all_opts)
+        seat_opt = _flex_seat_option(evt, _all_opts) if cap_on else None
+        seat_oid = seat_opt.option_id if seat_opt else None
         if cap_on:
             refusal = _flex_party_refusal(evt, tok, rsvp, seat_oid,
                                           before_party)
@@ -5477,7 +5504,7 @@ def _api_flex_token_vote(event: dict) -> dict:
         except db.ConcurrencyConflict:
             fresh = db.get_flexible_rsvp(tok.app_id, tok.event_id,
                                          tok.user_id)
-            if seq is None or (fresh.version if fresh else 0) != rsvp.version:
+            if (fresh.version if fresh else 0) != rsvp.version:
                 return collided         # their own reply moved on
     else:
         return collided
@@ -5666,6 +5693,7 @@ def _api_flex_token_join(event: dict) -> dict:
         rsvp = _rs.get(tok.user_id) or rsvp
     org_name, loc, date_label = _flex_send_confirmed_invite(
         tok, evt, user, rsvp, send=not capped)
+    cal_ok = bool(user) and prefs.wants_calendar(user) and not evt.adopted
     # Always tell the AA(s): the event is already scheduled, so they're
     # likely no longer watching the results page when a No-voter rejoins.
     who = (user.name or user.email) if user else tok.user_id
@@ -5676,12 +5704,15 @@ def _api_flex_token_join(event: dict) -> dict:
                    f"{evt.title}, but has changed their mind and is now "
                    f"coming on {date_label}"
                    + (f" at {loc}" if loc else "") + ".\n\n"
-                   "They've been sent the calendar invite. Your headcount has "
-                   "gone up by one.\n\n-- Community Organizer\n"),
+                   + ("They've been sent the calendar invite. " if cal_ok
+                      else "")
+                   + "Your headcount has gone up by one.\n\n"
+                   "-- Community Organizer\n"),
         kind="event_response_notice", related_user_id=tok.user_id)
     return _flex_terminal_page(
-        "Wonderful — you're in! We've sent you the calendar invite. Open this "
-        "link again any time to say what you're bringing.")
+        "Wonderful — you're in!"
+        + (" We've sent you the calendar invite." if cal_ok else "")
+        + " Open this link again any time to say what you're bringing.")
 
 
 def _flex_send_confirmed_invite(tok: EventToken, evt: FlexibleEvent,
@@ -5944,10 +5975,11 @@ _SELF_INTRO = "Glad you can make it!"
 
 
 def _flex_seat_seq(evt: FlexibleEvent | None) -> int | None:
-    """For a write that can change who holds a seat: the event's seat
-    ``seq`` to write against (None when the event has no capacity). Read it
-    BEFORE whatever the write was decided from."""
-    if evt is None or not evt.capacity:
+    """For a reply write: the event's seat ``seq`` to write against. Read it
+    BEFORE whatever the write was decided from (the event included: re-read
+    it after this). Every event has one, with a capacity or not, so a write
+    decided while the event was unlimited can't land after a cap is set."""
+    if evt is None:
         return None
     return db.get_seat_state(evt.app_id, evt.event_id)["seq"]
 
@@ -6060,10 +6092,14 @@ def _flex_reseat(app_id: str, event_id: str, *,
     for _round in range(60):
         if conflicts >= 6:
             break
-        evt = db.get_flexible_event(app_id, event_id)
+        # The seq first: everything the plan is made from is read after it,
+        # so any change to it since makes the commit fail.
+        state = db.get_seat_state(app_id, event_id)
+        evt = db.get_flexible_event(app_id, event_id, consistent=True)
         if evt is None:
             return total
-        options = list(db.list_flexible_poll_options(app_id, event_id))
+        options = list(db.list_flexible_poll_options(app_id, event_id,
+                                                     consistent=True))
         if not _flex_capacity_on(evt, options):
             return total
         opt = _flex_seat_option(evt, options)
@@ -6072,7 +6108,6 @@ def _flex_reseat(app_id: str, event_id: str, *,
         app = next((a for a in db.list_applications(evt.community_id)
                     if a.app_id == app_id), None)
         tz_name = _flex_tz(app, community)
-        state = db.get_seat_state(app_id, event_id)
         rsvps = {r.user_id: r for r in db.list_flexible_rsvps(
             app_id, event_id, consistent=True)}
         users = {u.user_id: u for u in db.list_users(evt.community_id)}
@@ -12049,7 +12084,17 @@ def _api_settings_save(event: dict, user: User, community: Community | None,
     if channel in ("email", "sms", "both"):
         user.channel = channel
     _apply_email_prefs(user, parsed)
-    db.put_user(user)
+    # Conditional on the record this request read: an admin may have just
+    # changed this member's settings, and a whole-record save from an older
+    # copy would silently undo that.
+    try:
+        db.put_user(user, expected_version=user.version or 0)
+    except db.ConcurrencyConflict:
+        return _error_redirect(
+            "/settings", "Your settings were changed elsewhere (perhaps by "
+            "an organizer) while you were editing, so nothing was saved. "
+            "The page now shows them as they are — please make your change "
+            "again.")
     log.info("user %s updated lead_times=%s alarm=%s channel=%s phone=%s "
              "calendar=%s peer=%s",
              user.user_id, user.lead_times_minutes, user.calendar_alarm_minutes,
@@ -14982,7 +15027,8 @@ def _delete_future_cohort_assignments(app: Application, cohort: Cohort,
 
 
 def _send_cohort_recurring_invite(community: Community, app: Application,
-                                  cohort: Cohort, target_user: User) -> None:
+                                  cohort: Cohort, target_user: User, *,
+                                  by_admin: bool = False) -> None:
     """Email the joining user a single RRULE-based VCALENDAR so their
     calendar fills in every future occurrence in one click.
 
@@ -14990,11 +15036,17 @@ def _send_cohort_recurring_invite(community: Community, app: Application,
     if the cohort isn't linked to a template, or if the email
     provider raises — we don't want a failed invite to block the
     join. The log captures any provider error.
+
+    A member who turned calendar invites off: when they joined themselves
+    the email would only carry the calendar file, so none is sent; when an
+    admin signed them up it is their news of a new duty, so it goes as a
+    plain message (``by_admin``).
     """
     if app.app_type != "recurring_commitments":
         return
-    if not prefs.wants_calendar(target_user):
-        return    # this email exists only to carry the calendar series
+    cal = prefs.wants_calendar(target_user)
+    if not cal and not by_admin:
+        return
     if not target_user.email or target_user.email_undeliverable:
         return
     if not cohort.linked_template_id:
@@ -15031,11 +15083,16 @@ def _send_cohort_recurring_invite(community: Community, app: Application,
         alarm_minutes=target_user.calendar_alarm_minutes,
     )
 
+    lead = (f"Thanks for committing to {tpl.name}!" if not by_admin else
+            f"You've been signed up for {tpl.name}, "
+            f"{_WEEKDAY_FULL[tpl.day_of_week]}s at "
+            f"{_fmt_time(tpl.start_time)}.")
     text = (
         f"Hi {target_user.name},\n\n"
-        f"Thanks for committing to {tpl.name}! The attached calendar "
-        "invite covers every future occurrence so you can add it "
-        "to your calendar once.\n\n"
+        f"{lead}"
+        + (" The attached calendar invite covers every future occurrence "
+           "so you can add it to your calendar once." if cal else "")
+        + "\n\n"
         "If you ever need to release a specific week, return to "
         f"https://{domain}/ and use the Withdraw button on that "
         "occurrence; the rest of your commitments stay intact.\n\n"
@@ -15049,11 +15106,12 @@ def _send_cohort_recurring_invite(community: Community, app: Application,
             community_id=community.community_id,
             from_addr=from_addr, to_addr=target_user.email,
             subject=f"{community.name if community else app.name}"
-                    f" -- recurring calendar invite: {tpl.name}",
+                    + (f" -- recurring calendar invite: {tpl.name}" if cal
+                       else f" -- you're signed up: {tpl.name}"),
             body_text=text, kind="change_notification",
             related_user_id=target_user.user_id,
             related_app_id=app.app_id,
-            ics_content=body,
+            ics_content=body if cal else None,
         )
     except Exception as e:    # noqa: BLE001
         log.warning("recurring invite send failed for user=%s cohort=%s: %s",
@@ -15259,7 +15317,8 @@ def _api_cohort_add_member(event: dict, user: User, community: Community | None,
                 log.info("cohort-join back-filled %d assignments for %s",
                          n_added, uid)
             _send_cohort_recurring_invite(
-                community, app, cohort_full, target_user)
+                community, app, cohort_full, target_user,
+                by_admin=not is_self)
     # Heads-up to every other admin so they see the roster change
     # without having to poll /admin/cohorts. Self-service AND
     # admin-driven (skip the actor either way).

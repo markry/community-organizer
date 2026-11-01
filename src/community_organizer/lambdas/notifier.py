@@ -13,7 +13,7 @@ import re
 
 from boto3.dynamodb.types import TypeDeserializer
 
-from community_organizer.core import db, publishing
+from community_organizer.core import db, prefs, publishing
 from community_organizer.core.ical import make_event_ics, make_occurrence_ics
 from community_organizer.core.models import (
     Application, EmailLog, Notification, Slot, StandingOccurrence,
@@ -531,7 +531,7 @@ def _send_occurrence_reminder(ntf: Notification, user: User,
             related_app_id=ntf.app_id,
             related_slot_id=ntf.slot_id,
             related_yyyy_mm=ntf.yyyy_mm,
-            ics_content=ics_content,
+            ics_content=prefs.ics_for(user, ics_content),
         )
 
     def send_sms():
@@ -631,8 +631,9 @@ def _reminder_email(user: User, slot: Slot, org_name: str,
         f"  {when} -- starts {_fmt_time(slot.start_time)}, "
         f"please arrive by {_fmt_time(_arrival_hhmm(slot))}\n"
         f"{_co_line(co_names or [])}\n"
-        f"If you need to withdraw, you can decline the calendar event or "
-        f"visit https://{host}/your-schedule to release your slot "
+        + ("If you need to withdraw, you can decline the calendar event or "
+           if prefs.wants_calendar(user) else "If you need to withdraw, ")
+        + f"visit https://{host}/your-schedule to release your slot "
         f"or trade for a different one.\n\n"
         f"-- {org_name}\n"
     )
@@ -719,7 +720,8 @@ def _process(rec: dict) -> bool:
         subject, body = _assigned_email(user, slot, org_name, event_type,
                                         self_signup=self_signup,
                                         co_names=co_names,
-                                        host=_community_host(community))
+                                        host=_community_host(community),
+                                        calendar=prefs.wants_calendar(user))
     else:
         return False
 
@@ -758,7 +760,7 @@ def _process(rec: dict) -> bool:
         related_app_id=app_id,
         related_slot_id=slot.slot_id,
         related_yyyy_mm=yyyy_mm,
-        ics_content=ics,
+        ics_content=prefs.ics_for(user, ics),
     )
     log.info("notified %s outcome=%s for event=%s slot=%s",
              user.email, log_row.outcome, event_name, slot.slot_id)
@@ -772,6 +774,8 @@ def _process(rec: dict) -> bool:
         for co_id in co_ids:
             co = users_by_id.get(co_id)
             if not co or not co.email or co.email_undeliverable or co.channel == "none":
+                continue
+            if not prefs.wants_peer_emails(co):
                 continue
             co_body = (
                 f"Hi {co.name},\n\n"
@@ -879,7 +883,8 @@ def _assigned_email(user: User, slot: Slot, org_name: str,
                     event_type: str = "event",
                     self_signup: bool = False,
                     co_names: list[str] | None = None,
-                    host: str = DOMAIN_NAME) -> tuple[str, str]:
+                    host: str = DOMAIN_NAME,
+                    calendar: bool = True) -> tuple[str, str]:
     when = _fmt_date(slot.local_date)
     if self_signup:
         subject = f"{org_name} -- you've signed up: {slot.name} on {when}"
@@ -894,9 +899,11 @@ def _assigned_email(user: User, slot: Slot, org_name: str,
         f"  {when} -- starts {_fmt_time(slot.start_time)}, "
         f"please arrive by {_fmt_time(_arrival_hhmm(slot))}\n"
         f"{_co_line(co_names or [])}\n"
-        f"If you need to withdraw, you can simply decline this calendar "
-        f"invitation. You can also visit https://{host}/your-schedule "
-        f"to release your slot, take a slot, or trade an existing slot for "
+        + (f"If you need to withdraw, you can simply decline this calendar "
+           f"invitation. You can also visit https://{host}/your-schedule "
+           if calendar else
+           f"If you need to withdraw, visit https://{host}/your-schedule ")
+        + f"to release your slot, take a slot, or trade an existing slot for "
         f"another. If you withdraw, others covering your {event_type} and "
         f"administrators will be notified, as well as others from your "
         f"cohort, encouraging someone to sign up in your place. Trading is "

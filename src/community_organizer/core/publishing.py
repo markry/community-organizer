@@ -96,7 +96,7 @@ import html
 import os
 from dataclasses import dataclass
 
-from . import db
+from . import db, prefs
 from .ical import make_event_ics
 from .models import (
     Application, Assignment, Community, Membership, Notification,
@@ -558,6 +558,8 @@ def plan_invites(community: Community, app: Application,
             continue
         if user.email_undeliverable or not user.email or user.channel == "none":
             continue
+        if not prefs.wants_calendar(user):
+            continue    # these emails exist only to carry the invite
         if slot.cancelled:
             continue
         arrival_text = None

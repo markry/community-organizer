@@ -298,6 +298,13 @@ class User:
     # are set it is composed from them. None on records not yet split.
     first_name: str | None = None
     last_name: str | None = None
+    # Member's email choices beyond reminders (core/prefs.py). Off means:
+    # no calendar files at all (no invites, updates or cancellations), and
+    # no emails about other members' changes (requests to cover or trade,
+    # who joined or left a shift they're on). News of their own
+    # assignments and admin announcements always go out.
+    calendar_invites: bool = True
+    peer_emails: bool = True
     version: int = 0
     created_at: str = field(default_factory=_now)
 

@@ -100,6 +100,8 @@ When you are assigned to an {{event}}, you'll receive a calendar invitation atta
 
 Calendar events are automatically added when you sign up and removed when you withdraw.
 
+Don't want calendar invitations? Turn off **Send me calendar invites** in **Your notification settings**. You'll still get the emails that tell you about your assignments, just without the calendar file. Entries already in your calendar stay there and won't update if an assignment changes later.
+
 ## Emails You'll Receive
 
 | Email | When you get it |
@@ -112,6 +114,8 @@ Calendar events are automatically added when you sign up and removed when you wi
 | **Cohort opening** | When someone at your usual time releases a slot and coverage is needed. |
 | **Cohort coverage update** | When someone assigned to the same {{event}} as you releases their slot. |
 | **Trade completed** | When a trade you requested or accepted is completed. Includes calendar invitation for your new slot. |
+
+To get fewer emails, open **Your notification settings**: untick every reminder, and turn off **Send me calendar invites** and **Ask me to cover or trade when someone drops out**. You'll then get the schedule when it's published, emails about changes to your own assignments, and announcements from the administrators. Your administrator can also change these settings for you.
 
 All emails come from `{{from_address}}` and include a link to the schedule where you can take action. Admin-initiated emails show the admin's name in the From field (*e.g.*, "John Doe of Rapids Swim Club"). You can reply to any scheduling email — your reply will be forwarded to the administrators.
 

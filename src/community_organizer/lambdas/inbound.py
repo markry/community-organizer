@@ -14,7 +14,7 @@ import re
 
 import boto3
 
-from community_organizer.core import db
+from community_organizer.core import db, prefs
 from community_organizer.providers.email import get_email_provider
 
 log = logging.getLogger()
@@ -305,6 +305,10 @@ def _handle_tentative(slot_id: str, user_id: str) -> bool:
     community_id = _resolve_community_for_user_id(user_id)
     user = db.get_user(community_id, user_id)
     if not user or not user.email or user.email_undeliverable:
+        return False
+    # This reply exists to carry a fresh invite; a member who has turned
+    # calendar files off gets none (and answered an old one).
+    if not prefs.wants_calendar(user):
         return False
 
     apps = db.list_applications(community_id)
@@ -852,6 +856,8 @@ def _trigger_withdrawal_notifications(user, community, app, slot, yyyy_mm):
             continue
         vol = users_by_id.get(cm.user_id)
         if not vol or not vol.email or vol.email_undeliverable or vol.channel == "none":
+            continue
+        if not prefs.wants_peer_emails(vol):
             continue
         in_slot = cm.user_id in assigned_ids
         if in_slot:

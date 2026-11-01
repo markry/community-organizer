@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 from community_organizer import auth
 from community_organizer.core import names as person_names
 from community_organizer.core import (
-    capacity as seats, db, ical, publishing, recurrence, schedule_email, scheduling, standing,
+    capacity as seats, db, ical, prefs, publishing, recurrence, schedule_email, scheduling, standing,
 )
 from community_organizer.providers.sms import to_e164
 from community_organizer.core.models import (
@@ -4730,14 +4730,15 @@ def _api_flex_event_close(event: dict, user: User,
                 + (f"{confirm_message}\n\n" if confirm_message else "")
                 + (f"You're bringing: {bringing}\n\n" if bringing else "")
                 + host_ask
-                + "A calendar invite is attached.\n\n"
-                f"-- {org_name}\n")
+                + ("A calendar invite is attached.\n\n"
+                   if prefs.wants_calendar(u) else "")
+                + f"-- {org_name}\n")
         provider.send(
             community_id=app.community_id, from_addr=from_addr, to_addr=u.email,
             subject=f"{org_name}: confirmed — {evt.title} on {date_label}",
             body_text=body, kind="event_confirmed",
             related_user_id=u.user_id, related_app_id=app.app_id,
-            ics_content=ics)
+            ics_content=prefs.ics_for(u, ics))
     for u in couldnt:
         # Include their personal link with a "change of mind" note — plans
         # change, and a No-voter can still join (see _api_flex_token_join).
@@ -5551,8 +5552,13 @@ def _flex_send_confirmed_invite(tok: EventToken, evt: FlexibleEvent,
     date_label = (_fmt_iso_date(evt.winning_date or "")
                   + (f" {_fmt_time(evt.winning_start_time)}"
                      if evt.winning_start_time else ""))
+    # A member confirming for themselves (the default intro) sees it on the
+    # page; the email exists to carry the invite. Other intros are news (a
+    # seat came free) and go out without the invite when calendars are off.
+    cal = prefs.wants_calendar(user) if user else True
+    news = intro != "Glad you can make it!"
     if (user and user.email and not user.email_undeliverable
-            and evt.winning_start_time):
+            and evt.winning_start_time and (cal or news)):
         try:
             ics = ical.make_flexible_event_ics(
                 event_id=tok.event_id, iso_date=evt.winning_date,
@@ -5565,15 +5571,15 @@ def _flex_send_confirmed_invite(tok: EventToken, evt: FlexibleEvent,
             body = (f"Hi {user.name},\n\n{intro}\n\n"
                     f"It's set: {evt.title} on {date_label}"
                     + (f" at {loc}" if loc else "") + ".\n\n"
-                    "A calendar invite is attached.\n\n"
-                    f"-- {org_name}\n")
+                    + ("A calendar invite is attached.\n\n" if cal else "")
+                    + f"-- {org_name}\n")
             get_email_provider().send(
                 community_id=tok.community_id, from_addr=_from_addr(None, org_name),
                 to_addr=user.email,
                 subject=subject or f"{org_name}: see you at {evt.title}",
                 body_text=body, kind="event_confirmed",
                 related_user_id=user.user_id, related_app_id=tok.app_id,
-                ics_content=ics)
+                ics_content=ics if cal else None)
         except Exception:
             log.exception("confirm .ics send failed app=%s user=%s",
                           tok.app_id, tok.user_id)
@@ -8296,7 +8302,7 @@ def _send_removal_notifications(
             related_app_id=app.app_id,
             related_slot_id=slot.slot_id,
             related_yyyy_mm=yyyy_mm,
-            ics_content=cancel_ics,
+            ics_content=prefs.ics_for(removed_user, cancel_ics),
         )
 
     # Symmetric to the signup fan-out (the notifier sends co-assignees an
@@ -8315,7 +8321,7 @@ def _send_removal_notifications(
         for a in co_asgns:
             co = users_by_id.get(a.user_id)
             if (not co or not co.email or co.email_undeliverable
-                    or co.channel == "none"):
+                    or co.channel == "none" or not prefs.wants_peer_emails(co)):
                 continue
             others = [n for n in co_names if n != co.name]
             still = (f"  Still covering with you: {', '.join(others)}\n"
@@ -8482,7 +8488,8 @@ def _send_take_or_split_emails(
     provider = get_email_provider()
 
     def _send_to(target: User, other_side: list[User]) -> None:
-        if not target.email or target.email_undeliverable:
+        if (not target.email or target.email_undeliverable
+                or not prefs.wants_peer_emails(target)):
             return
         base = (f"https://{domain}/assignments/cover"
                 f"?slot_id={slot.slot_id}&month={yyyy_mm}")
@@ -8575,8 +8582,10 @@ def _send_pickup_invite(target_user: User, community: Community,
     text = (
         f"Hi {target_user.name},\n\n"
         f"Thanks for picking up {slot.name} on {when} at "
-        f"{_fmt_time(slot.start_time)}. The calendar invite is "
-        "attached.\n\n"
+        f"{_fmt_time(slot.start_time)}."
+        + (" The calendar invite is attached."
+           if prefs.wants_calendar(target_user) else "")
+        + "\n\n"
         f"-- {community.name}\n"
     )
     from community_organizer.providers.email import get_email_provider
@@ -8592,7 +8601,7 @@ def _send_pickup_invite(target_user: User, community: Community,
             related_app_id=app.app_id,
             related_slot_id=slot.slot_id,
             related_yyyy_mm=yyyy_mm,
-            ics_content=body_ics,
+            ics_content=prefs.ics_for(target_user, body_ics),
         )
     except Exception as e:    # noqa: BLE001
         log.warning("pickup invite send failed user=%s slot=%s: %s",
@@ -8692,6 +8701,8 @@ def _notify_cohort_of_opening(releaser: User, community: Community,
         if not target or target.user_id == releaser.user_id:
             continue
         if target.email_undeliverable or not target.email or target.channel == "none":
+            continue
+        if not prefs.wants_peer_emails(target):
             continue
         if target.user_id in assigned_ids:
             in_slot_targets.append(target)
@@ -11631,6 +11642,7 @@ def _settings_page(event: dict, user: User, community: Community | None,
         "reminders, or as a backup.</p>"
         f"<select name='alarm' style='padding:4px;font-size:1em'>"
         f"{alarm_select}</select>"
+        + _email_prefs_html(user)
         + "<p style='margin-top:16px'>"
         "<button type='submit' style='padding:8px 24px;cursor:pointer;"
         "font-size:1em'>Save settings</button></p>"
@@ -11640,6 +11652,55 @@ def _settings_page(event: dict, user: User, community: Community | None,
     )
     return _html(200, _page(body, title=org_name,
                             ))
+
+
+_PREF_LABELS = (
+    ("calendar_invites", "Send me calendar invites",
+     "Invitations, updates and cancellations for my assignments. If you turn "
+     "this off, entries already in your calendar stay there: if one of your "
+     "assignments changes later, the email telling you says what changed, "
+     "but your calendar won't update."),
+    ("peer_emails", "Ask me to cover or trade when someone drops out",
+     "Also tells you when someone joins or leaves a shift you're on. Emails "
+     "about your own assignments and announcements from the organizers "
+     "always come."),
+)
+
+
+def _email_prefs_html(target: User, *, compact: bool = False) -> str:
+    """The two email-choice checkboxes (calendar invites; other members'
+    changes) for a settings form. ``compact`` is the admin's member row."""
+    marker = "<input type='hidden' name='has_prefs' value='1'>"
+    if compact:
+        return (marker + "<div style='display:flex;flex-direction:column;"
+                "font-size:0.85em;color:#666'>Other emails<div "
+                "style='display:flex;gap:8px;flex-wrap:wrap;margin-top:2px'>"
+                + "".join(
+                    f"<label title='{html.escape(help_)}'><input "
+                    f"type='checkbox' name='{f}' value='1'"
+                    f"{' checked' if getattr(target, f, True) else ''}> "
+                    f"{html.escape(lbl)}</label>"
+                    for f, lbl, help_ in _PREF_LABELS)
+                + "</div></div>")
+    return (marker + "<h3 style='font-size:1em;color:#555;margin-top:20px'>"
+            "Other emails:</h3>"
+            + "".join(
+                "<label style='display:block;margin:6px 0'>"
+                f"<input type='checkbox' name='{f}' value='1'"
+                f"{' checked' if getattr(target, f, True) else ''}> "
+                f"{html.escape(lbl)}</label>"
+                "<p style='color:#888;font-size:0.85em;margin:0 0 8px 22px'>"
+                f"{html.escape(help_)}</p>"
+                for f, lbl, help_ in _PREF_LABELS))
+
+
+def _apply_email_prefs(target: User, parsed: dict) -> None:
+    """Read the checkboxes from a form that showed them (``has_prefs``);
+    a form without them leaves the member's choices alone."""
+    if "has_prefs" not in parsed:
+        return
+    for f, _lbl, _help in _PREF_LABELS:
+        setattr(target, f, f in parsed)
 
 
 def _api_settings_save(event: dict, user: User, community: Community | None,
@@ -11671,10 +11732,13 @@ def _api_settings_save(event: dict, user: User, community: Community | None,
         downgraded = True
     if channel in ("email", "sms", "both"):
         user.channel = channel
+    _apply_email_prefs(user, parsed)
     db.put_user(user)
-    log.info("user %s updated lead_times=%s alarm=%s channel=%s phone=%s",
+    log.info("user %s updated lead_times=%s alarm=%s channel=%s phone=%s "
+             "calendar=%s peer=%s",
              user.user_id, user.lead_times_minutes, user.calendar_alarm_minutes,
-             user.channel, bool(user.phone))
+             user.channel, bool(user.phone), user.calendar_invites,
+             user.peer_emails)
     return _redirect("/settings?saved=1" + ("&nophone=1" if downgraded else ""))
 
 
@@ -12123,6 +12187,7 @@ def _users_page(event: dict, user: User, community: Community | None,
                         for mins, lbl in _REMINDER_OPTIONS
                     )
                     + "</div></div>"))
+                + _email_prefs_html(u, compact=True)
                 + "<button type='submit' style='padding:4px 12px;cursor:pointer'>"
                 "Save</button>"
                 " <a href='/admin/users' style='font-size:0.85em'>cancel</a>"
@@ -12258,6 +12323,11 @@ def _users_page(event: dict, user: User, community: Community | None,
                 + ("" if is_event else
                    "<div style='font-size:0.8em;color:#999;margin-top:2px'>"
                    f"Reminders: {_short_lead_desc(u.lead_times_minutes)}</div>")
+                + "".join("<div style='font-size:0.8em;color:#999;margin-top:2px'>"
+                          f"{t}</div>" for f, t in (
+                              ("calendar_invites", "No calendar invites"),
+                              ("peer_emails", "No cover/trade requests"))
+                          if not getattr(u, f, True))
                 + "</td>"
                 f"<td style='padding:6px 12px;font-size:0.85em'>{actions_html}</td>"
                 "</tr>"
@@ -12735,6 +12805,7 @@ def _api_user_edit(event: dict, user: User, community: Community | None,
     if "has_leads" in parsed:
         target.lead_times_minutes = sorted(
             [int(v) for v in parsed.get("lead", [])], reverse=True)
+    _apply_email_prefs(target, parsed)
     raw_next = _get_param(event, "next")
     next_url = _safe_next(raw_next) if raw_next else "/admin/users"
     try:
@@ -13199,6 +13270,8 @@ def _notify_swap_request(requester: User, community: Community,
         target = users_by_id.get(uid)
         if not target or not target.email or target.email_undeliverable or target.channel == "none":
             continue
+        if not prefs.wants_peer_emails(target):
+            continue
         can_accept = uid in pref_assigned
         if can_accept:
             action = (
@@ -13459,7 +13532,7 @@ def _notify_swap_completed(requester: User, accepter: User, community: Community
             body_text=body, kind="swap_request",
             related_user_id=target.user_id, related_app_id=app.app_id,
             related_yyyy_mm=swap.yyyy_mm,
-            ics_content=new_ics,
+            ics_content=prefs.ics_for(target, new_ics),
         )
     aa_ids = {m.user_id for m in db.list_memberships_for_app(app.app_id)
               if m.app_role == "aa"
@@ -14604,6 +14677,8 @@ def _send_cohort_recurring_invite(community: Community, app: Application,
     """
     if app.app_type != "recurring_commitments":
         return
+    if not prefs.wants_calendar(target_user):
+        return    # this email exists only to carry the calendar series
     if not target_user.email or target_user.email_undeliverable:
         return
     if not cohort.linked_template_id:
@@ -14706,8 +14781,10 @@ def _send_cohort_cancel(community: Community, app: Application,
     )
     text = (
         f"Hi {target_user.name},\n\n"
-        f"You've been removed from {tpl.name}. The attached cancellation "
-        "tells your calendar to drop the recurring entry.\n\n"
+        f"You've been removed from {tpl.name}."
+        + (" The attached cancellation tells your calendar to drop the "
+           "recurring entry." if prefs.wants_calendar(target_user) else "")
+        + "\n\n"
         f"-- {community.name if community else app.name}\n"
     )
     from community_organizer.providers.email import get_email_provider
@@ -14722,7 +14799,7 @@ def _send_cohort_cancel(community: Community, app: Application,
             body_text=text, kind="change_notification",
             related_user_id=target_user.user_id,
             related_app_id=app.app_id,
-            ics_content=body,
+            ics_content=prefs.ics_for(target_user, body),
         )
     except Exception as e:    # noqa: BLE001
         log.warning("recurring cancel send failed for user=%s cohort=%s: %s",

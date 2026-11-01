@@ -2597,6 +2597,107 @@ def list_flexible_rsvps(app_id: str, event_id: str, *,
         yield _hydrate(FlexibleRSVP, _strip_keys(item))
 
 
+# ---- Seats (capacity events) ----------------------------------------------
+#
+# Who holds a seat on a capacity event is the ``seat`` field of each reply,
+# worked out by core/capacity.py. Every change to those fields is written in
+# one transaction together with the event's seat row, ``EVT#<eid>#SEATS``,
+# conditional on its ``seq`` being what it was when the replies were read.
+# Two saves racing for the last seat therefore can't both win: the second
+# finds ``seq`` moved, re-reads and plans again. The row also carries the
+# "has been full" latch and what the organizer was last told about the
+# 24-hour cutoff. It lives in its own row, not on the event, so seat traffic
+# never collides with an organizer editing the event.
+
+def _flex_seats_sk(event_id: str) -> str:
+    return f"EVT#{event_id}#SEATS"
+
+
+def get_seat_state(app_id: str, event_id: str) -> dict:
+    """{"seq": int, "reached": bool, "cutoff_notice": str|None}; zeros when
+    the event has never had a seat decision."""
+    item = _table().get_item(
+        Key={"PK": _app_pk(app_id), "SK": _flex_seats_sk(event_id)},
+        ConsistentRead=True).get("Item") or {}
+    return {"seq": int(item.get("seq", 0)),
+            "reached": bool(item.get("reached", False)),
+            "cutoff_notice": item.get("cutoff_notice")}
+
+
+def list_capacity_events() -> Iterator[FlexibleEvent]:
+    """Every open (poll or scheduled) flexible event with a capacity, across
+    apps — for the periodic sweep that lapses expired seat offers and catches
+    events entering their 24-hour cutoff."""
+    for state in ("poll", "scheduled"):
+        for item in _paginate_query(
+            IndexName="GSI1",
+            KeyConditionExpression=Key("GSI1PK").eq(f"STATE#{state}")
+            & Key("GSI1SK").begins_with("APP#"),
+            FilterExpression=Attr("capacity").exists()
+            & Attr("capacity").ne(None),
+        ):
+            if not str(item.get("SK", "")).startswith("EVT#"):
+                continue
+            evt = _hydrate(FlexibleEvent, _strip_keys(item))
+            if evt.capacity and not evt.merged_into:
+                yield evt
+
+
+def commit_seat_plan(app_id: str, event_id: str, *, expected_seq: int,
+                     rsvps: dict, updates: dict, reached: bool,
+                     cutoff_notice: str | None) -> None:
+    """Write a seat plan: the changed seat fields of each reply in
+    ``updates`` (user_id -> {field: value}, each reply as read in ``rsvps``)
+    and the seat row, all or nothing. ConcurrencyConflict if the seat row or
+    any of those replies moved on since they were read."""
+    from botocore.exceptions import ClientError
+    pk = _app_pk(app_id)
+    legs = [{"Put": {
+        "TableName": TABLE_NAME,
+        "Item": _ddb_low({"PK": pk, "SK": _flex_seats_sk(event_id),
+                          "seq": expected_seq + 1, "reached": reached,
+                          **({"cutoff_notice": cutoff_notice}
+                             if cutoff_notice else {})}),
+        "ConditionExpression": "attribute_not_exists(seq) OR seq = :s",
+        "ExpressionAttributeValues": {":s": {"N": str(expected_seq)}},
+    }}]
+    from boto3.dynamodb.types import TypeSerializer
+    ts = TypeSerializer()
+    for uid, diff in updates.items():
+        r = rsvps[uid]
+        names = {f"#f{i}": k for i, k in enumerate(diff)}
+        values = {f":v{i}": ts.serialize(v) for i, v in enumerate(diff.values())}
+        values[":ver"] = ts.serialize(r.version)
+        values[":next"] = ts.serialize(r.version + 1)
+        values[":rid"] = ts.serialize(r.rsvp_id)
+        sets = ", ".join(f"#f{i} = :v{i}" for i in range(len(diff)))
+        legs.append({"Update": {
+            "TableName": TABLE_NAME,
+            "Key": {"PK": {"S": pk},
+                    "SK": {"S": _flex_rsvp_sk(event_id, uid)}},
+            "UpdateExpression": f"SET {sets}, version = :next",
+            "ConditionExpression": (
+                "attribute_exists(PK) AND version = :ver AND "
+                "(attribute_not_exists(rsvp_id) OR rsvp_id = :rid)"),
+            "ExpressionAttributeNames": names,
+            "ExpressionAttributeValues": values,
+        }})
+    if len(legs) > 100:
+        raise ValueError("too many seat changes for one transaction")
+    try:
+        boto3.client("dynamodb").transact_write_items(TransactItems=legs)
+    except ClientError as e:
+        if _cancelled_legs(e) is not None:
+            raise ConcurrencyConflict(
+                f"seats for event {event_id} moved on") from e
+        raise
+    for uid, diff in updates.items():
+        r = rsvps[uid]
+        for k, v in diff.items():
+            setattr(r, k, v)
+        r.version += 1
+
+
 # ---- EventToken (passwordless poll magic-links) --------------------------
 
 def _event_token_sk(event_id: str, user_id: str) -> str:

@@ -81,6 +81,13 @@ EmailKind = Literal[
     "event_response_notice", # AA alert on each member response / post-close rejoin
     "event_cancelled",       # event called off (CANCEL .ics) — fast-follow
     "event_reply_nudge",     # auto-reply: "use your link, replies aren't recorded"
+    # capacity events (core/capacity.py):
+    "event_seat_promoted",   # a seat opened and went to them (no .ics yet)
+    "event_seat_offered",    # a maybe is offered a freed seat for 24 hours
+    "event_seat_lapsed",     # their offer passed to the next person
+    "event_waitlisted",      # full: they're on the waitlist, with their place
+    "event_claim_seat",      # at close, to non-responders: answer to claim one
+    "event_seat_cutoff",     # AA: seat open inside 24h, here's who's next
     "other",
 ]
 EmailOutcome = Literal[
@@ -673,6 +680,10 @@ class FlexibleEvent:
     # this to the surviving event, so those links keep working. Tombstones are
     # hidden from list_flexible_events unless include_merged=True.
     merged_into: str | None = None
+    # Capacity: the most people (party sizes summed, each household once) who
+    # can hold a seat. None = unlimited. Enforced only once the date is known
+    # (a scheduled event, or a poll with a single date); see core/capacity.py.
+    capacity: int | None = None
     event_id: str = field(default_factory=_new_id)
     created_at: str = field(default_factory=_now)
     created_by: str | None = None
@@ -728,6 +739,20 @@ class FlexibleRSVP:
     # the moment the member answers for themselves, which always wins.
     marked_by: str | None = None
     marked_at: str | None = None
+    # Capacity events only (FlexibleEvent.capacity set); see core/capacity.py.
+    # seat: "seated" | "offered" | "wait_yes" | "wait_maybe" | None. Kept the
+    # same on every answering member of a household (the household is the
+    # unit that holds seats).
+    seat: str | None = None
+    # When this reply joined its current place in line. Not updated_at: that
+    # moves whenever someone edits what they are bringing.
+    queued_at: str | None = None
+    offer_expires_at: str | None = None          # while seat == "offered"
+    # A maybe who let an offer lapse or turned it down: out of the line until
+    # they answer again.
+    offer_passed: bool = False
+    # An AA marked them coming with no seat free: seated over capacity.
+    seat_forced: bool = False
     rsvp_id: str = field(default_factory=_new_id)
     version: int = 0
     updated_at: str = field(default_factory=_now)

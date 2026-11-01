@@ -2346,22 +2346,38 @@ def get_flexible_series_for_app(app_id: str) -> FlexibleSeries | None:
 
 # ---- FlexibleEvent -------------------------------------------------------
 
-def put_flexible_event(evt: FlexibleEvent, *,
-                       expected_version: int | None = None) -> None:
-    from botocore.exceptions import ClientError
-    if expected_version is not None:
-        evt.version = (expected_version or 0) + 1
-    item = dataclasses.asdict(evt) | {
+def _flex_event_item(evt: FlexibleEvent) -> dict:
+    return dataclasses.asdict(evt) | {
         "PK": _app_pk(evt.app_id),
         "SK": _flex_event_sk(evt.event_id),
         "GSI1PK": f"STATE#{evt.state}",
         "GSI1SK": f"APP#{evt.app_id}#{evt.event_id}",
     }
-    kwargs = {"Item": item}
+
+
+def put_flexible_event(evt: FlexibleEvent, *,
+                       expected_version: int | None = None,
+                       seat_seq: int | None = None) -> None:
+    """``seat_seq``: on a capacity event, the seat row's ``seq`` as read
+    before deciding this write; the write then also moves ``seq`` on, so a
+    seat plan made from an older read can't be committed (see the Seats
+    section)."""
+    from botocore.exceptions import ClientError
+    if expected_version is not None:
+        evt.version = (expected_version or 0) + 1
+    kwargs = {"Item": _flex_event_item(evt)}
     if expected_version is not None:
         kwargs["ConditionExpression"] = (
             "attribute_not_exists(version) OR version = :expected")
         kwargs["ExpressionAttributeValues"] = {":expected": expected_version}
+    if seat_seq is not None:
+        try:
+            _seat_seq_write(evt.app_id, evt.event_id, seat_seq, "Put", kwargs)
+        except ConcurrencyConflict:
+            if expected_version is not None:
+                evt.version = expected_version
+            raise
+        return
     try:
         _table().put_item(**kwargs)
     except ClientError as e:
@@ -2499,8 +2515,10 @@ def delete_flexible_poll_option(app_id: str, event_id: str,
 def put_flexible_rsvp(rsvp: FlexibleRSVP, *,
                       expected_version: int | None = None,
                       create_only: bool = False,
-                      update_only: bool = False) -> None:
-    """Persist an RSVP. ``expected_version`` makes it a conditional update
+                      update_only: bool = False,
+                      seat_seq: int | None = None) -> None:
+    """Persist an RSVP. ``seat_seq``: see ``put_flexible_event`` — every
+    write that can change who holds a seat on a capacity event passes it. ``expected_version`` makes it a conditional update
     (ConcurrencyConflict if the row moved on). ``create_only`` makes it a
     create that fails with ConcurrencyConflict if ANY row is already there —
     stricter than ``expected_version=0``, which a version-0 row would pass.
@@ -2512,6 +2530,7 @@ def put_flexible_rsvp(rsvp: FlexibleRSVP, *,
     something to overwrite. Rows from before ``rsvp_id`` was stored have
     none to compare and pass on version alone."""
     from botocore.exceptions import ClientError
+    prior_version = rsvp.version
     if create_only:
         rsvp.version = 1
     elif expected_version is not None:
@@ -2536,8 +2555,16 @@ def put_flexible_rsvp(rsvp: FlexibleRSVP, *,
             kwargs["ConditionExpression"] = (
                 "attribute_not_exists(version) OR version = :expected")
     try:
+        if seat_seq is not None:
+            _seat_seq_write(rsvp.app_id, rsvp.event_id, seat_seq, "Put",
+                            kwargs)
+            return
         _table().put_item(**kwargs)
+    except ConcurrencyConflict:
+        rsvp.version = prior_version
+        raise
     except ClientError as e:
+        rsvp.version = prior_version
         if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
             raise ConcurrencyConflict(
                 f"flexible_rsvp {rsvp.rsvp_id} was modified "
@@ -2557,7 +2584,8 @@ def get_flexible_rsvp(app_id: str, event_id: str,
 
 def delete_flexible_rsvp(app_id: str, event_id: str, user_id: str, *,
                          expected_version: int | None = None,
-                         expected_rsvp_id: str | None = None) -> None:
+                         expected_rsvp_id: str | None = None,
+                         seat_seq: int | None = None) -> None:
     """Forget a member's response entirely (an AA un-marking someone) — back
     to "haven't heard", not a decline. With ``expected_version`` the delete is
     conditional: ConcurrencyConflict if the row changed since it was read.
@@ -2575,6 +2603,9 @@ def delete_flexible_rsvp(app_id: str, event_id: str, user_id: str, *,
             kwargs["ConditionExpression"] += (
                 " AND (attribute_not_exists(rsvp_id) OR rsvp_id = :rid)")
             kwargs["ExpressionAttributeValues"][":rid"] = expected_rsvp_id
+    if seat_seq is not None:
+        _seat_seq_write(app_id, event_id, seat_seq, "Delete", kwargs)
+        return
     try:
         _table().delete_item(**kwargs)
     except ClientError as e:
@@ -2609,6 +2640,11 @@ def list_flexible_rsvps(app_id: str, event_id: str, *,
 # 24-hour cutoff. It lives in its own row, not on the event, so seat traffic
 # never collides with an organizer editing the event.
 
+# DynamoDB allows 100 items per transaction; the seat row takes one, and a
+# plan bigger than this is committed in parts (see web._flex_reseat).
+SEAT_TXN_MAX = 100
+
+
 def _flex_seats_sk(event_id: str) -> str:
     return f"EVT#{event_id}#SEATS"
 
@@ -2622,6 +2658,44 @@ def get_seat_state(app_id: str, event_id: str) -> dict:
     return {"seq": int(item.get("seq", 0)),
             "reached": bool(item.get("reached", False)),
             "cutoff_notice": item.get("cutoff_notice")}
+
+
+def _seat_seq_write(app_id: str, event_id: str, seat_seq: int, op: str,
+                    kwargs: dict) -> None:
+    """Do one Put/Delete (given as resource-style kwargs) in a transaction
+    with moving the event's seat ``seq`` on from ``seat_seq``.
+    ConcurrencyConflict if either condition fails."""
+    from botocore.exceptions import ClientError
+    from boto3.dynamodb.types import TypeSerializer
+    ts = TypeSerializer()
+    leg = {"TableName": TABLE_NAME}
+    if "Item" in kwargs:
+        leg["Item"] = _ddb_low(kwargs["Item"])
+    if "Key" in kwargs:
+        leg["Key"] = _ddb_low(kwargs["Key"])
+    if "ConditionExpression" in kwargs:
+        leg["ConditionExpression"] = kwargs["ConditionExpression"]
+        values = kwargs.get("ExpressionAttributeValues") or {}
+        if values:
+            leg["ExpressionAttributeValues"] = {
+                k: ts.serialize(v) for k, v in values.items()}
+    seq_leg = {"Update": {
+        "TableName": TABLE_NAME,
+        "Key": {"PK": {"S": _app_pk(app_id)},
+                "SK": {"S": _flex_seats_sk(event_id)}},
+        "UpdateExpression": "SET seq = :n",
+        "ConditionExpression": "attribute_not_exists(seq) OR seq = :s",
+        "ExpressionAttributeValues": {":s": {"N": str(seat_seq)},
+                                      ":n": {"N": str(seat_seq + 1)}},
+    }}
+    try:
+        boto3.client("dynamodb").transact_write_items(
+            TransactItems=[{op: leg}, seq_leg])
+    except ClientError as e:
+        if _cancelled_legs(e) is not None:
+            raise ConcurrencyConflict(
+                f"event {event_id} changed while this was decided") from e
+        raise
 
 
 def list_capacity_events() -> Iterator[FlexibleEvent]:
@@ -2645,11 +2719,14 @@ def list_capacity_events() -> Iterator[FlexibleEvent]:
 
 def commit_seat_plan(app_id: str, event_id: str, *, expected_seq: int,
                      rsvps: dict, updates: dict, reached: bool,
-                     cutoff_notice: str | None) -> None:
+                     cutoff_notice: str | None,
+                     event: FlexibleEvent | None = None) -> None:
     """Write a seat plan: the changed seat fields of each reply in
     ``updates`` (user_id -> {field: value}, each reply as read in ``rsvps``)
     and the seat row, all or nothing. ConcurrencyConflict if the seat row or
-    any of those replies moved on since they were read."""
+    any of those replies moved on since they were read. ``event``: also save
+    the event (conditional on its version as read; closing a poll saves its
+    new state together with the first seating)."""
     from botocore.exceptions import ClientError
     pk = _app_pk(app_id)
     legs = [{"Put": {
@@ -2663,6 +2740,15 @@ def commit_seat_plan(app_id: str, event_id: str, *, expected_seq: int,
     }}]
     from boto3.dynamodb.types import TypeSerializer
     ts = TypeSerializer()
+    if event is not None:
+        legs.append({"Put": {
+            "TableName": TABLE_NAME,
+            "Item": _ddb_low(_flex_event_item(event)
+                             | {"version": event.version + 1}),
+            "ConditionExpression": ("attribute_not_exists(version) OR "
+                                    "version = :ev"),
+            "ExpressionAttributeValues": {":ev": {"N": str(event.version)}},
+        }})
     for uid, diff in updates.items():
         r = rsvps[uid]
         names = {f"#f{i}": k for i, k in enumerate(diff)}
@@ -2682,7 +2768,7 @@ def commit_seat_plan(app_id: str, event_id: str, *, expected_seq: int,
             "ExpressionAttributeNames": names,
             "ExpressionAttributeValues": values,
         }})
-    if len(legs) > 100:
+    if len(legs) > SEAT_TXN_MAX:
         raise ValueError("too many seat changes for one transaction")
     try:
         boto3.client("dynamodb").transact_write_items(TransactItems=legs)
@@ -2696,6 +2782,8 @@ def commit_seat_plan(app_id: str, event_id: str, *, expected_seq: int,
         for k, v in diff.items():
             setattr(r, k, v)
         r.version += 1
+    if event is not None:
+        event.version += 1
 
 
 # ---- EventToken (passwordless poll magic-links) --------------------------

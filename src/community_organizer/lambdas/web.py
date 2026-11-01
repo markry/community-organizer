@@ -3546,6 +3546,14 @@ def _api_flex_event_save_attendance(event: dict, user: User,
     overrides = {u for u in parsed.get("override", []) if u in member_ids}
     users = {u.user_id: u for u in db.list_users(app.community_id)}
     rsvps = {r.user_id: r for r in db.list_flexible_rsvps(app.app_id, event_id)}
+    # Each member's answer for the seat date as it stood, before any of the
+    # rows below are changed in place (who is NEWLY marked coming).
+    _seat_opt0 = (_flex_seat_option(evt, options)
+                  if _flex_capacity_on(evt, options) else None)
+    before_answers = {
+        uid: seats.answer_for(r, _seat_opt0.option_id if _seat_opt0 else None,
+                              evt.state)
+        for uid, r in rsvps.items()}
     # Rows this save may touch: the ones the AA changed (every posted row when
     # the browser sent no markers — the no-JavaScript fallback), editable or
     # unlocked on purpose, and still exactly as the page showed them.
@@ -3610,9 +3618,7 @@ def _api_flex_event_save_attendance(event: dict, user: User,
         if not want:
             if r is not None:
                 try:
-                    db.delete_flexible_rsvp(app.app_id, event_id, uid,
-                                            expected_version=r.version,
-                                            expected_rsvp_id=r.rsvp_id)
+                    _flex_write_rsvp(evt, r, delete=True)
                     changed += 1
                 except db.ConcurrencyConflict:
                     conflicts += 1
@@ -3653,17 +3659,13 @@ def _api_flex_event_save_attendance(event: dict, user: User,
         if not _going(want):
             r.willing_to_host = False
         r.marked_by, r.marked_at = user.user_id, now
-        r.updated_at = now
+        r.updated_at = _flex_precise_now() if evt.capacity else now
         r.offer_passed = False
         if evt.capacity and polling and len(options) > 1:
             # No seats until the date is chosen; remember when they joined.
             r.queued_at = (r.queued_at or now) if _going(want) else None
         try:
-            if is_new:
-                db.put_flexible_rsvp(r, create_only=True)
-            else:
-                db.put_flexible_rsvp(r, expected_version=r.version,
-                                     update_only=True)
+            _flex_write_rsvp(evt, r, create_only=is_new)
             changed += 1
         except db.ConcurrencyConflict:
             conflicts += 1
@@ -3689,8 +3691,7 @@ def _api_flex_event_save_attendance(event: dict, user: User,
             continue
         r.party_size = really_coming.get(k)
         try:
-            db.put_flexible_rsvp(r, expected_version=r.version,
-                                 update_only=True)
+            _flex_write_rsvp(evt, r)
         except db.ConcurrencyConflict:
             pass
     over_note = ""
@@ -3701,8 +3702,7 @@ def _api_flex_event_save_attendance(event: dict, user: User,
         marked_yes = {uid for uid, r in now_stored.items()
                       if uid in listed
                       and seats.answer_for(r, _oid, evt.state) == "yes"
-                      and seats.answer_for(rsvps.get(uid), _oid,
-                                           evt.state) != "yes"}
+                      and before_answers.get(uid) != "yes"}
         p = _flex_reseat(app.app_id, event_id, tell_waitlisted=False,
                          seat_now=marked_yes)
         if p is not None and p.forced:
@@ -4227,6 +4227,64 @@ def _api_flex_event_seat_waiting(event: dict, user: User,
     return _redirect(results_url + "&notice=" + urllib.parse.quote(msg))
 
 
+def _flex_uncap(app_id: str, event_id: str) -> None:
+    """The limit was just removed: everyone on the yes waitlist is in (and
+    gets the invite once the date is set), a maybe holding an offer is just
+    a maybe again (no email), and the seat fields are cleared."""
+    blank = {"seat": None, "queued_at": None, "offer_expires_at": None,
+             "offer_passed": False, "seat_forced": False}
+    for _try in range(60):
+        evt = db.get_flexible_event(app_id, event_id)
+        if evt is None or evt.capacity:
+            return
+        state = db.get_seat_state(app_id, event_id)
+        rsvps = {r.user_id: r for r in db.list_flexible_rsvps(
+            app_id, event_id, consistent=True)}
+        updates = {}
+        for uid, r in rsvps.items():
+            diff = {f: v for f, v in blank.items() if getattr(r, f) != v}
+            if diff:
+                updates[uid] = diff
+        if not updates:
+            return
+        users = {u.user_id: u for u in db.list_users(evt.community_id)}
+        keyer = _flex_hh_keyer(users)
+        options = list(db.list_flexible_poll_options(app_id, event_id))
+        opt = (_flex_roster_option(evt, options) if evt.state == "scheduled"
+               else (options[0] if len(options) == 1 else None))
+        oid = opt.option_id if opt else None
+        groups = {g.key: g for g in seats.build_groups(
+            rsvps, keyer, oid, evt.state)}
+        limit = db.SEAT_TXN_MAX - 1
+        if len(updates) > limit:
+            keep = _flex_seat_chunk(updates, rsvps, keyer, [], limit)
+            updates = {u: d for u, d in updates.items() if u in keep}
+        try:
+            db.commit_seat_plan(app_id, event_id, expected_seq=state["seq"],
+                                rsvps=rsvps, updates=updates,
+                                reached=state["reached"],
+                                cutoff_notice=state["cutoff_notice"])
+        except db.ConcurrencyConflict:
+            continue
+        p = seats.Plan()
+        for k in sorted({keyer(u) for u in updates}):
+            g = groups.get(k)
+            if g is None or g.seat != "wait_yes":
+                continue
+            p.newly_seated.append(g)
+            p.news[k] = ("Good news: there's no longer a limit on numbers, "
+                         "so you're in.")
+            p.recipients[k] = list(g.user_ids)
+        if p.newly_seated:
+            community = db.get_community(evt.community_id)
+            app = next((a for a in db.list_applications(evt.community_id)
+                        if a.app_id == app_id), None)
+            _flex_announce_seats(evt, opt, app, community, users, rsvps, p,
+                                 tell_waitlisted=False, tell_cutoff=False,
+                                 tz_name=_flex_tz(app, community))
+    log.warning("uncap gave up app=%s event=%s", app_id, event_id)
+
+
 def _api_flex_event_save_capacity(event: dict, user: User,
                                   community: Community | None,
                                   app: Application,
@@ -4252,12 +4310,16 @@ def _api_flex_event_save_capacity(event: dict, user: User,
         return _error_redirect(results_url,
                                "Max attendees must be at least 1, or blank "
                                "for no limit.")
+    had = evt.capacity
+    seq = _flex_seat_seq(evt)
     evt.capacity = cap
     try:
-        db.put_flexible_event(evt, expected_version=evt.version)
+        db.put_flexible_event(evt, expected_version=evt.version, seat_seq=seq)
     except db.ConcurrencyConflict:
         return _error_redirect(results_url,
                                "Someone else just changed this — refresh.")
+    if had and not cap:
+        _flex_uncap(app.app_id, event_id)
     _flex_reseat(app.app_id, event_id, tell_waitlisted=True)
     msg = (f"Max attendees set to {cap}." if cap else
            "No limit on attendees.")
@@ -4528,59 +4590,53 @@ def _api_flex_event_close_review(event: dict, user: User,
 def _flex_close_prep(app: Application, evt: FlexibleEvent, opt,
                      rsvps: dict, member_ids: set, now: str) -> tuple:
     """The replies as closing on ``opt`` leaves them, before any seating:
-    the vote on the winning date becomes the answer, and the organizer who
-    created the event counts as a yes unless they said no. Works on copies.
-    Returns (work: user_id -> reply, writes: [(reply, is_new)], host)."""
+    the organizer who created the event counts as a yes unless they said no
+    (or have left the app). Answers for the winning date are read from the
+    vote on it (``capacity.answer_for``). Works on copies. Returns
+    (work: user_id -> reply, host reply to save or None, host user_id)."""
     import copy as _copy
     work = {u: _copy.copy(r) for u, r in rsvps.items()}
-    writes: list = []
-    # From here the vote on the winning date is the answer: a maybe stays a
-    # maybe (it was "coming" while the poll ran).
-    for uid, r in work.items():
-        v = r.votes.get(opt.option_id)
-        want = "no" if (r.confirmed_response == "no" or v == "no") else v
-        if want and r.confirmed_response != want:
-            r.confirmed_response = want
-            writes.append((r, False))
     host = evt.created_by
-    if host and host in member_ids:
-        r = work.get(host)
-        if seats.answer_for(r, opt.option_id, "scheduled") != "no":
-            is_new = r is None
-            if is_new:
-                r = FlexibleRSVP(community_id=app.community_id,
-                                 app_id=app.app_id, event_id=evt.event_id,
-                                 user_id=host)
-                work[host] = r
-            if seats.answer_for(r, opt.option_id, "scheduled") != "yes":
-                r.votes = {**r.votes, opt.option_id: "yes"}
-                r.confirmed_response = "yes"
-                r.updated_at = now
-                writes = [w for w in writes if w[0] is not r]
-                writes.append((r, is_new))
-    else:
-        host = None
-    return work, writes, host
+    if not (host and host in member_ids):
+        return work, None, None
+    r = work.get(host)
+    if seats.answer_for(r, opt.option_id, "scheduled") == "no":
+        return work, None, host
+    if seats.answer_for(r, opt.option_id, "scheduled") == "yes":
+        return work, None, host
+    if r is None:
+        r = FlexibleRSVP(community_id=app.community_id, app_id=app.app_id,
+                         event_id=evt.event_id, user_id=host)
+        work[host] = r
+    r.votes = {**r.votes, opt.option_id: "yes"}
+    r.confirmed_response = "yes"
+    r.updated_at = now
+    return work, r, host
 
 
-def _flex_close_split(confirmed: list, rsvps: dict, keyer, opt) -> tuple:
-    """Who closing sends what, once seats are settled: (invite: seated,
-    claim: never answered for the winning date and not part of a household
-    that did). A household answers as one: whoever in it hasn't answered
-    goes along with it — invited with a seated household, already in line
-    with a waiting one — rather than being asked to claim a seat."""
-    hh_seat = {g.key: g.seat for g in seats.build_groups(
-        rsvps, keyer, opt.option_id, "scheduled") if g.answer}
+def _flex_close_split(confirmed: list, rsvps: dict, keyer, opt,
+                      seated_keys: set | None = None) -> tuple:
+    """Who closing sends what, once seats are settled: (invite, claim).
+    A household is one unit: everyone in a seated household who didn't say
+    no is invited — a maybe too, since its seats cover them, and a member
+    who hasn't answered. Someone who hasn't answered, in a household that
+    hasn't either, is asked to answer to claim a seat. ``seated_keys``: the
+    households to invite (default: every household holding seats)."""
+    groups = {g.key: g for g in seats.build_groups(
+        rsvps, keyer, opt.option_id, "scheduled")}
+    answered = {k for k, g in groups.items() if g.answer}
+    if seated_keys is None:
+        seated_keys = {k for k, g in groups.items() if g.seat == "seated"}
     invite, claim = [], []
     for u in confirmed:
-        r = rsvps.get(u.user_id)
-        ans = seats.answer_for(r, opt.option_id, "scheduled")
-        hh = hh_seat.get(keyer(u.user_id))
-        if ans == "yes" and r is not None and r.seat == "seated":
+        k = keyer(u.user_id)
+        ans = seats.answer_for(rsvps.get(u.user_id), opt.option_id,
+                               "scheduled")
+        if ans == "no":
+            continue
+        if k in seated_keys:
             invite.append(u)
-        elif ans is None and hh == "seated":
-            invite.append(u)
-        elif ans is None and hh is None:
+        elif ans is None and k not in answered:
             claim.append(u)
     return invite, claim
 
@@ -4593,13 +4649,9 @@ def _flex_close_preview(app: Application, community: Community | None,
     import copy as _copy
     now = dt.datetime.now(dt.timezone.utc)
     member_ids = {m.user_id for m in db.list_memberships_for_app(app.app_id)}
-    work, _writes, host = _flex_close_prep(
-        app, evt, opt, rsvps, member_ids, now.isoformat(timespec="seconds"))
-    sim = _copy.copy(evt)
-    sim.state = "scheduled"
-    sim.winning_date = opt.iso_date
-    sim.winning_start_time = opt.start_time or "18:00"
-    sim.winning_option_id = opt.option_id
+    work, _host_row, host = _flex_close_prep(
+        app, evt, opt, rsvps, member_ids, _flex_precise_now())
+    sim = _flex_closed_copy(evt, opt)
     users = {u.user_id: u for u in db.list_users(app.community_id)}
     keyer = _flex_hh_keyer(users)
     starts = now if evt.adopted else _flex_starts_at(
@@ -4614,40 +4666,106 @@ def _flex_close_preview(app: Application, community: Community | None,
 
     def tier(t: str) -> list:
         return sorted((g for g in groups if g.seat == t),
-                      key=lambda g: (g.queued_at or "", g.key))
+                      key=lambda g: (seats.when(g.queued_at), g.key))
     seated = sum(g.size for g in groups if g.seat == "seated")
     return {"invite": invite, "claim": claim, "users": users,
             "wait_yes": tier("wait_yes"), "wait_maybe": tier("wait_maybe"),
             "offered": tier("offered"), "seated": seated, "host": host}
 
 
-def _flex_close_seats(app: Application, evt: FlexibleEvent, opt,
-                      confirmed: list, rsvps: dict) -> tuple:
-    """Closing a poll on a capacity event (already saved as scheduled): seat
-    people on the winning date and split who gets what. Returns
-    (invite: seated users, claim: users who never answered for that date,
-    rsvps as they now stand). The waitlisted are told by the re-seat."""
-    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+def _flex_closed_copy(evt: FlexibleEvent, opt) -> FlexibleEvent:
+    """The event as closing it on ``opt`` leaves it (not saved)."""
+    import copy as _copy
+    sim = _copy.copy(evt)
+    sim.state = "scheduled"
+    sim.winning_date = opt.iso_date
+    sim.winning_start_time = opt.start_time or "18:00"
+    sim.winning_option_id = opt.option_id
+    return sim
+
+
+def _flex_close_seats(app: Application, community: Community | None,
+                      evt: FlexibleEvent, opt, confirmed: list,
+                      rsvps: dict) -> tuple:
+    """Close a poll on a capacity event: save the event as scheduled TOGETHER
+    with the first seating, in one transaction, so no other request can seat
+    (and announce) anyone in between. Returns (closed event or None if it
+    was closed meanwhile, invite, claim, rsvps). The close sends the invites
+    for everyone seated by that commit; anything after is announced by
+    whichever request commits it."""
+    import copy as _copy
     member_ids = {m.user_id for m in db.list_memberships_for_app(app.app_id)}
-    _work, writes, host = _flex_close_prep(app, evt, opt, rsvps, member_ids,
-                                           now)
-    for r, is_new in writes:
+    users = {u.user_id: u for u in db.list_users(app.community_id)}
+    keyer = _flex_hh_keyer(users)
+    # The organizer's own yes is saved first, while still a poll.
+    _w, host_row, host = _flex_close_prep(app, evt, opt, rsvps, member_ids,
+                                          _flex_precise_now())
+    if host_row is not None:
         try:
-            if is_new:
-                db.put_flexible_rsvp(r, create_only=True)
-            else:
-                db.put_flexible_rsvp(r, expected_version=r.version,
-                                     update_only=True)
+            _flex_write_rsvp(evt, host_row, create_only=host_row.version == 0
+                             and host not in rsvps)
         except db.ConcurrencyConflict:
             pass
-    _flex_reseat(app.app_id, evt.event_id, tell_waitlisted=True,
-                 seat_now={host} if host else None)
-    rsvps = {r.user_id: r for r in db.list_flexible_rsvps(
-        app.app_id, evt.event_id, consistent=True)}
-    users = {u.user_id: u for u in db.list_users(app.community_id)}
-    invite, claim = _flex_close_split(confirmed, rsvps,
-                                      _flex_hh_keyer(users), opt)
-    return invite, claim, rsvps
+    for _try in range(6):
+        cur = db.get_flexible_event(app.app_id, evt.event_id)
+        if cur is None or cur.state != "poll":
+            return None, [], [], rsvps
+        state = db.get_seat_state(app.app_id, evt.event_id)
+        rsvps = {r.user_id: r for r in db.list_flexible_rsvps(
+            app.app_id, evt.event_id, consistent=True)}
+        work = {u: _copy.copy(r) for u, r in rsvps.items()}
+        closed = _flex_closed_copy(cur, opt)
+        now = dt.datetime.now(dt.timezone.utc)
+        starts = now if cur.adopted else _flex_starts_at(
+            closed, opt, _flex_tz(app, community))
+        before = {g.key: g.seat for g in seats.build_groups(
+            rsvps, keyer, opt.option_id, "scheduled")}
+        p = _flex_plan_seats(closed, opt, work, keyer,
+                             reached=state["reached"], when=now,
+                             starts=starts,
+                             seat_now={host} if host else None)
+        p.updates = {}
+        for u, w in work.items():
+            diff = {f: getattr(w, f) for f in seats.SEAT_FIELDS
+                    if getattr(w, f) != getattr(rsvps[u], f)}
+            if diff:
+                p.updates[u] = diff
+        limit = db.SEAT_TXN_MAX - 2
+        if len(p.updates) > limit:
+            keep = _flex_seat_chunk(p.updates, rsvps, keyer,
+                                    [keyer(host)] if host else [], limit)
+            p.updates = {u: d for u, d in p.updates.items() if u in keep}
+        try:
+            db.commit_seat_plan(app.app_id, evt.event_id,
+                                expected_seq=state["seq"], rsvps=rsvps,
+                                updates=p.updates, reached=p.reached,
+                                cutoff_notice=state["cutoff_notice"],
+                                event=closed)
+        except db.ConcurrencyConflict:
+            continue
+        done = {keyer(u) for u in p.updates}
+        after = {g.key: g for g in seats.build_groups(
+            work, keyer, opt.option_id, "scheduled")}
+        seated_keys = {k for k, g in after.items() if g.seat == "seated"
+                       and (k in done or before.get(k) == "seated")}
+        stored = {u: (work[u] if keyer(u) in done else rsvps[u])
+                  for u in rsvps}
+        invite, claim = _flex_close_split(confirmed, stored, keyer, opt,
+                                          seated_keys)
+        # A deliverable organizer counts as coming even if not in the cohort.
+        if host and host in users and host not in {u.user_id for u in invite}:
+            if keyer(host) in seated_keys:
+                invite.append(users[host])
+        # Tell whoever went on the waitlist; any remaining part of a very
+        # big plan is committed (and announced) by the re-seat.
+        for attr in ("promoted", "offered", "waitlisted", "lapsed"):
+            setattr(p, attr, [g for g in getattr(p, attr) if g.key in done])
+        _flex_announce_seats(closed, opt, app, community, users, rsvps, p,
+                             tell_waitlisted=True, tell_cutoff=False,
+                             tz_name=_flex_tz(app, community))
+        _flex_reseat(app.app_id, evt.event_id, tell_waitlisted=True)
+        return closed, invite, claim, stored
+    return None, [], [], rsvps
 
 
 def _api_flex_event_close(event: dict, user: User,
@@ -4673,24 +4791,29 @@ def _api_flex_event_close(event: dict, user: User,
     confirmed, couldnt, rsvps = _flex_cohorts(app, community, event_id, winning)
     series = db.get_flexible_series_for_app(app.app_id)
     loc = evt.location or (series.default_location if series else None)
-    # Finalize (optimistic guard makes a double-submit safe).
-    evt.state = "scheduled"
-    evt.winning_date = opt.iso_date
-    evt.winning_start_time = opt.start_time or "18:00"
-    evt.winning_option_id = opt.option_id
-    try:
-        db.put_flexible_event(evt, expected_version=evt.version)
-    except db.ConcurrencyConflict:
-        return _error_redirect(f"/flex/event/results?event={event_id}",
-                               "Someone else just closed this — refresh.")
+    # Finalize (optimistic guard makes a double-submit safe). On a capacity
+    # event the new state is saved together with the first seating.
     # Keep the poll options after finalizing so the event's results page
     # still shows the full vote history (winner marked) — they're no longer
     # rendered to members (the scheduled view replaces the poll form).
-
     claim: list[User] = []
     if evt.capacity:
-        confirmed, claim, rsvps = _flex_close_seats(app, evt, opt, confirmed,
-                                                    rsvps)
+        closed, confirmed, claim, rsvps = _flex_close_seats(
+            app, community, evt, opt, confirmed, rsvps)
+        if closed is None:
+            return _error_redirect(f"/flex/event/results?event={event_id}",
+                                   "Someone else just closed this — refresh.")
+        evt = closed
+    else:
+        evt.state = "scheduled"
+        evt.winning_date = opt.iso_date
+        evt.winning_start_time = opt.start_time or "18:00"
+        evt.winning_option_id = opt.option_id
+        try:
+            db.put_flexible_event(evt, expected_version=evt.version)
+        except db.ConcurrencyConflict:
+            return _error_redirect(f"/flex/event/results?event={event_id}",
+                                   "Someone else just closed this — refresh.")
 
     from community_organizer.providers.email import get_email_provider
     provider = get_email_provider()
@@ -4968,7 +5091,8 @@ def _flex_token_page(event: dict) -> dict:
         "Stop emailing me about this group</button></form>")
 
     # Capacity: where this member stands, and whether the event is full.
-    _opts_all = list(db.list_flexible_poll_options(tok.app_id, tok.event_id))
+    _opts_all = (list(db.list_flexible_poll_options(tok.app_id, tok.event_id))
+                 if evt.capacity else [])
     cap_on = _flex_capacity_on(evt, _opts_all)
     tier, place, cap_full = None, 0, False
     if cap_on:
@@ -5260,8 +5384,9 @@ def _api_flex_token_vote(event: dict) -> dict:
     was_host_volunteer = rsvp.willing_to_host
     # Capacity: where this reply stood before the save, to tell afterwards
     # whether they joined the line, won a seat, or were waitlisted.
-    _all_opts = (options if evt.state == "poll" else list(
-        db.list_flexible_poll_options(tok.app_id, tok.event_id)))
+    _all_opts = (options if evt.state == "poll" or not evt.capacity
+                 else list(db.list_flexible_poll_options(tok.app_id,
+                                                         tok.event_id)))
     cap_on = _flex_capacity_on(evt, _all_opts)
     seat_opt = _flex_seat_option(evt, _all_opts) if cap_on else None
     seat_oid = seat_opt.option_id if seat_opt else None
@@ -5303,10 +5428,6 @@ def _api_flex_token_vote(event: dict) -> dict:
             rsvp.party_size_auto = False
         except ValueError:
             pass
-    if cap_on:
-        refusal = _flex_party_refusal(evt, tok, rsvp, seat_oid, before_party)
-        if refusal:
-            return _flex_terminal_page(refusal)
     bringing = (parsed.get("bringing", [""])[0] or "").strip()
     rsvp.bringing = bringing or None
     # The hosting fields are only on the form while the question is open, so
@@ -5324,8 +5445,11 @@ def _api_flex_token_vote(event: dict) -> dict:
         rsvp.marked_by = rsvp.marked_at = None
         # Answering again puts a maybe who let an offer go back in line.
         rsvp.offer_passed = False
-    rsvp.updated_at = dt.datetime.now(dt.timezone.utc).isoformat(
-        timespec="seconds")
+    # On a capacity event the time is their place in line, so it is stored
+    # with the answer, to the microsecond.
+    rsvp.updated_at = (_flex_precise_now() if evt.capacity else
+                       dt.datetime.now(dt.timezone.utc).isoformat(
+                           timespec="seconds"))
     if (evt.capacity and evt.state == "poll" and not cap_on):
         # A poll still choosing between dates: no seats yet, but remember when
         # they first said they could come, for their place once it closes.
@@ -5333,17 +5457,36 @@ def _api_flex_token_vote(event: dict) -> dict:
             rsvp.queued_at = rsvp.updated_at
         elif rsvp.confirmed_response != "yes":
             rsvp.queued_at = None
-    try:
-        db.put_flexible_rsvp(rsvp, expected_version=rsvp.version)
-    except db.ConcurrencyConflict:
-        return _flex_terminal_page(
-            "Your response collided with another update — open your link "
-            "again and re-save.")
+    collided = _flex_terminal_page(
+        "Your response collided with another update — open your link "
+        "again and re-save.")
+    # On a capacity event, the party-size check and the save are made
+    # against the same seat ``seq``: if any seat-affecting change lands in
+    # between, the save fails and both are done again from fresh.
+    for _try in range(4):
+        seq = _flex_seat_seq(evt)
+        if cap_on:
+            refusal = _flex_party_refusal(evt, tok, rsvp, seat_oid,
+                                          before_party)
+            if refusal:
+                return _flex_terminal_page(refusal)
+        try:
+            db.put_flexible_rsvp(rsvp, expected_version=rsvp.version,
+                                 seat_seq=seq)
+            break
+        except db.ConcurrencyConflict:
+            fresh = db.get_flexible_rsvp(tok.app_id, tok.event_id,
+                                         tok.user_id)
+            if seq is None or (fresh.version if fresh else 0) != rsvp.version:
+                return collided         # their own reply moved on
+    else:
+        return collided
     seat_msg = None
     if cap_on:
         after_answer = seats.answer_for(rsvp, seat_oid, evt.state)
         _flex_reseat(tok.app_id, tok.event_id, tell_waitlisted=False,
-                     answered_at=({tok.user_id: _flex_precise_now()}
+                     actor=tok.user_id,
+                     answered_at=({tok.user_id: rsvp.updated_at}
                                   if after_answer != before_answer else None))
         rsvps_now = {r.user_id: r for r in db.list_flexible_rsvps(
             tok.app_id, tok.event_id, consistent=True)}
@@ -5351,14 +5494,15 @@ def _api_flex_token_vote(event: dict) -> dict:
         tier, place = _flex_line_place(rsvps_now, users_now, seat_opt,
                                        evt.state, tok.user_id)
         mine = rsvps_now.get(tok.user_id)
-        # The invite is for a seat newly held — taking one, or an offer.
+        # A seat newly held — taking one, or an offer. Whichever request
+        # committed it has sent the invite (see _flex_reseat).
         confirmed_now = (evt.state == "scheduled" and tier == "seated"
                          and before_seat not in ("seated",))
         if confirmed_now and mine is not None:
             rsvp = mine
         seat_msg = _flex_seat_message(tier, place, after_answer,
                                       evt.state == "scheduled")
-    if confirmed_now:
+    elif confirmed_now:
         _flex_send_confirmed_invite(
             tok, evt, db.get_user(tok.community_id, tok.user_id), rsvp)
     if evt.notify_on_response:
@@ -5425,9 +5569,12 @@ def _api_flex_token_vote(event: dict) -> dict:
             "Got it — you won't get further emails about this event. Open "
             "your link again any time if you change your mind.")
     if confirmed_now:
+        cal = prefs.wants_calendar(db.get_user(tok.community_id, tok.user_id))
         return _flex_terminal_page(
-            "Wonderful — you're in! We've sent you the calendar invite. Open "
-            "this link again any time to update what you're bringing.")
+            "Wonderful — you're in!"
+            + (" We've sent you the calendar invite." if cal else "")
+            + " Open this link again any time to update what you're "
+            "bringing.")
     if seat_msg:
         return _flex_terminal_page(seat_msg)
     return _flex_terminal_page(
@@ -5491,15 +5638,22 @@ def _api_flex_token_join(event: dict) -> dict:
         rsvp.votes = {**rsvp.votes, _won.option_id: "yes"}
     rsvp.marked_by = rsvp.marked_at = None
     rsvp.offer_passed = False
-    rsvp.updated_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    rsvp.updated_at = (_flex_precise_now() if evt.capacity else
+                       dt.datetime.now(dt.timezone.utc).isoformat(
+                           timespec="seconds"))
     try:
-        db.put_flexible_rsvp(rsvp, expected_version=rsvp.version)
+        db.put_flexible_rsvp(rsvp, expected_version=rsvp.version,
+                             seat_seq=_flex_seat_seq(evt))
     except db.ConcurrencyConflict:
         return _flex_terminal_page("Please open your link again and retry.")
-    _opts = list(db.list_flexible_poll_options(tok.app_id, tok.event_id))
-    if _flex_capacity_on(evt, _opts):
+    _opts = (list(db.list_flexible_poll_options(tok.app_id, tok.event_id))
+             if evt.capacity else [])
+    capped = _flex_capacity_on(evt, _opts)
+    if capped:
+        # The invite goes from whichever request commits their seat.
         _flex_reseat(tok.app_id, tok.event_id, tell_waitlisted=False,
-                     answered_at={tok.user_id: _flex_precise_now()})
+                     actor=tok.user_id,
+                     answered_at={tok.user_id: rsvp.updated_at})
         _rs = {r.user_id: r for r in db.list_flexible_rsvps(
             tok.app_id, tok.event_id, consistent=True)}
         _us = {u.user_id: u for u in db.list_users(tok.community_id)}
@@ -5510,7 +5664,8 @@ def _api_flex_token_join(event: dict) -> dict:
                 _flex_seat_message(tier, place, "yes", True)
                 or "Thanks — your answer is saved.")
         rsvp = _rs.get(tok.user_id) or rsvp
-    org_name, loc, date_label = _flex_send_confirmed_invite(tok, evt, user, rsvp)
+    org_name, loc, date_label = _flex_send_confirmed_invite(
+        tok, evt, user, rsvp, send=not capped)
     # Always tell the AA(s): the event is already scheduled, so they're
     # likely no longer watching the results page when a No-voter rejoins.
     who = (user.name or user.email) if user else tok.user_id
@@ -5533,7 +5688,8 @@ def _flex_send_confirmed_invite(tok: EventToken, evt: FlexibleEvent,
                                 user: User | None,
                                 rsvp: FlexibleRSVP, *,
                                 intro: str = "Glad you can make it!",
-                                subject: str | None = None) -> tuple:
+                                subject: str | None = None,
+                                send: bool = True) -> tuple:
     """Email a member the calendar invite for a scheduled event they have
     just confirmed for themselves (rejoining after a No, or settling a Maybe).
     Best-effort: a send failure is logged, never raised. Returns
@@ -5557,7 +5713,9 @@ def _flex_send_confirmed_invite(tok: EventToken, evt: FlexibleEvent,
     # seat came free) and go out without the invite when calendars are off.
     cal = prefs.wants_calendar(user) if user else True
     news = intro != "Glad you can make it!"
-    if (user and user.email and not user.email_undeliverable
+    # An adopted event was arranged outside the app: it never emails members.
+    if (send and not evt.adopted
+            and user and user.email and not user.email_undeliverable
             and evt.winning_start_time and (cal or news)):
         try:
             ics = ical.make_flexible_event_ics(
@@ -5782,32 +5940,134 @@ def _flex_plan_seats(evt: FlexibleEvent, opt, work: dict, keyer, *,
     return p
 
 
+_SELF_INTRO = "Glad you can make it!"
+
+
+def _flex_seat_seq(evt: FlexibleEvent | None) -> int | None:
+    """For a write that can change who holds a seat: the event's seat
+    ``seq`` to write against (None when the event has no capacity). Read it
+    BEFORE whatever the write was decided from."""
+    if evt is None or not evt.capacity:
+        return None
+    return db.get_seat_state(evt.app_id, evt.event_id)["seq"]
+
+
+def _flex_write_rsvp(evt: FlexibleEvent, r: FlexibleRSVP, *,
+                     create_only: bool = False, delete: bool = False) -> None:
+    """Save (or delete) one reply the caller decided on, conditional on its
+    version; on a capacity event also against the seat ``seq``, retrying
+    when only the ``seq`` moved. ConcurrencyConflict if the reply itself
+    changed since it was read."""
+    for _try in range(4):
+        seq = _flex_seat_seq(evt)
+        try:
+            if delete:
+                db.delete_flexible_rsvp(r.app_id, r.event_id, r.user_id,
+                                        expected_version=r.version,
+                                        expected_rsvp_id=r.rsvp_id,
+                                        seat_seq=seq)
+            elif create_only:
+                db.put_flexible_rsvp(r, create_only=True, seat_seq=seq)
+            else:
+                db.put_flexible_rsvp(r, expected_version=r.version,
+                                     update_only=True, seat_seq=seq)
+            return
+        except db.ConcurrencyConflict:
+            if seq is None:
+                raise
+            fresh = db.get_flexible_rsvp(r.app_id, r.event_id, r.user_id)
+            if create_only:
+                if fresh is not None:
+                    raise
+            elif fresh is None or fresh.version != r.version:
+                raise
+    raise db.ConcurrencyConflict(f"seats for event {r.event_id} kept moving")
+
+
+def _flex_seat_chunk(updates: dict, before: dict, keyer,
+                     first: list[str], limit: int) -> set[str]:
+    """Which replies to commit first when a plan is too big for one
+    transaction: whole households only; those giving seats up first (so
+    the seats they free exist before anyone takes them), then the
+    households in ``first``, then the rest."""
+    hh: dict[str, list[str]] = {}
+    for uid in updates:
+        hh.setdefault(keyer(uid), []).append(uid)
+
+    def frees(k: str) -> bool:
+        return any(before[u].seat in ("seated", "offered")
+                   and updates[u].get("seat", before[u].seat)
+                   not in ("seated", "offered") for u in hh[k])
+    order = ([k for k in hh if frees(k)]
+             + [k for k in first if k in hh]
+             + list(hh))
+    out: set[str] = set()
+    seen: set[str] = set()
+    for k in order:
+        if k in seen:
+            continue
+        seen.add(k)
+        if out and len(out) + len(hh[k]) > limit:
+            break
+        out.update(hh[k])
+    return out
+
+
+def _flex_hh_recipients(g, rsvps: dict, users: dict, keyer, oid, state,
+                        member_ids: set) -> list[str]:
+    """Who in a newly seated household is told: everyone in it who hasn't
+    said no — a maybe too, since the household's seats cover them, and a
+    member of the app who hasn't answered."""
+    out = list(g.user_ids)
+    for uid in users:
+        if uid in out or keyer(uid) != g.key or uid not in member_ids:
+            continue
+        if seats.answer_for(rsvps.get(uid), oid, state) is None:
+            out.append(uid)
+    return out
+
+
 def _flex_reseat(app_id: str, event_id: str, *,
                  answered_at: dict[str, str] | None = None,
                  tell_waitlisted: bool = True,
                  seat_now: set[str] | None = None,
                  announce_seat_now: bool = False,
+                 actor: str | None = None,
+                 announce_seated: bool = True,
                  now: dt.datetime | None = None):
     """Re-plan the seats of a capacity event after its replies changed, write
-    the plan, and send what it calls for. Returns the committed Plan, or None
-    when the event has no cap in force. ``answered_at``: user_id -> when the
-    reply just saved was given (their place if they're joining the line).
+    the plan, and send what it calls for. Returns the committed Plan (its
+    ``newly_seated`` covers every part committed), or None when the event
+    has no cap in force or the plan could not be committed.
+
+    ``answered_at``: user_id -> when the reply just saved was given.
     ``tell_waitlisted``: email people newly put on the waitlist (False when
     the member did it themselves and the page they're looking at says so).
     ``seat_now``: user_ids an organizer has just marked coming — their
     households are seated whether or not a seat is free (over capacity if
     need be: the plan's ``forced`` lists those households).
-    ``announce_seat_now``: also tell those households they're in, as if
-    promoted (an organizer squeezing someone in off the waitlist)."""
+    ``announce_seat_now``: tell those households they're in (an organizer
+    squeezing someone in off the waitlist); otherwise they aren't emailed.
+    ``actor``: the member whose own answer this follows, for the wording.
+    ``announce_seated``: False when the caller sends the invites for the
+    households this commits as newly seated (closing a poll).
+
+    Whoever commits a household's move into a seat sends its invite — and
+    only that commit, so two requests can't both send it."""
     import copy as _copy
-    for _attempt in range(6):
+    total = None
+    conflicts = 0
+    for _round in range(60):
+        if conflicts >= 6:
+            break
         evt = db.get_flexible_event(app_id, event_id)
         if evt is None:
-            return None
+            return total
         options = list(db.list_flexible_poll_options(app_id, event_id))
         if not _flex_capacity_on(evt, options):
-            return None
+            return total
         opt = _flex_seat_option(evt, options)
+        oid = opt.option_id if opt else None
         community = db.get_community(evt.community_id)
         app = next((a for a in db.list_applications(evt.community_id)
                     if a.app_id == app_id), None)
@@ -5823,13 +6083,12 @@ def _flex_reseat(app_id: str, event_id: str, *,
         starts = (when if evt.adopted
                   else _flex_starts_at(evt, opt, tz_name))
         keyer = _flex_hh_keyer(users)
+        before_seat = {g.key: g.seat for g in seats.build_groups(
+            rsvps, keyer, oid, evt.state)}
         work = {u: _copy.copy(r) for u, r in rsvps.items()}
         p = _flex_plan_seats(evt, opt, work, keyer, reached=state["reached"],
                              when=when, starts=starts,
                              answered_at=answered_at, seat_now=seat_now)
-        if announce_seat_now:
-            p.promoted = p.promoted + [g for g in p.seated_now
-                                       if g not in p.promoted]
         p.updates = {}
         for u, w in work.items():
             diff = {f: getattr(w, f) for f in seats.SEAT_FIELDS
@@ -5842,21 +6101,73 @@ def _flex_reseat(app_id: str, event_id: str, *,
         new_notice = notice and notice != state["cutoff_notice"]
         if (not p.updates and p.reached == state["reached"]
                 and not new_notice):
-            return p
+            return total or p
+        limit = db.SEAT_TXN_MAX - 1
+        partial = len(p.updates) > limit
+        if partial:
+            first = ([keyer(actor)] if actor else []) + [
+                g.key for g in p.seated_now]
+            keep = _flex_seat_chunk(p.updates, rsvps, keyer, first, limit)
+            p.updates = {u: d for u, d in p.updates.items() if u in keep}
         try:
             db.commit_seat_plan(app_id, event_id,
                                 expected_seq=state["seq"], rsvps=rsvps,
                                 updates=p.updates, reached=p.reached,
                                 cutoff_notice=notice or state["cutoff_notice"])
         except db.ConcurrencyConflict:
+            conflicts += 1
             continue
+        # What this commit did, household by household.
+        done = {keyer(u) for u in p.updates}
+        after = {g.key: g for g in seats.build_groups(
+            work, keyer, oid, evt.state)}
+        for attr in ("promoted", "offered", "waitlisted", "lapsed"):
+            setattr(p, attr, [g for g in getattr(p, attr) if g.key in done])
+        squeezed = {g.key for g in p.seated_now}
+        member_ids = None
+        for k in sorted(done):
+            g = after.get(k)
+            if g is None or g.seat != "seated" or before_seat.get(k) == "seated":
+                continue
+            p.newly_seated.append(g)
+            if k in squeezed:
+                news = ("Good news: the organizers have made room for you, "
+                        "so you're in." if announce_seat_now else None)
+            elif not announce_seated:
+                news = None
+            elif before_seat.get(k) == "wait_yes":
+                news = "Good news: a seat has opened up, and it's yours."
+            elif actor and keyer(actor) == k:
+                news = _SELF_INTRO
+            else:
+                news = "Good news: there's a seat for you."
+            p.news[k] = news
+            if news:
+                if member_ids is None:
+                    member_ids = {m.user_id for m in
+                                  db.list_memberships_for_app(app_id)}
+                p.recipients[k] = _flex_hh_recipients(
+                    g, work, users, keyer, oid, evt.state, member_ids)
         _flex_announce_seats(evt, opt, app, community, users, rsvps, p,
                              tell_waitlisted=tell_waitlisted,
                              tell_cutoff=bool(new_notice), tz_name=tz_name)
-        return p
-    log.warning("reseat gave up after conflicts app=%s event=%s",
-                app_id, event_id)
-    return None
+        if total is None:
+            total = p
+        else:
+            total.newly_seated += p.newly_seated
+            total.forced += [k for k in p.forced if k not in total.forced]
+            total.seated_now += [g for g in p.seated_now
+                                 if g.key not in {x.key for x in
+                                                  total.seated_now}]
+            total.seated, total.free = p.seated, p.free
+            total.reached = p.reached
+        if not partial:
+            return total
+        # Only part of a big plan went in: plan again from what is stored.
+        answered_at = None
+    log.warning("reseat gave up app=%s event=%s conflicts=%d",
+                app_id, event_id, conflicts)
+    return total
 
 
 def _flex_announce_seats(evt, opt, app, community, users, rsvps, p, *,
@@ -5891,14 +6202,14 @@ def _flex_announce_seats(evt, opt, app, community, users, rsvps, p, *,
             log.exception("seat notice failed app=%s user=%s kind=%s",
                           evt.app_id, u.user_id, kind)
 
-    squeezed = {g.key for g in p.seated_now}
-    for g in p.promoted:
-        news = ("Good news: the organizers have made room for you, so "
-                "you're in." if g.key in squeezed else
-                "Good news: a seat has opened up, and it's yours.")
-        for uid in g.user_ids:
+    for g in p.newly_seated:
+        news = p.news.get(g.key)
+        if not news or evt.adopted:
+            continue
+        self_ = news == _SELF_INTRO
+        for uid in p.recipients.get(g.key, g.user_ids):
             u = users.get(uid)
-            if not u or evt.adopted:
+            if not u:
                 continue
             if evt.state == "scheduled":
                 tok = db.get_event_token(evt.app_id, evt.event_id, uid)
@@ -5907,11 +6218,16 @@ def _flex_announce_seats(evt, opt, app, community, users, rsvps, p, *,
                                      app_id=evt.app_id, event_id=evt.event_id,
                                      user_id=uid, token="", expires_at="")
                 tok.event_id = evt.event_id
+                r = rsvps.get(uid) or FlexibleRSVP(
+                    community_id=evt.community_id, app_id=evt.app_id,
+                    event_id=evt.event_id, user_id=uid)
                 _flex_send_confirmed_invite(
-                    tok, evt, u, rsvps[uid],
-                    intro=news,
-                    subject=f"{org_name}: you're in for {evt.title}")
-            else:
+                    tok, evt, u, r, intro=news,
+                    subject=(None if self_ else
+                             f"{org_name}: you're in for {evt.title}"))
+            elif not self_:
+                # Still a single-date invitation: the calendar invite comes
+                # when the organizer confirms the date.
                 lk = link(uid)
                 send(u, f"{org_name}: you're in for {evt.title}",
                      f"Hi {u.name},\n\n{news} ({evt.title}, "

@@ -10,6 +10,7 @@ design-capacity-waitlist notes):
   joins the **maybe tier**. Both tiers are in the order people joined them.
 * Freed seats are handed on only once the event has actually been full (the
   ``reached`` latch). An event that never filled has no line to work through.
+  Turning a yes away because their party didn't fit counts as full.
 * Handing on: the first yes-tier household whose party fits is seated (the
   caller sends the calendar invite). Only when nobody is waiting on the yes
   tier is the maybe tier reached, and a maybe gets an *offer* that holds the
@@ -56,6 +57,11 @@ def answer_for(rsvp, option_id: str | None, state: str) -> str | None:
         return "no"
     if state == "poll":
         return None
+    # Voted in the poll, but not on this date: not an answer for it. (The
+    # overall response says only that they could come on SOME date.)
+    if option_id and any(v in ("yes", "maybe", "no")
+                         for v in (rsvp.votes or {}).values()):
+        return None
     return (rsvp.confirmed_response
             if rsvp.confirmed_response in ("yes", "maybe") else None)
 
@@ -94,12 +100,34 @@ class Plan:
     forced: list[str] = field(default_factory=list)  # seated over capacity
     # Households an organizer just seated by hand (see web._flex_plan_seats).
     seated_now: list[Group] = field(default_factory=list)
+    # Filled in by the caller once committed (web._flex_reseat): households
+    # that now hold seats they didn't, what to tell them (None: nothing, the
+    # caller sends its own), and who in each household to tell.
+    newly_seated: list[Group] = field(default_factory=list)
+    news: dict[str, str | None] = field(default_factory=dict)
+    recipients: dict[str, list[str]] = field(default_factory=dict)
     waiting_yes: int = 0
     waiting_maybe: int = 0
 
 
 def _iso(t: dt.datetime) -> str:
     return t.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+_EPOCH = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+
+
+def when(ts: str | None) -> dt.datetime:
+    """An ISO timestamp as an instant, for ordering: stored values mix
+    second and microsecond precision, which don't sort correctly as text.
+    Missing or unreadable values sort first."""
+    if not ts:
+        return _EPOCH
+    try:
+        t = dt.datetime.fromisoformat(ts)
+    except ValueError:
+        return _EPOCH
+    return t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)
 
 
 def _later(a: str | None, b: dt.datetime) -> bool:
@@ -134,8 +162,8 @@ def build_groups(rsvps: dict, hh_key, option_id: str | None,
                    default=None)
         # A reply that has never been placed (answered before the cap was in
         # force) stands in line from when it was last saved.
-        queued = sorted(r.queued_at or r.updated_at for r in held
-                        if r.queued_at or r.updated_at)
+        queued = sorted((r.queued_at or r.updated_at for r in held
+                         if r.queued_at or r.updated_at), key=when)
         expiries = sorted(r.offer_expires_at for r in held
                           if r.seat == "offered" and r.offer_expires_at)
         groups.append(Group(
@@ -172,7 +200,7 @@ def plan(*, capacity: int, rsvps: dict, hh_key, option_id: str | None,
         mine = [answered_at[u] for u in g.user_ids if u in answered_at]
         if g.queued_at and not (mine and g.seat is None):
             return g.queued_at
-        return min(mine) if mine else (g.queued_at or now_iso)
+        return min(mine, key=when) if mine else (g.queued_at or now_iso)
 
     groups = build_groups(rsvps, hh_key, option_id, state)
     used = 0
@@ -225,8 +253,8 @@ def plan(*, capacity: int, rsvps: dict, hh_key, option_id: str | None,
                 g = _restart(g, place(g) if g.seat is None else now_iso)
             maybe_line.append((g.queued_at, g))
 
-    yes_line.sort(key=lambda p: (p[0] or "", p[1].key))
-    maybe_line.sort(key=lambda p: (p[0] or "", p[1].key))
+    yes_line.sort(key=lambda p: (when(p[0]), p[1].key))
+    maybe_line.sort(key=lambda p: (when(p[0]), p[1].key))
     free = capacity - used
     skipped_waiter = False
     for _, g in yes_line:
@@ -256,7 +284,9 @@ def plan(*, capacity: int, rsvps: dict, hh_key, option_id: str | None,
         if not was_waiting:
             out.waitlisted.append(g)
         out.waiting_yes += 1
-    if used >= capacity:
+    # Full means full for someone: turning a yes away (their party didn't
+    # fit what was left) counts, so they get the next seats that fit.
+    if used >= capacity or out.waiting_yes:
         reached = True
     for _, g in maybe_line:
         offer = (reached and not in_cutoff and out.waiting_yes == 0

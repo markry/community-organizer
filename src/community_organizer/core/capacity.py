@@ -92,6 +92,8 @@ class Plan:
     free: int = 0
     seated: int = 0
     forced: list[str] = field(default_factory=list)  # seated over capacity
+    # Households an organizer just seated by hand (see web._flex_plan_seats).
+    seated_now: list[Group] = field(default_factory=list)
     waiting_yes: int = 0
     waiting_maybe: int = 0
 

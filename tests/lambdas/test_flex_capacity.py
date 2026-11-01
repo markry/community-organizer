@@ -308,3 +308,99 @@ def test_results_page_shows_seats_and_waitlist(ddb_table, outbox) -> None:
                                         aa_mem)["body"]
     assert "1 of 1 seats" in body and "1 waiting (0 yes, 1 maybe)" in body
     assert "Waitlist: said maybe" in body
+
+
+def _squeeze(evt, who, aa, cid, app, aa_mem):
+    return web._api_flex_event_seat_waiting(
+        _post("/api/flex/event/seat", {"event": evt.event_id,
+                                       "user": who.user_id}),
+        aa, db.get_community(cid), app, aa_mem)
+
+
+def _results(evt, aa, cid, app, aa_mem):
+    ev = {"requestContext": {"http": {"method": "GET"}},
+          "queryStringParameters": {"event": evt.event_id}}
+    return web._flex_event_results_page(ev, aa, db.get_community(cid), app,
+                                        aa_mem)["body"]
+
+
+def test_admin_squeezes_in_a_waiting_yes(ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, (opt,) = _event(cid, cap=1, state="scheduled")
+    _mk_token(cid, evt, joe.user_id, "tj")
+    _mk_token(cid, evt, bob.user_id, "tb")
+    _attend("tj", "yes")
+    _attend("tb", "yes")
+    assert _seat(evt, bob) == "wait_yes"
+    assert "Squeeze in" in _results(evt, aa, cid, app, aa_mem)
+    outbox.clear()
+    resp = _squeeze(evt, bob, aa, cid, app, aa_mem)
+    loc = resp["headers"]["Location"].replace("%20", " ")
+    assert "over capacity" in loc
+    # The household is seated as one; over capacity is recorded.
+    assert _seat(evt, bob) == "seated" and _seat(evt, joe) == "seated"
+    assert db.get_flexible_rsvp("a1", evt.event_id, bob.user_id).seat_forced
+    mail = [m for m in outbox if m["to_addr"] == "bob@example.com"]
+    assert [m["kind"] for m in mail] == ["event_confirmed"]
+    assert "made room for you" in mail[0]["body_text"]
+    # Nobody left waiting, and a second click is refused cleanly.
+    assert "Squeeze in" not in _results(evt, aa, cid, app, aa_mem)
+    again = _squeeze(evt, bob, aa, cid, app, aa_mem)
+    assert "no longer on the waitlist" in again["headers"]["Location"].replace(
+        "%20", " ").replace("%E2%80%99", "'").replace("%27", "'")
+
+
+def test_admin_seats_waiting_yes_inside_cutoff_without_going_over(
+        ddb_table, outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    soon = (dt.date.today() + dt.timedelta(days=1)).isoformat()
+    evt, (opt,) = _event(cid, cap=1, state="scheduled", dates=(soon,))
+    # Inside 24 hours nobody moves up on their own; the admin decides.
+    evt.winning_start_time = "00:00"
+    db.put_flexible_event(evt, expected_version=evt.version)
+    _mk_token(cid, evt, joe.user_id, "tj")
+    _mk_token(cid, evt, bob.user_id, "tb")
+    _attend("tj", "yes")
+    _attend("tb", "yes")
+    _attend("tj", "no")
+    assert _seat(evt, bob) == "wait_yes"
+    assert "Seat now" in _results(evt, aa, cid, app, aa_mem)
+    resp = _squeeze(evt, bob, aa, cid, app, aa_mem)
+    assert "over capacity" not in resp["headers"]["Location"].replace(
+        "%20", " ")
+    assert _seat(evt, bob) == "seated"
+    assert not db.get_flexible_rsvp("a1", evt.event_id, bob.user_id).seat_forced
+
+
+def test_close_review_previews_exactly_what_close_does(ddb_table,
+                                                       outbox) -> None:
+    cid, app, aa, aa_mem, bob, sue, joe = _seed(ddb_table)
+    evt, (o1, o2) = _event(cid, cap=2, dates=(FUTURE, "2027-03-22"),
+                           created_by=aa.user_id)
+    for uid, tk in ((joe.user_id, "tj"), (bob.user_id, "tb"),
+                    (sue.user_id, "ts")):
+        _mk_token(cid, evt, uid, tk)
+    web._api_flex_token_vote(_post("/api/e/vote", {
+        "token": "tj", f"vote_{o1.option_id}": "yes",
+        f"vote_{o2.option_id}": "no"}))
+    web._api_flex_token_vote(_post("/api/e/vote", {
+        "token": "tb", f"vote_{o1.option_id}": "yes",
+        f"vote_{o2.option_id}": "yes", "party_size": "2"}))
+    review = web._api_flex_event_close_review(
+        _post("/api/flex/event/close-review",
+              {"event": evt.event_id, "winning_option": o1.option_id}),
+        aa, db.get_community(cid), app, aa_mem)["body"]
+    assert "2 of 2 seats" in review and "you count as coming" in review
+    invite_part = review.split("Calendar invite")[1].split("Waitlist")[0]
+    assert "Joe" in invite_part and "Bob" not in invite_part
+    assert "Waitlist: said yes" in review and "Bob, Sue" not in invite_part
+    assert "claim a seat" not in review      # Sue goes with her household
+    # The preview wrote nothing.
+    assert _seat(evt, joe) is None
+    assert db.get_flexible_rsvp("a1", evt.event_id, aa.user_id) is None
+    web._api_flex_event_close(
+        _post("/api/flex/event/close", {"event": evt.event_id,
+                                        "winning_option": o1.option_id}),
+        aa, db.get_community(cid), app, aa_mem)
+    assert _seat(evt, aa) == _seat(evt, joe) == "seated"
+    assert _seat(evt, bob) == "wait_yes"

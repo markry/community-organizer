@@ -12749,6 +12749,12 @@ def _users_page(event: dict, user: User, community: Community | None,
             "Community users</a>."
             "</p>"
         )
+    elif _seed_source_apps(user, app):
+        add_form += (
+            "<p style='margin:8px 0 16px'>"
+            "<a href='/admin/users/add-many' style='color:#2a7'>"
+            "Add several from your other apps...</a></p>"
+        )
 
     table = ""
     if all_users:
@@ -12848,58 +12854,143 @@ def _row_filter_html(table_id: str) -> str:
         "})();</script>")
 
 
+def _seed_source_apps(user: User, app: Application) -> list[Application]:
+    """The other apps this admin may start members from: any app for a
+    community-level admin; otherwise only apps they administer themselves,
+    whose rosters they can already see (PRIVACY-AUDIT HIGH-1). Event apps
+    only: a coverage roster is built deliberately, so those get none."""
+    if app.app_type not in EVENT_APP_TYPES:
+        return []
+    apps = [a for a in db.list_applications(user.community_id)
+            if a.app_id != app.app_id]
+    if user.community_role not in ("ca", "ua"):
+        admin_of = {m.app_id for m in db.list_memberships_for_user(user.user_id)
+                    if m.app_role == "aa"}
+        apps = [a for a in apps if a.app_id in admin_of]
+    return sorted(apps, key=lambda a: a.name.lower())
+
+
+def _pickable_people(user: User, sources: list[Application]) -> list[User]:
+    """Who this admin may add from the picker: the whole community for a
+    community-level admin; otherwise the members of the apps they administer,
+    never anyone else in the community."""
+    people = db.list_users(user.community_id)
+    if user.community_role not in ("ca", "ua"):
+        allowed = {m.user_id for a in sources
+                   for m in db.list_memberships_for_app(a.app_id)}
+        people = (u for u in people if u.user_id in allowed)
+    return list(people)
+
+
+def _may_use_picker(user: User, membership: Membership | None,
+                    app: Application, sources: list[Application]) -> bool:
+    """Scheduling apps: community-level admins who administer the app. Event
+    apps also let any community-level admin in (creating an app for someone
+    else lands them on the picker) and an AA who has other apps to pick from."""
+    if user.community_role in ("ca", "ua"):
+        return _is_admin(user, membership) or app.app_type in EVENT_APP_TYPES
+    return _is_admin(user, membership) and bool(sources)
+
+
 def _users_add_many_page(event: dict, user: User, community: Community | None,
                          app: Application, membership: Membership | None) -> dict:
-    """Tick any number of community members and add them to this app in
-    one go. Community-level admins only: it lists the whole community,
-    which a plain AA must not see (PRIVACY-AUDIT HIGH-1)."""
-    if not _is_admin(user, membership) or user.community_role not in ("ca", "ua"):
+    """Tick any number of people and add them to this app in one go. A
+    community-level admin picks from the whole community; in an event app a
+    plain AA can pick from the members of their other apps
+    (PRIVACY-AUDIT HIGH-1). There, choosing an app under "Start from" ticks
+    its members, ready to adjust before anything is added."""
+    community_level = user.community_role in ("ca", "ua")
+    sources = _seed_source_apps(user, app)
+    if not _may_use_picker(user, membership, app, sources):
         return _html(403, _page(
             "<p>Only a community admin can add members from the whole "
             "community. Use the add-by-email form on the "
             "<a href='/admin/users'>members page</a>.</p>"))
     back = _safe_next(_get_param(event, "next") or "/admin/users")
     members = {m.user_id for m in db.list_memberships_for_app(app.app_id)}
-    everyone = sorted(db.list_users(user.community_id),
-                      key=person_names.sort_key)
+    people = sorted(_pickable_people(user, sources),
+                    key=person_names.sort_key)
+    source_id = _get_param(event, "from") or ""
+    source = next((a for a in sources if a.app_id == source_id), None)
+    source_members = ({m.user_id: m for m in
+                       db.list_memberships_for_app(source.app_id)}
+                      if source else {})
     hh_names: dict[str, list[str]] = {}
-    for u in everyone:
+    for u in people:
         if u.household_id:
             hh_names.setdefault(u.household_id, []).append(u.name)
     rows = ""
-    for u in everyone:
+    ticked = 0
+    for u in people:
         already = u.user_id in members
         others = sorted(n for n in hh_names.get(u.household_id or "", [])
                         if n != u.name)
         hh = ("<div style='font-size:0.8em;color:#2a7'>Household: "
               + html.escape(", ".join(others)) + "</div>" if others else "")
         label = html.escape(u.name or u.email)
+        note = ""
         if already:
             box = "<span style='font-size:0.8em'>already a member</span>"
         else:
+            from_source = source_members.get(u.user_id)
+            # Someone who asked the source app to stop emailing them is shown
+            # but left for the admin to decide: a new app would email them.
+            opted_out = bool(from_source and from_source.opted_out)
+            tick = bool(from_source) and not opted_out
+            ticked += tick
+            if opted_out:
+                note = ("<div style='font-size:0.8em;color:#b60'>Opted out of "
+                        f"emails from {html.escape(source.name)}</div>")
             box = (f"<input type='checkbox' name='user_id' value='{u.user_id}' "
-                   f"id='pick-{u.user_id}' style='transform:scale(1.2)'>")
+                   f"id='pick-{u.user_id}'{' checked' if tick else ''} "
+                   "style='transform:scale(1.2)'>")
             label = (f"<label for='pick-{u.user_id}' style='cursor:pointer'>"
                      f"{label}</label>")
         rows += (
             "<tr style='border-bottom:1px solid #f0f0f0"
             + (";color:#999" if already else "") + "'>"
             f"<td style='padding:6px 12px;text-align:center'>{box}</td>"
-            f"<td style='padding:6px 12px;text-align:left'>{label}{hh}</td>"
+            f"<td style='padding:6px 12px;text-align:left'>{label}{note}{hh}</td>"
             "<td style='padding:6px 12px;font-size:0.9em;text-align:left'>"
             f"{html.escape(u.email)}</td>"
             "<td style='padding:6px 12px;font-size:0.85em;color:#666'>"
             f"{html.escape(u.phone or '')}</td></tr>")
     app_name = html.escape(app.name)
+    start_from = ""
+    if sources:
+        options = "".join(
+            f"<option value='{a.app_id}'"
+            f"{' selected' if source and a.app_id == source.app_id else ''}>"
+            f"{html.escape(a.name)}</option>" for a in sources)
+        start_from = (
+            "<form method='get' action='/admin/users/add-many' "
+            "style='margin:12px 0'>"
+            f"<input type='hidden' name='app_id' value='{app.app_id}'>"
+            f"<input type='hidden' name='next' value='{html.escape(back)}'>"
+            "<label>Start from the members of "
+            "<select name='from' style='padding:4px'>"
+            f"<option value=''>(choose an app)</option>{options}</select>"
+            "</label> <button type='submit' style='padding:4px 12px;"
+            "cursor:pointer'>Tick them</button>"
+            + (f"<span style='color:#666;font-size:0.9em;margin-left:8px'>"
+               f"{ticked} ticked. Untick anyone you don't want, then add.</span>"
+               if source else "")
+            + "</form>")
     body = (
         f"<h1>{app_name}</h1>"
-        "<h2 style='font-size:1.1em;color:#444'>Add members from the "
-        "community</h2>"
+        "<h2 style='font-size:1.1em;color:#444'>"
+        + ("Add members from the community" if community_level
+           else "Add members from your other apps") + "</h2>"
         + _flash_banner_html(event)
         + "<p style='color:#666;font-size:0.9em'>Tick everyone to add, then "
-        "use the button at the bottom. Someone not in the community yet is "
+        "use the button at the bottom. They join as members, whatever their "
+        "role elsewhere. Someone not listed here is "
         "added by email on the <a href='/admin/users'>members page</a>.</p>"
-        "<form method='post' action='/api/users/add-many'>"
+        + start_from
+        + "<form method='post' action='/api/users/add-many'>"
+        # The app this page is about, not whichever one was opened last in
+        # another tab.
+        f"<input type='hidden' name='app_id' value='{app.app_id}'>"
         f"<input type='hidden' name='next' value='{html.escape(back)}'>"
         + _row_filter_html("pick-rows")
         + "<table id='pick-rows' style='border-collapse:collapse;width:100%;"
@@ -12913,12 +13004,13 @@ def _users_add_many_page(event: dict, user: User, community: Community | None,
         # Two ways out: add and stay (search, tick, add, search again), or
         # add and go back to where the picker was opened from.
         "<p style='margin:18px 0'><button type='submit' name='stay' value='1' "
-        "class='add-many-go' disabled style='padding:8px 18px;cursor:pointer'>"
+        f"class='add-many-go'{'' if ticked else ' disabled'} "
+        "style='padding:8px 18px;cursor:pointer'>"
         f"Add selected users to {app_name} "
-        "(<span class='add-many-n'>0</span>)</button> "
-        "<button type='submit' class='add-many-go' disabled "
+        f"(<span class='add-many-n'>{ticked}</span>)</button> "
+        f"<button type='submit' class='add-many-go'{'' if ticked else ' disabled'} "
         "style='padding:8px 18px;cursor:pointer'>Add and exit "
-        "(<span class='add-many-n'>0</span>)</button>"
+        f"(<span class='add-many-n'>{ticked}</span>)</button>"
         f" <a href='{html.escape(back)}' style='margin-left:8px'>cancel</a></p>"
         "</form>"
         "<script>(function(){"
@@ -12937,8 +13029,11 @@ def _users_add_many_page(event: dict, user: User, community: Community | None,
 
 def _api_users_add_many(event: dict, user: User, community: Community | None,
                         app: Application, membership: Membership | None) -> dict:
-    """Grant membership in this app to each ticked community member."""
-    if not _is_admin(user, membership) or user.community_role not in ("ca", "ua"):
+    """Grant membership in this app to each ticked person the admin may
+    pick (see _users_add_many_page). Membership only: nothing about their
+    role or status in another app carries over."""
+    sources = _seed_source_apps(user, app)
+    if not _may_use_picker(user, membership, app, sources):
         return _text(403, "community admins only")
     if _http_method(event) != "POST":
         return _text(405, "POST required")
@@ -12947,12 +13042,13 @@ def _api_users_add_many(event: dict, user: User, community: Community | None,
         return _error_redirect_or_next(event, "/admin/users/add-many",
                                        "Nobody was ticked.")
     members = {m.user_id for m in db.list_memberships_for_app(app.app_id)}
+    pickable = {u.user_id: u for u in _pickable_people(user, sources)}
     added = 0
     for uid in dict.fromkeys(picked):
         if uid in members:
             continue
-        u = db.get_user(user.community_id, uid)
-        if u is None:          # not in this community: skip, never create
+        u = pickable.get(uid)
+        if u is None:          # not someone they may pick: skip, never create
             continue
         db.put_membership(Membership(
             community_id=user.community_id, app_id=app.app_id,
@@ -16383,6 +16479,9 @@ def _ca_landing_page(event: dict, user: User,
         "</section>"
     )
 
+    seed_options = "".join(
+        f"<option value='{a.app_id}'>{html.escape(a.name)}</option>"
+        for a in sorted(apps, key=lambda a: a.name.lower()))
     # Create new app section — was a separate centered block before
     # (#193). Now matches the AA-home section style: left-flush
     # heading at the standard h2 size, content sized to the page
@@ -16421,7 +16520,12 @@ def _ca_landing_page(event: dict, user: User,
         "onchange=\"var pt=document.getElementById('create-period-type');"
         "if(this.value==='recurring_commitments')pt.value='weekly';"
         "else if(this.value==='flexible_event')pt.value='ad_hoc';"
-        "else pt.value='monthly';\">"
+        "else pt.value='monthly';"
+        # Starting members from another app is for event apps only.
+        "var sd=document.getElementById('create-seed');if(sd){"
+        "var ev=this.value==='flexible_event'||this.value==='standing_event';"
+        "sd.style.display=ev?'':'none';"
+        "if(!ev)sd.querySelector('select').value='';}\">"
         "<option value=''>-- pick one --</option>"
         f"{app_type_options}"
         "</select></label>"
@@ -16445,7 +16549,16 @@ def _ca_landing_page(event: dict, user: User,
         f"{admin_options}"
         "</select></label>"
         "</fieldset>"
-        "<button type='submit' "
+        + ("<label id='create-seed' style='display:none'>"
+           "Start members from another app (optional) "
+           "<select name='seed_from' style='width:100%;padding:6px'>"
+           "<option value=''>(no, add members later)</option>"
+           f"{seed_options}</select>"
+           "<span style='display:block;color:#888;font-size:0.85em;"
+           "margin-top:4px'>Next you'll see that app's members ticked, to "
+           "adjust before anyone is added.</span></label>"
+           if seed_options else "")
+        + "<button type='submit' "
         "style='padding:8px 16px;cursor:pointer;background:#2a7;"
         "color:white;border:none;border-radius:4px;align-self:flex-start'>"
         "Create app</button>"
@@ -16562,6 +16675,13 @@ def _api_app_create(event: dict, user: User,
         return _error_redirect("/admin/apps",
             "An app needs at least one admin: tick \"Make me the app "
             "admin\" or pick someone.")
+    seed_from = (_get_param(event, "seed_from") or "").strip()
+    if seed_from and app_type not in EVENT_APP_TYPES:
+        return _error_redirect("/admin/apps",
+            "Only event apps can start members from another app.")
+    if seed_from and db.get_application(user.community_id, seed_from) is None:
+        return _error_redirect("/admin/apps",
+            "The app to start members from wasn't found.")
     app = Application(community_id=user.community_id, name=name,
                       app_type=app_type, period_type=period_type,
                       description=description)
@@ -16574,6 +16694,10 @@ def _api_app_create(event: dict, user: User,
     log.info("CA %s created app %s name=%r type=%s period=%s slug=%s "
              "admins=%s", user.user_id, app.app_id, name, app_type,
              period_type, app.public_slug, admin_ids)
+    if seed_from:
+        home = urllib.parse.quote(f"/?app_id={app.app_id}", safe="")
+        return _redirect(f"/admin/users/add-many?app_id={app.app_id}"
+                         f"&from={seed_from}&next={home}")
     return _redirect(f"/?app_id={app.app_id}")
 
 

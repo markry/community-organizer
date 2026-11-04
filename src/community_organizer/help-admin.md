@@ -190,6 +190,12 @@ Scroll to **Add new member** and fill in:
 
 New members are automatically added as members of {{app_name}} with the community's default reminder settings.
 
+### Adding Several People at Once
+
+Use **Add several...** on the members page to tick people and add them together. In an event app, you can also choose another app under **Start from the members of** to tick its members, then untick anyone you don't want before adding. Community Admins can choose any app and pick from the whole community; App Admins can choose the other apps they administer and pick from those apps' members.
+
+People join as ordinary members: an admin role, a break from scheduling or an email opt-out in the other app doesn't carry over. Anyone who opted out of the other app's emails is flagged and left unticked, because this app would email them.
+
 ### How Members Sign In
 
 When you add a member, the system automatically provisions their login identity. No "send invite" step is required. Tell the new member to:

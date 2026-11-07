@@ -576,8 +576,8 @@ def _send_forward_to_app_admins(*, msg, sender_member, apps, community,
             if aa.email.lower() == safe_sender_email.lower():
                 continue
             nudge_note = (
-                f"(We've automatically emailed {safe_sender_name} their "
-                f"personal voting link and let them know email replies "
+                f"(We've automatically emailed {safe_sender_name} a "
+                f"personal voting link, with a note that email replies "
                 f"aren't recorded as poll answers.)\n\n"
                 if nudged_event else "")
             fwd_body = (

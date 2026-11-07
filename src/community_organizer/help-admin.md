@@ -78,8 +78,8 @@ Set the default reminder times for newly added members. Existing members keep th
 ### Trade Default Behavior
 
 Configure the default trade mode for your application:
-- **Release slot immediately** (recommended) — when a member requests a trade, their slot opens up right away.
-- **Keep slot while looking** — the member holds their slot until someone accepts.
+- **Release slot immediately** (recommended) — when a member requests a trade, the member's slot opens up right away.
+- **Keep slot while looking** — the member keeps the slot until someone accepts.
 
 Members can override this default when creating each trade request.
 
@@ -183,7 +183,7 @@ Click **manage members** on the admin home page.
 ### Adding a Member
 
 Scroll to **Add new member** and fill in:
-- **Name** (required) — their display name.
+- **Name** (required) — the member's display name.
 - **Email** (required) — must be unique in the community.
 - **Phone** (optional) — for future SMS features.
 - **Notes** (optional) — admin-only reference (*e.g.*, "prefers morning services", "new member as of June").
@@ -194,18 +194,18 @@ New members are automatically added as members of {{app_name}} with the communit
 
 Use **Add several...** on the members page to tick people and add them together. In an event app, you can also choose another app under **Start from the members of** to tick its members, then untick anyone you don't want before adding. Community Admins can choose any app and pick from the whole community; App Admins can choose the other apps they administer and pick from those apps' members.
 
-People join as ordinary members: an admin role, a break from scheduling or an email opt-out in the other app doesn't carry over. Anyone who opted out of the other app's emails is flagged and left unticked, because this app would email them.
+People join as ordinary members: an admin role, a break from scheduling or an email opt-out in the other app doesn't carry over. People who opted out of the other app's emails are flagged and left unticked, because this app would email them.
 
 ### How Members Sign In
 
-When you add a member, the system automatically provisions their login identity. No "send invite" step is required. Tell the new member to:
+When you add a member, the system automatically provisions the member's login identity. No "send invite" step is required. Tell the new member to:
 
 1. Visit the site.
 2. Click **New user or forgot your password?** on the sign-in page.
-3. Enter their email address. The system sends a verification code.
-4. Enter the code and choose their own password.
+3. Enter the email address you registered. The system sends a verification code.
+4. Enter the code and choose a password.
 
-This same flow also works any time a member forgets their password.
+This same flow also works any time a member forgets a password.
 
 Members with a Google account matching their registered email can alternatively click **Sign in with Google** and skip the password setup entirely.
 
@@ -215,41 +215,41 @@ Please warn your members that although the sending email address has all the pro
 
 Click **edit** in the Actions column to modify:
 - Name, email, phone, notes.
-- Reminder settings (the admin can adjust on behalf of the member, but the member can always edit their own settings).
+- Reminder settings (the admin can adjust on behalf of the member, but the member can always edit these settings).
 
 If two admins try to edit the same member at the same time, only the first save wins. The second admin will see a red banner: *"Your edit was not saved. Another admin changed [Name] while you were editing. The current values are shown below — please review and try your edit again."* The page reloads showing the current values so you can decide whether to redo your changes. The same conflict protection applies to the Application identity / settings form on the templates page, and to publishing a schedule (a duplicate publish click never sends duplicate broadcast emails).
 
 ### Roles
 
-- **Member** — can view published schedules, sign up for open slots, and release their own slots.
+- **Member** — can view published schedules, sign up for open slots, and release assigned slots.
 - **App Admin** — all member capabilities plus managing schedules, members, and cohorts.
 
 Click **make admin** or **demote** in the Role/Cohorts column to change a member's role.
 
 ### Resetting Member Access
 
-If a member's account is compromised, behaving suspiciously, or they simply need to start over with a fresh password:
+If a member's account is compromised, behaving suspiciously, or the member simply needs to start over with a fresh password:
 
 - Click **reset access** in the Actions column.
 - The system will:
-  - Rotate the member's password to a fresh random value (their old password no longer works).
-  - Sign the member out of all devices (within roughly an hour, as their current session token expires).
+  - Rotate the member's password to a fresh random value (the old password no longer works).
+  - Sign the member out of all devices (within roughly an hour, as the current session token expires).
 - The member can recover access by visiting the site and clicking **New user or forgot your password?** to set a new password.
 
 You will not see this action for your own account, or for members who do not yet have a login identity.
 
 ### Removing vs Deleting
 
-- **remove from app** — removes the member from {{app_name}} only. They remain in the community and can be added to other applications later. Their login still works for other apps.
-- **delete from community** (Community Admin only) — permanently removes the member from everything, including their login identity. Cannot be undone. *(This action will move to a future community-wide member management screen, since it is not specific to one application.)*
+- **remove from app** — removes the member from {{app_name}} only. The member remains in the community and can be added to other applications later. The member's login still works for other apps.
+- **delete from community** (Community Admin only) — permanently removes the member from everything, including the login identity. Cannot be undone. *(This action will move to a future community-wide member management screen, since it is not specific to one application.)*
 
 ### Handling Bounced Emails
 
-If a member's email bounces (permanent delivery failure), their name shows **(bouncing / clear)** next to it. While flagged:
-- The system stops sending them emails (reminders, notifications, *etc.*).
+If a member's email bounces (permanent delivery failure), the member's name shows **(bouncing / clear)** next to it. While flagged:
+- The system stops sending this member emails (reminders, notifications, *etc.*).
 - Other functionality is unaffected.
 
-To resolve: contact the member for their correct email, update it via **edit**, and click **clear** to remove the bounce flag.
+To resolve: contact the member for the correct email, update it via **edit**, and click **clear** to remove the bounce flag.
 
 ---
 
@@ -264,9 +264,9 @@ Cohorts are groups of {{volunteers}} who typically cover {{events}} that occur a
 When someone releases a slot on a published schedule **and coverage drops below desired:**
 1. Cohort members **not assigned** to that {{event}} receive: "A slot opened up -- sign up at [link]."
 2. Cohort members **already assigned** to that {{event}} receive: "Coverage update -- [name] released a slot you're also assigned to."
-3. App Admins receive: "[name] released their slot -- coverage is now X/Y."
+3. App Admins receive: "[name] released this slot", with the current coverage.
 
-When coverage remains at the desired level after a release, **no cohort or admin notifications are sent** -- only the releaser receives their confirmation notice.
+When coverage remains at the desired level after a release, **no cohort or admin notifications are sent** -- only the releaser receives a confirmation notice.
 
 ### How Cohorts Are Created
 
@@ -285,14 +285,14 @@ Cohorts are sorted by day and time on the management page.
 
 Each cohort shows its current members as names in rounded boxes. To manage:
 - **Add a member** -- use the **+add** dropdown to select from members not yet in this cohort. Auto-submits on selection.
-- **Remove a member** -- click **x** next to their name.
+- **Remove a member** -- click **x** next to the member's name.
 
 Members can belong to multiple cohorts (*e.g.*, someone willing to cover both 10 AM and 12 PM {{events}} on a given weekend day).
 
 ### Best Practices
 
-- **Add each member to the cohort matching the time for which they usually volunteer.** This ensures they get notified when coverage is needed at "their" time.
-- **Add flexible {{volunteers}} to multiple cohorts.** If someone is happy to cover any (say) Sunday {{event}}, add them to all Sunday cohorts.
+- **Add each member to the cohort matching his or her usual volunteering time.** This ensures members are notified when coverage is needed at their usual times.
+- **Add flexible {{volunteers}} to multiple cohorts.** If someone is happy to cover any (say) Sunday {{event}}, add that person to all Sunday cohorts.
 - **You can see each member's cohort memberships** on the member management page under the Role/Cohorts column. Go to the cohorts page to edit those.
 
 ---
@@ -302,7 +302,7 @@ Members can belong to multiple cohorts (*e.g.*, someone willing to cover both 10
 Click **Send Email** in the navigation bar, or **compose and send email** on the admin home page.
 
 Choose your recipients:
-- **All members** — sends to everyone in {{app_name}}. Each member gets a personalized email with their own greeting ("Hi [Name]"). This mode never exposes member email addresses to each other.
+- **All members** — sends to everyone in {{app_name}}. Each member gets a personalized email with a personal greeting ("Hi [Name]"). This mode never exposes member email addresses to each other.
 - **Select recipients** — pick any combination of cohorts, individual members, and free-text email addresses. Everyone on the resulting list receives a single shared email (visible to each other, supporting reply-all). App Admins are automatically included on the recipient list so they're part of any follow-up discussion. The greeting becomes "Hi all".
 
 When **Select recipients** mode is active, you can also use:
@@ -322,7 +322,7 @@ On any schedule's edit page, at the bottom you'll find **Email schedule table to
 
 This generates a formatted HTML table of the full month's schedule -- matching a simple scheduling email format (DATE | TIME | {{volunteers}} columns, one name per row) -- and sends it to the specified address.
 
-Note: this is different from the **Publish** action. When you publish a schedule, each member receives a personalized email listing only their own assignments. The schedule summary email sends the complete table -- all {{events}}, all members -- to a single email address you specify.
+Note: this is different from the **Publish** action. When you publish a schedule, each member receives a personalized email listing only that member's assignments. The schedule summary email sends the complete table -- all {{events}}, all members -- to a single email address you specify.
 
 Members can also send the schedule to themselves by clicking **Send schedule to me by email** on their schedule page or home page.
 
@@ -345,7 +345,7 @@ This shows a complete log of all emails sent by the system. You can filter by:
 
 **Common uses:**
 - Verify a publish broadcast went out successfully.
-- Check if a specific member received their reminder.
+- Check if a specific member received a reminder.
 - Investigate delivery failures (look for "error" or "bounced" outcomes).
 - Confirm cohort notifications fired after a release.
 
@@ -360,7 +360,7 @@ As an App Admin, you automatically receive email notifications in these cases:
 | 1 | **Member signed up** | A member signs up for a slot on a published schedule. |
 | 2 | **Coverage drop** | A member withdraws or is removed and coverage falls below the desired level. Shows current coverage status. |
 | 3 | **Calendar decline withdrawal** | A member declines a calendar invitation, triggering automatic withdrawal. Same coverage notification as #2 if coverage drops. |
-| 4 | **Trade requested** | A member requests a trade — shows which slot they want to give up and which they'd prefer. |
+| 4 | **Trade requested** | A member requests a trade — shows which slot the member wants to give up and which dates would work instead. |
 | 5 | **Trade completed** | A trade is completed — shows who traded what with whom. |
 | 6 | **Member reply forwarded** | A member replies to any scheduling email. The original sender, subject, and message are included so you can respond directly. |
 | 7 | **Schedule unpublished** | Another App Admin unpublishes a published schedule. The email names the admin who took the action and the affected month. |

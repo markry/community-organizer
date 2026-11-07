@@ -112,7 +112,7 @@ Don't want calendar invitations? Turn off **Send me calendar invites** in **Your
 | **Withdrawal confirmation** | Confirmation after you withdraw. Includes calendar cancellation. |
 | **Withdrawn via calendar** | Confirmation after you decline a calendar invitation. |
 | **Cohort opening** | When someone at your usual time releases a slot and coverage is needed. |
-| **Cohort coverage update** | When someone assigned to the same {{event}} as you releases their slot. |
+| **Cohort coverage update** | When someone assigned to the same {{event}} as you releases a slot. |
 | **Trade completed** | When a trade you requested or accepted is completed. Includes calendar invitation for your new slot. |
 
 To get fewer emails, open **Your notification settings**: untick every reminder (this also stops reminders for regular events like a weekly meeting), and turn off **Send me calendar invites** and **Ask me to cover or trade when someone drops out**. You'll then get the schedule when it's published, emails about changes to your own assignments, and announcements from the administrators. Your administrator can also change these settings for you.

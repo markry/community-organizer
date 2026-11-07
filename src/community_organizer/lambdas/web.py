@@ -2496,7 +2496,7 @@ def _flex_event_new_page(event: dict, user: User, community: Community | None,
           "<p style='color:#888;font-size:0.85em;margin:0 0 12px 22px'>For a "
           "gathering whose invitations went out some other way. Give its "
           "<b>one</b> date above; nothing is emailed. You then mark who's "
-          "coming yourself, and can write to them with Send Email.</p>"
+          "coming yourself, and can write to those people with Send Email.</p>"
           "<p><button type='submit' style='padding:8px 24px;cursor:pointer;"
           "font-size:1em'>Create</button>"
           "<a href='/' style='margin-left:16px'>Cancel</a></p>"
@@ -2912,7 +2912,7 @@ def _flex_event_results_page(event: dict, user: User,
             "placeholder='e.g. We added a fifth date &mdash; could you weigh "
             "in?'></textarea></label></p>"
             "<p style='margin:2px 0;color:#888;font-size:0.85em'>Each person "
-            "gets their own poll link below your message. One email each "
+            "gets a personal poll link below your message. One email each "
             "&mdash; nobody sees anyone else&#39;s address.</p></div>")
         send_html = (
             "<form method='post' action='/api/flex/event/send-poll' "
@@ -2986,8 +2986,8 @@ def _flex_event_results_page(event: dict, user: User,
                     "removed completely.")
         else:
             clabel = "Cancel this event"
-            cmsg = ("Cancel this event? Anyone who opens their link will then "
-                    "see that it is cancelled.")
+            cmsg = ("Cancel this event? Anyone who opens a personal link will "
+                    "then see that it is cancelled.")
         cancel_html = (
             "<form method='post' action='/api/flex/event/cancel' "
             "style='margin-top:20px'"
@@ -3047,8 +3047,8 @@ def _flex_event_results_page(event: dict, user: User,
                 f"<input type='hidden' name='user_id' value='{r.user_id}'>"
                 "<button type='submit' style='padding:2px 10px;cursor:pointer;"
                 "font-size:0.85em' onclick=\"return confirm('Choose this "
-                "person as host? They will get a private thank-you email "
-                "letting them know.');\">Choose as host</button></form>"
+                "person as host? A private thank-you email will let this "
+                "person know.');\">Choose as host</button></form>"
                 if not is_host else
                 " <b style='color:#2a7'>&check; host</b>")
             host_rows += (f"<li style='margin:4px 0'><b>"
@@ -3057,7 +3057,7 @@ def _flex_event_results_page(event: dict, user: User,
         if evt.host_user_id:
             chosen = (
                 f"<p>Host: <b>{html.escape(name_of(evt.host_user_id))}</b>. "
-                "They've been told privately; letting the group know is up to "
+                "The host has been told privately; letting the group know is up to "
                 "you (e.g. via Send Email). The question is now closed.</p>"
                 "<form method='post' action='/api/flex/event/host' "
                 "style='margin:0 0 6px'>"
@@ -3067,7 +3067,7 @@ def _flex_event_results_page(event: dict, user: User,
                 "border:none;color:#c33;text-decoration:underline;"
                 "cursor:pointer;padding:0' onclick=\"return confirm('Clear the "
                 "host and reopen the question? The current host is NOT "
-                "emailed; let them know yourself.');\">Clear host and reopen "
+                "emailed, so please pass the news along yourself.');\">Clear host and reopen "
                 "the question</button></form>")
         elif not _flex_date_known(evt, len(options)):
             chosen = ("<p style='color:#888'>Members will be asked once you've "
@@ -3214,8 +3214,8 @@ def _flex_event_results_page(event: dict, user: User,
             "Arranged outside the app: nobody was emailed and nobody can "
             "answer online. Record replies here."
             if evt.adopted else
-            "Marking below answers for someone else. If they answer through "
-            "their own link later, <b>their answer replaces yours</b>. "
+            "Marking below answers for someone else. If that person later "
+            "answers through a personal link, <b>that answer replaces yours</b>. "
             "Nothing is emailed.")
         _note_row = (
             f"<tr><td colspan='{len(_cols) + 2}' style='padding:10px 8px 2px;"
@@ -3277,8 +3277,8 @@ def _flex_event_results_page(event: dict, user: User,
             "var y=ss(K+'-y');if(y!==null){ss(K+'-y',null);window.scrollTo(0,+y);}"
             "function ok(){if(!warn||ss(K+'-ok'))return true;"
             "if(!confirm('You are recording a reply on behalf of a member.\\n\\n"
-            "It may not match what they intend. If they later answer through "
-            "their own link, their answer replaces yours.\\n\\nContinue? You "
+            "It may not match what the member intends. If the member later "
+            "answers through a personal link, that answer replaces yours.\\n\\nContinue? You "
             "will not be asked again for this event in this session.'))"
             "return false;ss(K+'-ok','1');return true;}"
             "function go(){if(ok()){ss(K+'-y',String(window.scrollY));f.submit();}"
@@ -3299,8 +3299,8 @@ def _flex_event_results_page(event: dict, user: User,
             "if(n===0||n===sel.length){go();}"
             "else{dirty=setTimeout(go,3000);}});"
             "f.querySelectorAll('.rs-unlock').forEach(function(b){"
-            "b.onclick=function(){if(!confirm('This member answered online "
-            "themselves. Change their answer anyway?'))return;"
+            "b.onclick=function(){if(!confirm('This member answered online. "
+            "Change the answer anyway?'))return;"
             "var tr=b.closest('tr');tr.querySelectorAll('[disabled]').forEach("
             "function(i){i.disabled=false;});b.remove();};});"
             "f.addEventListener('submit',function(e){if(!ok()){e.preventDefault();"
@@ -4143,7 +4143,7 @@ def _flex_capacity_html(evt: FlexibleEvent, options: list, rsvps: list,
         label = "Seat now" if fits else "Squeeze in"
         ask = ("" if fits else
                " onsubmit=\"return confirm('No seat is free: this puts the "
-               "event over capacity. Seat them anyway?')\"")
+               "event over capacity. Seat this household anyway?')\"")
         return ("<form method='post' action='/api/flex/event/seat' "
                 f"style='display:inline;margin-left:8px'{ask}>"
                 f"<input type='hidden' name='event' value='{evt.event_id}'>"
@@ -4166,7 +4166,7 @@ def _flex_capacity_html(evt: FlexibleEvent, options: list, rsvps: list,
     offered = [g for g in groups if g.seat == "offered"]
     offered_html = "".join(
         f"<div style='margin:4px 0'>Seat offered to <b>{who(g)}</b> "
-        f"(party of {g.size}), waiting for their answer.</div>"
+        f"(party of {g.size}), waiting for an answer.</div>"
         for g in offered)
     forced = [g for g in groups if g.seat == "seated" and g.forced]
     return (form
@@ -4207,17 +4207,17 @@ def _api_flex_event_seat_waiting(event: dict, user: User,
               if x.user_id == uid), None)
     if r is None or r.seat != "wait_yes":
         return _error_redirect(results_url,
-                               "They're no longer on the waitlist — refresh.")
+                               "That household is no longer on the waitlist — refresh.")
     p = _flex_reseat(app.app_id, event_id, tell_waitlisted=True,
                      seat_now={uid}, announce_seat_now=True)
     if p is None or not p.seated_now:
         return _error_redirect(results_url,
-                               "Couldn't seat them just now — try again.")
+                               "Couldn't seat that household just now — try again.")
     users = {u.user_id: u for u in db.list_users(app.community_id)}
     g = p.seated_now[0]
     names = ", ".join((users[u].name or users[u].email) if u in users else u
                       for u in g.user_ids)
-    msg = (f"Seated {names} (party of {g.size}) and sent them the news."
+    msg = (f"Seated {names} (party of {g.size}) and sent the news."
            if not evt.adopted else f"Seated {names} (party of {g.size}).")
     if p.seated > evt.capacity:
         msg += (f" That's {p.seated} for {evt.capacity} seats — "
@@ -4433,7 +4433,7 @@ def _api_flex_event_choose_host(event: dict, user: User,
     return _redirect(back + "&notice=" + urllib.parse.quote(
         f"{who} is the host"
         + (" and has been sent a private thank-you." if told
-           else " — but couldn't be emailed; please let them know yourself.")))
+           else " — but couldn't be emailed; please pass the news along yourself.")))
 
 
 # ---- AA: close (two-step — review the cohorts, then send) ------------------
@@ -4547,10 +4547,10 @@ def _api_flex_event_close_review(event: dict, user: User,
             f"({len(pv['invite'])} invited)</span></h2>"
             f"<p style='color:#555'>{names(pv['invite'])}</p>"
             + tier(pv["wait_yes"], "Waitlist: said yes",
-                   "Each is told their place; the first whose party fits gets "
+                   "Each household is told its place; the first whose party fits gets "
                    "the next free seat.")
             + tier(pv["wait_maybe"], "Waitlist: said maybe",
-                   "Each is told their place; offered a seat only once no yes "
+                   "Each household is told its place; offered a seat only once no yes "
                    "is waiting.")
             + (f"<h2 style='font-size:1.05em;color:#555'>Asked to answer to "
                f"claim a seat &rarr; {len(pv['claim'])}</h2>"
@@ -4912,7 +4912,7 @@ def _api_flex_event_close(event: dict, user: User,
         f"{evt.title} confirmed for {date_label}. "
         f"{len(confirmed)} invited, {len(couldnt)} notified."
         + (f" {len(claim)} asked to answer to claim a seat; anyone "
-           "waitlisted was told their place." if evt.capacity else "")))
+           "waitlisted was told of its place in line." if evt.capacity else "")))
 
 
 def _api_flex_event_cancel(event: dict, user: User,
@@ -4948,7 +4948,7 @@ def _api_flex_event_cancel(event: dict, user: User,
                                    "Someone else just changed this — refresh.")
         log.info("flexible event CANCELLED app=%s event=%s by=%s",
                  app.app_id, event_id, user.user_id)
-        msg = (f"Cancelled “{evt.title}”. Anyone who opens their "
+        msg = (f"Cancelled “{evt.title}”. Anyone who opens a personal "
                "link will see it's cancelled.")
     return _redirect("/?notice=" + urllib.parse.quote(msg))
 
@@ -5631,7 +5631,7 @@ def _api_flex_token_optout(event: dict) -> dict:
         subject=f"{org_name}: {who} opted out of group emails",
         body_text=(f"Hi {{aa_name}},\n\n{who} asked to stop getting "
                    f"emails about {org_name}. You may want to follow "
-                   "up with them personally.\n\n-- Community Organizer\n"),
+                   "up personally.\n\n-- Community Organizer\n"),
         kind="event_optout_notice", related_user_id=tok.user_id)
     return _flex_terminal_page(
         "Done — you won't get any more emails about this group. (Your "
@@ -5700,8 +5700,8 @@ def _api_flex_token_join(event: dict) -> dict:
     _notify_app_admins(
         community_id=tok.community_id, app_id=tok.app_id, org_name=org_name,
         subject=f"{org_name}: {who} can now make {evt.title}",
-        body_text=(f"Hi {{aa_name}},\n\n{who} had said they couldn't make "
-                   f"{evt.title}, but has changed their mind and is now "
+        body_text=(f"Hi {{aa_name}},\n\n{who} had said no to "
+                   f"{evt.title}, but has had a change of plans and is now "
                    f"coming on {date_label}"
                    + (f" at {loc}" if loc else "") + ".\n\n"
                    + ("They've been sent the calendar invite. " if cal_ok
@@ -6353,7 +6353,7 @@ def _flex_announce_seats(evt, opt, app, community, users, rsvps, p, *,
                        + ("" if p.free == 1 else "s")
                        + f" open for {evt.title}. {why}\n\nNext in line:\n"
                        + "\n".join(nxt)
-                       + "\n\nIf you reach them, mark them coming on the "
+                       + "\n\nAfter reaching someone, mark that person as coming on the "
                        f"event page:\n\n  {results_url}\n\n"
                        "-- Community Organizer\n"),
             kind="event_seat_cutoff")
@@ -7472,7 +7472,7 @@ def _collect_cohort_members_by_template(
 
 
 _CONFIRMED_VIA_LABEL = {
-    "self_signup": "signed up themselves",
+    "self_signup": "self sign-up",
     "member_login": "confirmed in app",
     "ical_reply": "accepted calendar invite",
     "admin_override": "marked by admin",
@@ -8855,8 +8855,8 @@ def _send_take_or_split_emails(
             split_note = (
                 f"\n\nIf you click 'Split with {other.name}', you'll BOTH "
                 "be assigned to the 2 PM slot. Only do this if you have "
-                f"reason to believe {other.name} is willing — they'll be "
-                f"signed up automatically and notified. {other.name} can "
+                f"reason to believe {other.name} is willing. {other.name} will be "
+                f"signed up automatically and notified, and can "
                 "decline by releasing the slot if it doesn't actually "
                 "work for them."
             )
@@ -9081,7 +9081,7 @@ def _notify_cohort_of_opening(releaser: User, community: Community,
             f"  {slot.name}\n"
             f"  {when} -- {_fmt_time(slot.start_time)}\n\n"
             f"{coverage}\n\n"
-            f"If you know someone who can help, ask them to sign up at:\n"
+            f"If you know someone who can help, please pass along this link:\n"
             f"  https://{domain}/your-schedule\n\n"
             f"-- {app.name if app else community.name}\n"
         )
@@ -9339,9 +9339,9 @@ def _cover_released_page(event: dict, user: User,
             f"{html.escape(when)} alongside you. "
             "<b>Only do this if you have reason to believe "
             f"{html.escape(other_user.name)} is willing</b> — for "
-            "example, you've already chatted or you know they "
-            "regularly cover for each other. They'll be emailed and "
-            "can decline by releasing the slot if it doesn't work."
+            "example, you've already chatted or you two "
+            "regularly cover for each other. Your partner will be emailed "
+            "and can decline by releasing the slot if it doesn't work."
             "</div>"
         )
         btn_label = f"Yes, split it with {html.escape(other_user.name)}"
@@ -9424,8 +9424,8 @@ def _api_cover_released(event: dict, user: User,
         if (partner_mem is not None
                 and partner_mem.inactive_on(slot.local_date)):
             return _error_redirect("/your-schedule",
-                "Your partner is taking a break from the schedule, so "
-                "they can't be added. You can still take the whole slot.")
+                "Your partner is taking a break from the schedule and "
+                "can't be added. You can still take the whole slot.")
 
     def _assign(target: User) -> bool:
         """Idempotent assignment. Returns True if we wrote a new row."""
@@ -9913,7 +9913,7 @@ def _api_membership_inactive(event: dict, user: User,
               else " until further notice."))
     if still:
         n = len(still)
-        msg += (f" {'You' if is_self else 'They'} still have {n} upcoming "
+        msg += (f" {'You still have' if is_self else who + ' still has'} {n} upcoming "
                 f"slot{'s' if n != 1 else ''} in that time"
                 + (": withdraw or trade on My Schedule if you can't "
                    "cover them." if is_self else "."))
@@ -9944,7 +9944,7 @@ def _send_inactive_change_notice(member: User, community: Community,
         return
     domain = os.environ.get("DOMAIN_NAME", "community.example.org")
     if paused:
-        subject = (f"{app.name} -- {member.name} paused their scheduling")
+        subject = (f"{app.name} -- {member.name} paused scheduling")
         line = (f"{member.name} has stepped out of the rotation "
                 + (f"and will be back on {_pretty_date(until)}." if until
                    else "until further notice."))
@@ -10409,7 +10409,7 @@ def _api_admin_assign(event: dict, user: User, community: Community | None,
         return _error_redirect_or_next(event,
             f"/schedules/{yyyy_mm}",
             f"{target.name} is {_inactive_label(target_mem)}. Reactivate "
-            "them on the Members page first.")
+            f"{target.name} on the Members page first.")
     asg = Assignment(
         community_id=user.community_id, app_id=app.app_id,
         yyyy_mm=yyyy_mm, slot_id=slot_id, user_id=user_id,
@@ -12637,9 +12637,9 @@ def _users_page(event: dict, user: User, community: Community | None,
                     f"<form method='post' action='/api/users/reset-access"
                     f"?user_id={u.user_id}' style='display:inline'"
                     f" onsubmit=\"return confirmSubmit(this,"
-                    f"'Reset access for {_js_str(u.name)}? Their "
-                    f"password will be reset and they will be signed out "
-                    f"of all devices. They can recover access via the "
+                    f"'Reset access for {_js_str(u.name)}? The "
+                    f"password will be reset and {_js_str(u.name)} will be signed out "
+                    f"of all devices. Access can be recovered via the "
                     f"\\x27New user or forgot your password?\\x27 link.',"
                     f"'Reset access','#a80')\">"
                     f"<input type='hidden' name='next' "
@@ -12655,7 +12655,7 @@ def _users_page(event: dict, user: User, community: Community | None,
                     + ("" if paused else
                        f" onsubmit=\"return confirmSubmit(this,"
                        f"'Mark {_js_str(u.name)} inactive until further "
-                       "notice? They will not be scheduled or asked to "
+                       "notice? This member will not be scheduled or asked to "
                        "cover. Use edit to set a return date.',"
                        "'Mark inactive','#a80')\"")
                     + ">"
@@ -12674,7 +12674,7 @@ def _users_page(event: dict, user: User, community: Community | None,
                     f"?user_id={u.user_id}' style='display:inline'"
                     f" onsubmit=\"return confirmSubmit(this,"
                     f"'Remove {_js_str(u.name)} from this app? "
-                    f"They will remain in the community.','Remove','#a80')\">"
+                    f"{_js_str(u.name)} will remain in the community.','Remove','#a80')\">"
                     f"<input type='hidden' name='next' "
                     f"value='/admin/users#user-{anchor_uid}'>"
                     f"<button type='submit' style='{_act};color:#a80'>"
@@ -13129,8 +13129,8 @@ def _api_user_add(event: dict, user: User, community: Community | None,
     # no stored one to use.
     if not name:
         return _error_redirect("/admin/users",
-            f"{email} isn't in the community yet. Enter their name too "
-            "to add them.")
+            f"{email} isn't in the community yet. Enter a name too "
+            "to add this person.")
     new_user = User(community_id=user.community_id, email=email, name=name,
                     first_name=first, last_name=last,
                     community_role="member", phone=phone, notes=notes,
@@ -13146,7 +13146,7 @@ def _api_user_add(event: dict, user: User, community: Community | None,
     except db.EmailInUse:
         return _error_redirect("/admin/users",
             "Someone with that email address was just added. Refresh the "
-            "page and add them from the existing entry.")
+            "page and use the existing entry.")
     # Auto-provision the Cognito identity so the unified
     # new-user/forgot-password flow works immediately.
     cognito_sub = _create_cognito_user(email, name)
@@ -13248,7 +13248,7 @@ def _api_user_edit(event: dict, user: User, community: Community | None,
         except db.EmailInUse:
             return _error_redirect_or_next(event, "/admin/users",
                 "Another person in this community already has that email "
-                "address. Each person needs their own. Nothing was saved.")
+                "address. Each person needs a separate address. Nothing was saved.")
         old_email, target.email = target.email, new_email
     else:
         old_email = None
@@ -13763,10 +13763,10 @@ def _notify_swap_request(requester: User, community: Community,
             )
         body_text = (
             f"Hi {target.name},\n\n"
-            f"{requester.name} would like to trade their slot:\n\n"
+            f"{requester.name} would like to trade this slot:\n\n"
             f"  {release_slot.name}\n"
             f"  {when} -- {_fmt_time(release_slot.start_time)}\n\n"
-            f"They can take any of these dates instead:\n"
+            f"Any of these dates would work instead:\n"
             f"{alt_lines}\n\n"
             f"{action}\n"
             f"-- {app.name if app else community.name}\n"
@@ -13788,15 +13788,16 @@ def _notify_swap_request(requester: User, community: Community,
         aa = users_by_id.get(aa_id)
         if not aa or not aa.email or aa.email_undeliverable:
             continue
-        mode = "released their slot and is" if swap.released else "is"
+        mode = "released this slot and is" if swap.released else "is"
         aa_body = (
             f"Hi {aa.name},\n\n"
-            f"{requester.name} {mode} looking to trade:\n\n"
+            f"{requester.name} {mode} looking to trade"
+            f"{'' if swap.released else ' this slot'}:\n\n"
             f"  {release_slot.name}\n"
             f"  {when} -- {_fmt_time(release_slot.start_time)}\n\n"
-            f"They can take any of these dates instead:\n"
+            f"Any of these dates would work instead:\n"
             f"{alt_lines}\n\n"
-            f"{'The slot has been released and the cohort has been notified.' if swap.released else 'They are keeping the slot until someone accepts the trade.'}\n\n"
+            f"{'The slot has been released and the cohort has been notified.' if swap.released else requester.name + ' is keeping the slot until someone accepts the trade.'}\n\n"
             f"-- {app.name if app else community.name}\n"
         )
         provider.send(
@@ -13845,7 +13846,7 @@ def _swap_accept_page(event: dict, user: User, community: Community | None,
             f"<h1>{html.escape(org_name)}</h1>"
             f"<p>{html.escape(requester.name)} wants to trade out of "
             f"{html.escape(release_slot.name)} on {_pretty_date(release_slot.local_date)}, "
-            f"but you're not assigned to any of their preferred alternatives.</p>"
+            f"but you're not assigned to any of the dates offered in exchange.</p>"
             "<p><a href='/your-schedule'>Back to schedule</a></p>",
             title=org_name))
     when = _pretty_date(release_slot.local_date)
@@ -13858,8 +13859,8 @@ def _swap_accept_page(event: dict, user: User, community: Community | None,
             f"<h2 style='color:#444'>Accept a trade</h2>"
             f"<p>{html.escape(requester.name)} wants to trade:</p>"
             f"<div style='padding:12px;background:#f5f5f5;border-radius:8px;margin:12px 0'>"
-            f"<b>They give up:</b> {html.escape(release_slot.name)} on {when}<br>"
-            f"<b>They take yours:</b> {html.escape(s.name if s else '?')} on {your_when}"
+            f"<b>{html.escape(requester.name)} gives up:</b> {html.escape(release_slot.name)} on {when}<br>"
+            f"<b>{html.escape(requester.name)} takes yours:</b> {html.escape(s.name if s else '?')} on {your_when}"
             "</div>"
             f"<form method='post' action='/api/swap/accept'>"
             f"<input type='hidden' name='swap_id' value='{swap_id}'>"
@@ -13890,7 +13891,7 @@ def _swap_accept_page(event: dict, user: User, community: Community | None,
             f"<div style='padding:12px;background:#f5f5f5;border-radius:8px;margin:12px 0'>"
             f"<b>{html.escape(release_slot.name)}</b><br>"
             f"{when} -- {_fmt_time(release_slot.start_time)}</div>"
-            f"<p>In exchange, they'll take your slot on one of these dates. "
+            f"<p>In exchange, {html.escape(requester.name)} will take your slot on one of these dates. "
             f"Select which one to trade:</p>"
             f"<form method='post' action='/api/swap/accept'>"
             f"<input type='hidden' name='swap_id' value='{swap_id}'>"
@@ -15036,7 +15037,7 @@ def _cohorts_page(event: dict, user: User, community: Community | None,
         "<h2 style='font-size:1.1em;color:#444'>Manage cohorts</h2>"
         "<p style='color:#888;font-size:0.85em'>Cohorts are groups of "
         "users who typically cover the same events. When someone releases "
-        "a slot, their cohort is notified.</p>"
+        "a slot, the cohort is notified.</p>"
         + _flash_banner_html(event)
         + (sections or "<p style='color:#888'>No cohorts yet. "
            "Cohorts are auto-created when you add events to the template.</p>")
@@ -15742,7 +15743,7 @@ def _login_page(event: dict) -> dict:
         "margin:0;line-height:1.4;text-align:center;font-weight:600'>"
         "When asked by Apple, you <u>must</u> share your real email "
         "address. Your administrator added that address to the system "
-        "when they invited you, and Hide My Email won't match."
+        "when you were invited, and Hide My Email won't match."
         "</p>"
         "</div>"
         "<div style='color:#888;margin:24px 0'>or sign in with email</div>"
@@ -16908,8 +16909,8 @@ def _ca_users_page(event: dict, user: User,
                     f"<form method='post' action='/api/users/reset-access"
                     f"?user_id={u.user_id}' style='display:inline'"
                     f" onsubmit=\"return confirmSubmit(this,"
-                    f"'Reset access for {_js_str(u.name)}? Their "
-                    f"password will be reset and they will be signed out "
+                    f"'Reset access for {_js_str(u.name)}? The "
+                    f"password will be reset and {_js_str(u.name)} will be signed out "
                     f"of all devices.',"
                     f"'Reset access','#a80')\">"
                     f"<button type='submit' style='{_act};color:#a80'>"
@@ -16924,7 +16925,7 @@ def _ca_users_page(event: dict, user: User,
                     f"'Permanently delete {_js_str(u.name)} from the "
                     f"entire community? This cannot be undone, and any "
                     f"app memberships, assignments, or schedule history "
-                    f"tied to them will be orphaned.','Delete','#c33')\">"
+                    f"for this person will be orphaned.','Delete','#c33')\">"
                     f"<button type='submit' style='{_act};color:#c33'>"
                     "delete</button></form>"
                 )
@@ -16952,7 +16953,7 @@ def _ca_users_page(event: dict, user: User,
                         "style='display:inline'"
                         f" onsubmit=\"return confirmSubmit(this,"
                         f"'Make {_js_str(u.name)} a Community Admin? "
-                        f"They will be able to manage all apps, members, "
+                        f"{_js_str(u.name)} will be able to manage all apps, members, "
                         f"and settings community-wide.',"
                         f"'Make CA','#2a7')\">"
                         f"<input type='hidden' name='next' "
@@ -17065,8 +17066,8 @@ def _api_ca_user_add(event: dict, user: User,
     if existing is not None:
         return _error_redirect("/admin/community-users",
             f"{existing.name} <{existing.email}> is already in this "
-            "community. Use the existing entry; you can grant them "
-            "app memberships from their row.")
+            "community. Use the existing entry; you can grant app "
+            "memberships from that row.")
     new_user = User(community_id=user.community_id, email=email, name=name,
                     first_name=first, last_name=last,
                     community_role="member", phone=phone, notes=notes)
@@ -17206,7 +17207,7 @@ def _ca_households_page(event: dict, user: User,
                       if o.user_id != u.user_id]
             hh_cell = (
                 html.escape(", ".join(others)) if others else
-                "<span style='color:#a80'>only them &mdash; tick someone "
+                "<span style='color:#a80'>just this person &mdash; tick someone "
                 "to join, or remove</span>")
             # A button, not a nested form: the whole table sits inside the
             # "make a household" form, and formaction sends it elsewhere.
@@ -17214,7 +17215,7 @@ def _ca_households_page(event: dict, user: User,
                 "<button type='submit' formaction='/api/households/unpair' "
                 f"name='unpair_id' value='{u.user_id}' style='{btn}' "
                 f"onclick=\"return confirm('Remove {_js_str(u.name or u.email)}"
-                " from their household?');\">remove</button>")
+                " from the household?');\">remove</button>")
         rows += (
             "<tr style='border-bottom:1px solid #f0f0f0'>"
             "<td style='padding:6px 12px;text-align:center'>"
@@ -17314,7 +17315,7 @@ def _api_ca_household_unpair(event: dict, user: User,
         u.household_id = None
         db.put_user(u, expected_version=u.version)
     return _redirect("/admin/households?notice=" + urllib.parse.quote(
-        f"Removed {u.name or u.email} from their household."))
+        f"Removed {u.name or u.email} from the household."))
 
 
 def _api_app_update(event: dict, user: User,
@@ -17788,8 +17789,8 @@ def _public_page_section(app: Application, slug: str, share_url: str,
         "<h2 style='font-size:1.1em;color:#444'>Public page</h2>"
         f"<p style='margin-top:-6px'><a href='{share_url}'>{share_url}</a></p>"
         "<p style='color:#888;font-size:0.85em'>Send this link to members. It "
-        "opens a public page for this app and, once they sign in, takes them "
-        "straight here — overriding their last-used app.</p>"
+        "opens a public page for this app and, after sign-in, goes "
+        "straight here — overriding the last-used app.</p>"
         "<form method='post' action='/api/app/slug"
         f"?app_id={app.app_id}' style='text-align:left;margin-top:12px'>"
         f"<input type='hidden' name='app_id' value='{app.app_id}'>"
@@ -17853,7 +17854,7 @@ def _api_sharing_save(event: dict, user: User, community: Community | None,
         db.put_application(app, expected_version=version)
     except db.ConcurrencyConflict:
         return _error_redirect_or_next(event, "/admin/sharing",
-            "Someone else just changed this app — reloaded with their values.")
+            "Someone else just changed this app — reloaded with the latest values.")
     return _redirect("/admin/sharing")
 
 
@@ -17889,7 +17890,7 @@ def _api_app_slug_save(event: dict, user: User, community: Community | None,
         db.put_application(app, expected_version=version)
     except db.ConcurrencyConflict:
         return _error_redirect_or_next(event, nxt,
-            "Someone else just changed this app — reloaded with their values.")
+            "Someone else just changed this app — reloaded with the latest values.")
     sep = "&" if "?" in nxt else "?"
     return _redirect(f"{nxt}{sep}notice="
                      + urllib.parse.quote("Public page saved."))

@@ -232,7 +232,7 @@ def test_poll_table_has_a_column_per_date(ddb_table, outbox) -> None:
     evt, o1 = _mk_event(cid)
     o2 = _add_option(cid, evt, "2026-08-22")
     body = _results(cid, app, aa, aa_mem, evt)
-    assert "id='roster-form'" in body and "their answer replaces yours" in body
+    assert "id='roster-form'" in body and "that answer replaces yours" in body
     assert "warn=true" in body and "multi=true" in body
     # Who answered for themselves comes first, the unanswered last.
     order = [body.index(h) for h in ("Member direct feedback (", "Admin-created status (",

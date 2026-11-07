@@ -136,7 +136,7 @@ def test_member_pauses_themselves_and_admins_hear(world) -> None:
     assert "marked inactive until further notice" in _location(resp)
     assert _mem(world, member).inactive_since
     assert [s["to_addr"] for s in outbox.sent] == ["Admin@example.com"]
-    assert "paused their scheduling" in outbox.sent[0]["subject"]
+    assert "paused scheduling" in outbox.sent[0]["subject"]
 
     resp = _pause(world, member, {"action": "resume"})
     assert "active again" in _location(resp)
